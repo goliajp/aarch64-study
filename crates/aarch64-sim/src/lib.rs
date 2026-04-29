@@ -675,6 +675,35 @@ impl Core {
             return Ok(StepResult::Continue);
         }
 
+        // LDP/STP (signed offset, 64-bit)
+        // 1 0 1 0 1 0 0 1 0 L imm7 Rt2 Rn Rt1
+        //   STP: 0xA9000000  |  LDP: 0xA9400000
+        if (insn & 0xFFC0_0000 == 0xA900_0000) || (insn & 0xFFC0_0000 == 0xA940_0000) {
+            let l = (insn >> 22) & 1;
+            // imm7 is signed, scaled by 8.
+            let imm7_raw = ((insn >> 15) & 0x7F) as u32;
+            let imm7 = ((imm7_raw as i32) << 25) >> 25; // sign-extend 7-bit
+            let offset_bytes = (imm7 as i64) * 8;
+            let rt2 = ((insn >> 10) & 0x1F) as usize;
+            let rn = ((insn >> 5) & 0x1F) as usize;
+            let rt1 = (insn & 0x1F) as usize;
+            let base = self.read_x(rn);
+            let addr = (base as i64).wrapping_add(offset_bytes) as u64;
+            if l == 0 {
+                let v1 = self.read_x(rt1);
+                let v2 = self.read_x(rt2);
+                self.store64(mem, out, aic, addr, v1)?;
+                self.store64(mem, out, aic, addr.wrapping_add(8), v2)?;
+            } else {
+                let v1 = self.load64(mem, aic, addr)?;
+                let v2 = self.load64(mem, aic, addr.wrapping_add(8))?;
+                self.write_x(rt1, v1);
+                self.write_x(rt2, v2);
+            }
+            self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
         // MSR/MRS sysreg
         if insn & 0xFFC0_0000 == 0xD500_0000 {
             let l = (insn >> 21) & 1;
@@ -1031,32 +1060,34 @@ fn unsupported_sysreg(op: &str, sr: (u32, u32, u32, u32, u32), pc: u64) -> Strin
 
 fn load_demo(mem: &mut [u8]) {
     // Memory regions, both cores execute the same code:
-    //   PA 0x4000  kernel boot — EL2 → EL1, MMU bring-up, init scheduler slot,
-    //              drop to EL0 at task A.
-    //   PA 0x4800  sync handler at VBAR_EL1+0x400 — leftover SVC handler,
-    //              currently unused by the new tasks.
-    //   PA 0x4880  IRQ handler at VBAR_EL1+0x480 — the scheduler. ACKs the AIC,
-    //              flips the global "current task" slot, and ERETs into the
-    //              other task.
-    //   PA 0x4D00  task A (EL0) — spins printing 'A' to UART.
-    //   PA 0x4E00  task B (EL0) — spins printing 'B' to UART.
-    //   PA 0x4F00  current-task slot (8 bytes) — holds the currently running
-    //              task entry. Initialised to TASK_A_ENTRY by kernel boot.
+    //   PA 0x4000  kernel boot
+    //   PA 0x4800  sync handler (stub)
+    //   PA 0x4880  IRQ handler = scheduler with X0-X3 save/restore
+    //   PA 0x4D00  task A — counts in X3 and prints 'A'
+    //   PA 0x4E00  task B — counts in X3 and prints 'B'
+    //   PA 0x4F00  global current-task entry (8 bytes)
+    //   PA 0x4F08  global current-task save area pointer (8 bytes)
+    //   PA 0x4F10  task A save area (32 bytes — X0..X3)
+    //   PA 0x4F30  task B save area (32 bytes — X0..X3)
     //
-    // Both cores boot with the same code and write the same value to the slot,
-    // so they start out running task A in lockstep. Each timer tick (broadcast
-    // by the AIC to all cores) makes the scheduler swap them to the other task.
+    // Save areas are zero-initialised; tasks see X0..X3 = 0 on first entry.
+    // After a context switch they see the values they had at the previous
+    // pre-emption point, so X3 (the counter) keeps growing across switches.
     const SPSR_EL1H_DAIF: u32 = 0x3C5;
     const VBAR: u32 = 0x4400;
     const SYNC_HANDLER_PA: u64 = 0x4800;
     const IRQ_HANDLER_PA: u64 = 0x4880;
     const TASK_A_ENTRY: u32 = 0x4D00;
     const TASK_B_ENTRY: u32 = 0x4E00;
-    const TASK_SUM: u32 = TASK_A_ENTRY + TASK_B_ENTRY; // 0x9B00 — fits in 16 bits
+    const TASK_SUM: u32 = TASK_A_ENTRY + TASK_B_ENTRY; // 0x9B00
     const TASK_SLOT_PA: u32 = 0x4F00;
+    const TASK_PTR_SLOT_PA: u32 = 0x4F08;
+    const TASK_A_SAVE_PA: u32 = 0x4F10;
+    const TASK_B_SAVE_PA: u32 = 0x4F30;
+    const TASK_SAVE_SUM: u32 = TASK_A_SAVE_PA + TASK_B_SAVE_PA; // 0x9E40
     const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
-    let kernel: [u32; 21] = [
+    let kernel: [u32; 24] = [
         // EL2 prologue → ERET to EL1
         movz(9, EL1_ENTRY, 0),
         msr_elr_el2(9),
@@ -1074,17 +1105,20 @@ fn load_demo(mem: &mut [u8]) {
         // EL1: install vector base
         movz(9, VBAR, 0),
         msr_vbar_el1(9),
-        // EL1: initialise the scheduler slot to task A and ERET into it
+        // EL1: initialise scheduler — current task = A, current save area = A's
         movz(9, TASK_A_ENTRY, 0),
         movz(10, TASK_SLOT_PA, 0),
-        str_imm(9, 10, 0),
+        str_imm(9, 10, 0),                  // entry slot = A_entry
+        movz(11, TASK_A_SAVE_PA, 0),
+        movz(10, TASK_PTR_SLOT_PA, 0),
+        str_imm(11, 10, 0),                 // ptr slot = A_save_area
+        // EL1: ERET into task A
         msr_elr_el1(9),
         movz(10, 0, 0),
         msr_spsr_el1(10),
         eret(),
     ];
-    // Sync handler (VBAR+0x400) — kept as a stub so a stray SVC traps to a
-    // visible 'K' rather than going somewhere undefined.
+    // Sync handler at VBAR+0x400 — stub for any stray SVC.
     let sync_handler: [u32; 5] = [
         movz(1, UART_OUT as u32, 0),
         movz(0, b'K' as u32, 0),
@@ -1092,33 +1126,52 @@ fn load_demo(mem: &mut [u8]) {
         add_imm(0, 0, 0),
         eret(),
     ];
-    // IRQ handler (VBAR+0x480) — the scheduler. Reads AIC ACK to clear the
-    // pending IRQ, computes the "other" task entry as (A+B)-current, swaps
-    // the slot, and ERETs into the new task.
-    let scheduler: [u32; 9] = [
-        movz(9, AIC_BASE as u32, 0),     // X9 = AIC base
-        ldr_imm(10, 9, 0),                // X10 = ACK (clears pending)
-        movz(9, TASK_SLOT_PA, 0),         // X9 = slot addr
-        ldr_imm(11, 9, 0),                // X11 = current task entry
-        movz(12, TASK_SUM, 0),            // X12 = A_entry + B_entry
-        sub_reg(12, 12, 11),              // X12 = the other entry
-        str_imm(12, 9, 0),                // *slot = other
-        msr_elr_el1(12),                  // ELR_EL1 = other (next task)
-        eret(),                           // → EL0 at the other task
+    // IRQ handler at VBAR+0x480 — the scheduler with proper context switch.
+    // Saves X0-X3 of the outgoing task, swaps the global slots, restores
+    // X0-X3 of the incoming task, ERETs into the incoming task's entry.
+    let scheduler: [u32; 20] = [
+        // ACK to clear AIC pending
+        movz(9, AIC_BASE as u32, 0),
+        ldr_imm(10, 9, 0),
+        // Load current entry + current save-area pointer
+        movz(9, TASK_SLOT_PA, 0),
+        ldr_imm(11, 9, 0),                  // X11 = current entry
+        movz(9, TASK_PTR_SLOT_PA, 0),
+        ldr_imm(12, 9, 0),                  // X12 = current save-area ptr
+        // Save outgoing X0..X3 to *X12
+        stp_imm(0, 1, 12, 0),
+        stp_imm(2, 3, 12, 2),               // imm7=2 → byte offset 16
+        // Compute "other" entry and save area via (sum - current)
+        movz(13, TASK_SUM, 0),
+        sub_reg(13, 13, 11),                // X13 = other entry
+        movz(14, TASK_SAVE_SUM, 0),
+        sub_reg(14, 14, 12),                // X14 = other save-area ptr
+        // Update the global slots
+        movz(9, TASK_SLOT_PA, 0),
+        str_imm(13, 9, 0),
+        movz(9, TASK_PTR_SLOT_PA, 0),
+        str_imm(14, 9, 0),
+        // Load incoming X0..X3 from *X14
+        ldp_imm(0, 1, 14, 0),
+        ldp_imm(2, 3, 14, 2),
+        // Switch and return
+        msr_elr_el1(13),
+        eret(),
     ];
+    // Task A — counts in X3, prints 'A'. X3 persists across context switches.
     let task_a: [u32; 5] = [
         movz(1, UART_OUT as u32, 0),
+        add_imm(3, 3, 1),                   // X3 = X3 + 1 (counter)
         movz(0, b'A' as u32, 0),
         str_imm(0, 1, 0),
-        add_imm(0, 0, 0),
-        b_offset(-1),
+        b_offset(-3),                       // back to ADD (skip the MOVZ)
     ];
     let task_b: [u32; 5] = [
         movz(1, UART_OUT as u32, 0),
+        add_imm(3, 3, 1),
         movz(0, b'B' as u32, 0),
         str_imm(0, 1, 0),
-        add_imm(0, 0, 0),
-        b_offset(-1),
+        b_offset(-3),
     ];
 
     write_words(mem, ENTRY_PC, &kernel);
@@ -1169,6 +1222,18 @@ const fn str_imm(rt: u32, rn: u32, imm12: u32) -> u32 {
 #[allow(dead_code)]
 const fn ldr_imm(rt: u32, rn: u32, imm12: u32) -> u32 {
     0xF940_0000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+
+/// STP Xt1, Xt2, [Xn, #imm7*8] (signed-offset).
+const fn stp_imm(rt1: u32, rt2: u32, rn: u32, imm7: i32) -> u32 {
+    let imm = (imm7 as u32) & 0x7F;
+    0xA900_0000 | (imm << 15) | ((rt2 & 0x1F) << 10) | ((rn & 0x1F) << 5) | (rt1 & 0x1F)
+}
+
+/// LDP Xt1, Xt2, [Xn, #imm7*8] (signed-offset).
+const fn ldp_imm(rt1: u32, rt2: u32, rn: u32, imm7: i32) -> u32 {
+    let imm = (imm7 as u32) & 0x7F;
+    0xA940_0000 | (imm << 15) | ((rt2 & 0x1F) << 10) | ((rn & 0x1F) << 5) | (rt1 & 0x1F)
 }
 
 const fn b_self() -> u32 {
@@ -1274,6 +1339,28 @@ mod tests {
     }
 
     #[test]
+    fn x3_counter_persists_across_context_switches() {
+        let mut cpu = Cpu::new();
+        // Run long enough for several A/B context switches.
+        cpu.run(400);
+        // Read task A's save area (PA 0x4F10) — X0..X3 stored as 4 × u64 LE.
+        let read_u64 = |mem: &[u8], pa: usize| -> u64 {
+            u64::from_le_bytes(mem[pa..pa + 8].try_into().unwrap())
+        };
+        let a_x3 = read_u64(&cpu.mem, 0x4F10 + 24); // X3 is the 4th slot
+        let b_x3 = read_u64(&cpu.mem, 0x4F30 + 24);
+        // Both counters should be non-zero — each task incremented X3 every
+        // iteration of its loop, and we ran enough cycles for both to run.
+        assert!(a_x3 > 0, "task A X3 didn't accumulate: {}", a_x3);
+        assert!(b_x3 > 0, "task B X3 didn't accumulate: {}", b_x3);
+        // The save areas hold X0='A'/'B' (0x41 / 0x42) and X1=UART (0x1000).
+        assert_eq!(read_u64(&cpu.mem, 0x4F10), b'A' as u64);
+        assert_eq!(read_u64(&cpu.mem, 0x4F30), b'B' as u64);
+        assert_eq!(read_u64(&cpu.mem, 0x4F10 + 8), UART_OUT);
+        assert_eq!(read_u64(&cpu.mem, 0x4F30 + 8), UART_OUT);
+    }
+
+    #[test]
     fn aic_acks_clear_pending_bits() {
         let mut cpu = Cpu::new();
         cpu.run(200);
@@ -1294,13 +1381,12 @@ mod tests {
     #[test]
     fn daif_restored_through_eret() {
         let mut cpu = Cpu::new();
-        // After 5 steps the EL2 prologue ERETs into EL1 with SPSR_EL2=0x3C5
-        // (M[3:0]=EL1h, DAIF all set) — kernel runs with IRQs masked.
         cpu.run(5);
         assert_eq!(cpu.cores[0].current_el, 1);
         assert_eq!(cpu.cores[0].daif, 0xF);
-        // Remaining kernel boot is 16 more instructions (21 total per core).
-        cpu.run(16);
+        // Remaining kernel boot is 19 more instructions (24 total per core)
+        // before ERETing into EL0 with SPSR_EL1=0 — DAIF restored to 0.
+        cpu.run(19);
         assert_eq!(cpu.cores[0].current_el, 0);
         assert_eq!(cpu.cores[0].daif, 0);
     }

@@ -29,9 +29,9 @@ v0.4  + EL2 boot + ERET drops to EL1 (current_el visible, ELR/SPSR sysregs)
 v0.5  + SVC raises EL0 → EL1 + ERET returns (full syscall round-trip)
 v0.6  + two cores (P-core / E-core) sharing memory + MPIDR_EL1
 v0.7  + DAIF + AIC timer IRQ + IRQ vector (VBAR+0x480)
-v0.8  + AIC abstraction + scheduler swaps tasks A/B on every tick  ← here
-v0.9  + virtio device (Type-1 hypervisor seed)
-v1.0  same Rust code on bare metal via m1n1`}
+v0.8  + AIC abstraction + scheduler swaps tasks A/B on every tick
+v0.9  + LDP/STP + real context switch (X0–X3 persist across switches)  ← here
+v1.0  + virtio block device (hypervisor seed) and bare-metal port via m1n1`}
           </pre>
         </Card>
       </div>

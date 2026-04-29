@@ -34,6 +34,13 @@ interface AicState {
   total_acks: bigint
 }
 
+interface TaskSave {
+  x0: bigint
+  x1: bigint
+  x2: bigint
+  x3: bigint
+}
+
 interface SystemInfo {
   systemSteps: bigint
   timerPeriod: bigint
@@ -84,6 +91,15 @@ function fmtHex32(v: number): string {
   return '0x' + (v >>> 0).toString(16).padStart(8, '0')
 }
 
+function parseSaveAreas(bytes: Uint8Array): { a: TaskSave; b: TaskSave } {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const u64 = (off: number) => view.getBigUint64(off, true)
+  return {
+    a: { x0: u64(0), x1: u64(8), x2: u64(16), x3: u64(24) },
+    b: { x0: u64(32), x1: u64(40), x2: u64(48), x3: u64(56) },
+  }
+}
+
 function parseHex(text: string): bigint | null {
   const trimmed = text.trim()
   if (trimmed === '') return null
@@ -98,6 +114,7 @@ export function CpuView() {
   const [cpu, setCpu] = useState<Cpu | null>(null)
   const [cores, setCores] = useState<CoreState[] | null>(null)
   const [aic, setAic] = useState<AicState | null>(null)
+  const [saveArea, setSaveArea] = useState<{ a: TaskSave; b: TaskSave } | null>(null)
   const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null)
   const [memory, setMemory] = useState<Uint8Array>(new Uint8Array(MEMORY_VIEW_BYTES))
   const [output, setOutput] = useState('')
@@ -120,6 +137,9 @@ export function CpuView() {
     const viewStart = Number(s[0].pc) & ~0xf
     setMemory(c.mem_slice(viewStart, MEMORY_VIEW_BYTES))
     setOutput(c.output())
+    // Pull both task save areas (PA 0x4F10 and 0x4F30, 32 bytes each).
+    const saveBytes = c.mem_slice(0x4f10, 0x40)
+    setSaveArea(parseSaveAreas(saveBytes))
   }, [])
 
   useEffect(() => {
@@ -204,7 +224,7 @@ export function CpuView() {
     }
   }, [cpu, cores, vaText, translateCoreIdx])
 
-  if (!cpu || !cores || !sysInfo || !aic) {
+  if (!cpu || !cores || !sysInfo || !aic || !saveArea) {
     return <div className="text-fg-muted text-sm">Loading WASM…</div>
   }
 
@@ -223,7 +243,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.8</Badge>
+          <Badge color="info">v0.9</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -234,17 +254,18 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          AIC broadcasts an IRQ to every core every {sysInfo.timerPeriod.toString()} system steps.
-          The IRQ handler at <code>VBAR_EL1+0x480</code> reads <code>AIC_BASE+0x00</code> to ACK,
-          computes the other task entry as <code>(A_entry+B_entry)-current</code>, swaps the global
-          slot, and ERETs into the new task. Both cores boot into task A; each tick swaps them to B
-          and back.
+          Real context switching: the IRQ handler now <code>STP</code>s X0–X3 of the outgoing task
+          into its save area before swapping, and <code>LDP</code>s X0–X3 of the incoming task back
+          out. Each task increments X3 every iteration, and that counter survives across switches
+          because the kernel preserves it.
         </p>
       </header>
 
       <SystemInfoBar info={sysInfo} totalCoreSteps={cores.reduce((a, c) => a + c.steps, 0n)} />
 
       <AicPanel aic={aic} />
+
+      <SavePanel save={saveArea} />
 
       <div className="flex flex-wrap items-center gap-2">
         <GlassButton onClick={onStep} size="sm" variant="accent">
@@ -298,6 +319,41 @@ function inferTaskLabel(pc: bigint): string | null {
   if (p >= 0x4800 && p < 0x4880) return 'sync handler'
   if (p >= 0x4000 && p < 0x4400) return 'kernel boot'
   return null
+}
+
+function SavePanel({ save }: { save: { a: TaskSave; b: TaskSave } }) {
+  return (
+    <GlassCard>
+      <div className="space-y-2 p-4">
+        <div className="text-fg-muted text-[10px] font-semibold tracking-wider uppercase">
+          Task save areas — kernel-managed X0–X3 per task
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <SaveCard label="task A @ 0x4F10" save={save.a} />
+          <SaveCard label="task B @ 0x4F30" save={save.b} />
+        </div>
+        <div className="text-fg-muted text-[11px]">
+          On every timer IRQ the scheduler at <code>VBAR_EL1+0x480</code> stores X0–X3 to the
+          outgoing task's slot via two STP instructions, then loads the incoming task's slot via two
+          LDP instructions. X3 is the loop counter — watch it grow on both tasks.
+        </div>
+      </div>
+    </GlassCard>
+  )
+}
+
+function SaveCard({ label, save }: { label: string; save: TaskSave }) {
+  const x0Char = Number(save.x0 & 0xffn)
+  const ascii = x0Char >= 0x20 && x0Char < 0x7f ? `'${String.fromCharCode(x0Char)}'` : ''
+  return (
+    <div className="border-border bg-bg/40 space-y-1 rounded border px-3 py-2 font-mono text-[11px]">
+      <div className="text-fg-muted text-[10px] tracking-wider uppercase">{label}</div>
+      <RegRow label={`X0 ${ascii}`} value={save.x0} />
+      <RegRow label="X1" value={save.x1} />
+      <RegRow label="X2" value={save.x2} />
+      <RegRow highlight label="X3 (counter)" value={save.x3} />
+    </div>
+  )
 }
 
 function AicPanel({ aic }: { aic: AicState }) {
