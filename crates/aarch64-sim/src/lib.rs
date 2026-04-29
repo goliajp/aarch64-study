@@ -148,9 +148,9 @@ impl Cpu {
         }
         let pc = self.pc;
         let insn = match self.fetch_u32(pc) {
-            Some(v) => v,
-            None => {
-                self.trap(format!("fetch fault at pc={:#x}", pc));
+            Ok(v) => v,
+            Err(e) => {
+                self.trap(format!("{e} at pc={:#x}", pc));
                 return false;
             }
         };
@@ -238,12 +238,26 @@ impl Cpu {
         self.halted = true;
     }
 
-    fn fetch_u32(&self, addr: u64) -> Option<u32> {
-        let a = addr as usize;
-        if a + 4 > self.mem.len() {
-            return None;
+    /// MMU-aware translation for instruction fetch and data accesses. When
+    /// SCTLR_EL1.M=0 the address passes through unchanged; when M=1 we walk
+    /// the stage-1 tables and surface any fault as a string error.
+    fn translate_for_access(&self, va: u64) -> Result<u64, String> {
+        if self.sctlr_el1 & 1 == 0 {
+            return Ok(va);
         }
-        Some(u32::from_le_bytes([
+        let r = self.do_translate(va);
+        r.pa.ok_or_else(|| r.fault.unwrap_or_else(|| "MMU fault".into()))
+    }
+
+    // --- raw physical-memory accessors. The page-table walker uses these
+    //     directly so it never recurses through translate_for_access. ---
+
+    fn read_pa_u32(&self, pa: u64) -> Result<u32, String> {
+        let a = pa as usize;
+        if a + 4 > self.mem.len() {
+            return Err(format!("fetch fault at PA {:#x}", pa));
+        }
+        Ok(u32::from_le_bytes([
             self.mem[a],
             self.mem[a + 1],
             self.mem[a + 2],
@@ -251,10 +265,10 @@ impl Cpu {
         ]))
     }
 
-    fn load64(&self, addr: u64) -> Result<u64, String> {
-        let a = addr as usize;
+    fn read_pa_u64(&self, pa: u64) -> Result<u64, String> {
+        let a = pa as usize;
         if a + 8 > self.mem.len() {
-            return Err(format!("load fault at {:#x}", addr));
+            return Err(format!("load fault at PA {:#x}", pa));
         }
         Ok(u64::from_le_bytes([
             self.mem[a],
@@ -268,18 +282,33 @@ impl Cpu {
         ]))
     }
 
-    fn store64(&mut self, addr: u64, val: u64) -> Result<(), String> {
-        // UART hook: any 8-byte store whose base lands in [UART_OUT, UART_OUT+8)
-        // emits the low byte. The store still proceeds against backing memory.
-        if addr == UART_OUT {
-            self.output_buf.push((val & 0xFF) as u8);
-        }
-        let a = addr as usize;
+    fn write_pa_u64(&mut self, pa: u64, val: u64) -> Result<(), String> {
+        let a = pa as usize;
         if a + 8 > self.mem.len() {
-            return Err(format!("store fault at {:#x}", addr));
+            return Err(format!("store fault at PA {:#x}", pa));
         }
         self.mem[a..a + 8].copy_from_slice(&val.to_le_bytes());
         Ok(())
+    }
+
+    fn fetch_u32(&self, va: u64) -> Result<u32, String> {
+        let pa = self.translate_for_access(va)?;
+        self.read_pa_u32(pa)
+    }
+
+    fn load64(&self, va: u64) -> Result<u64, String> {
+        let pa = self.translate_for_access(va)?;
+        self.read_pa_u64(pa)
+    }
+
+    fn store64(&mut self, va: u64, val: u64) -> Result<(), String> {
+        let pa = self.translate_for_access(va)?;
+        // UART is identified by physical address: writing to PA 0x1000
+        // emits the low byte, regardless of MMU state.
+        if pa == UART_OUT {
+            self.output_buf.push((val & 0xFF) as u8);
+        }
+        self.write_pa_u64(pa, val)
     }
 
     fn execute(&mut self, insn: u32) -> Result<StepResult, String> {
@@ -331,6 +360,72 @@ impl Cpu {
             return Ok(StepResult::Continue);
         }
 
+        // MSR Xt, sysreg / MRS Xt, sysreg :: 1101 0101 00 L op0 op1 CRn CRm op2 Rt
+        // L=0 → MSR (write sysreg from Rt), L=1 → MRS (read sysreg into Rt)
+        if insn & 0xFFC0_0000 == 0xD500_0000 {
+            let l = (insn >> 21) & 1;
+            let op0 = (insn >> 19) & 0x3;
+            let op1 = (insn >> 16) & 0x7;
+            let crn = (insn >> 12) & 0xF;
+            let crm = (insn >> 8) & 0xF;
+            let op2 = (insn >> 5) & 0x7;
+            let rt = (insn & 0x1F) as usize;
+
+            // Hint / barrier instructions occupy this same major class but with
+            // Rt = 0b11111 and op0 < 2; route them to no-ops below.
+            if op0 < 2 {
+                // 0xD503_201F NOP, 0xD503_30xx ISB/DSB/DMB. Treat as no-op.
+                if insn & 0xFFFF_F01F == 0xD503_201F || insn & 0xFFFF_F01F == 0xD503_301F {
+                    self.pc = self.pc.wrapping_add(4);
+                    return Ok(StepResult::Continue);
+                }
+                return Err(format!(
+                    "unsupported system instruction {:#010x} at pc={:#x}",
+                    insn, self.pc
+                ));
+            }
+
+            match (op0, op1, crn, crm, op2) {
+                // TTBR0_EL1 = S3_0_C2_C0_0
+                (3, 0, 2, 0, 0) => {
+                    if l == 0 {
+                        self.ttbr0_el1 = self.read_x(rt);
+                    } else {
+                        let v = self.ttbr0_el1;
+                        self.write_x(rt, v);
+                    }
+                }
+                // TCR_EL1 = S3_0_C2_C0_2
+                (3, 0, 2, 0, 2) => {
+                    if l == 0 {
+                        self.tcr_el1 = self.read_x(rt);
+                    } else {
+                        let v = self.tcr_el1;
+                        self.write_x(rt, v);
+                    }
+                }
+                // SCTLR_EL1 = S3_0_C1_C0_0
+                (3, 0, 1, 0, 0) => {
+                    if l == 0 {
+                        self.sctlr_el1 = self.read_x(rt);
+                    } else {
+                        let v = self.sctlr_el1;
+                        self.write_x(rt, v);
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "{} of unsupported sysreg S{}_{}_C{}_C{}_{} at pc={:#x}",
+                        if l == 1 { "MRS" } else { "MSR" },
+                        op0, op1, crn, crm, op2,
+                        self.pc
+                    ));
+                }
+            }
+            self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
         // B label :: 0 00101 imm26
         if insn & 0xFC00_0000 == 0x1400_0000 {
             let imm26_raw = (insn & 0x03FF_FFFF) as i32;
@@ -361,22 +456,34 @@ impl Cpu {
     }
 
     fn load_demo(&mut self) {
-        // Program: write "Hello\n" to UART by repeated STR to [X1, #0] where X1 = UART_OUT.
-        let prog: [u32; 14] = [
-            movz(1, UART_OUT as u32, 0),      // MOVZ X1, #0x1000
+        // Demo program: enable the MMU using MSR, then write "Hello\n" through it.
+        // Page tables (L1/L2/L3) are pre-populated by setup_demo_pgtable; this
+        // routine only points TTBR0/TCR at them and flips SCTLR_EL1.M.
+        let prog: [u32; 21] = [
+            // --- bring up the MMU ---
+            movz(9, L1_TABLE_PA as u32, 0),   // X9 = 0x8000 (L1 table PA)
+            msr_ttbr0(9),                     // TTBR0_EL1 = X9
+            movz(9, 25, 0),                   // X9 = 25  (TCR.T0SZ → 39-bit VA)
+            msr_tcr(9),                       // TCR_EL1 = X9
+            movz(9, 1, 0),                    // X9 = 1   (SCTLR.M = 1)
+            msr_sctlr(9),                     // SCTLR_EL1 = X9 — MMU on
+            isb(),                            // realistic barrier; no-op for us
+
+            // --- the original Hello\n through the MMU ---
+            movz(1, UART_OUT as u32, 0),      // MOVZ X1, #0x1000 (UART VA)
             movz(0, b'H' as u32, 0),          // MOVZ X0, #'H'
-            str_imm(0, 1, 0),                 // STR  X0, [X1]
+            str_imm(0, 1, 0),                 // STR  X0, [X1]   (VA→PA via MMU)
             movz(0, b'e' as u32, 0),
             str_imm(0, 1, 0),
             movz(0, b'l' as u32, 0),
             str_imm(0, 1, 0),
-            str_imm(0, 1, 0),                 // 'l' twice
+            str_imm(0, 1, 0),
             movz(0, b'o' as u32, 0),
             str_imm(0, 1, 0),
             movz(0, b'\n' as u32, 0),
             str_imm(0, 1, 0),
-            add_imm(0, 0, 0),                 // NOP-ish (ADD X0, X0, #0) to show ADD too
-            b_self(),                          // halt
+            add_imm(0, 0, 0),                 // ADD X0, X0, #0 — ADD demo
+            b_self(),                         // B . — halt
         ];
         let mut off = ENTRY_PC as usize;
         for word in prog.iter() {
@@ -399,12 +506,14 @@ impl Cpu {
         write_u64(&mut self.mem, L3_TABLE_PA + 1 * 8, 0x1000 | page_attr);
         // VA 0x4000 -> PA 0x4000 (program page). Index = 4.
         write_u64(&mut self.mem, L3_TABLE_PA + 4 * 8, 0x4000 | page_attr);
+        // Page tables themselves at PA 0x8000-0xA000 — also identity-map them
+        // so a kernel could walk/edit them once MMU is on. Index = 8/9/A.
+        write_u64(&mut self.mem, L3_TABLE_PA + 8 * 8, 0x8000 | page_attr);
+        write_u64(&mut self.mem, L3_TABLE_PA + 9 * 8, 0x9000 | page_attr);
+        write_u64(&mut self.mem, L3_TABLE_PA + 0xA * 8, 0xA000 | page_attr);
 
-        // TCR_EL1.T0SZ = 25 → 39-bit VA → start level 1 with 4 KiB granule.
-        self.tcr_el1 = 25;
-        self.ttbr0_el1 = L1_TABLE_PA;
-        // SCTLR_EL1.M still 0 — translation is a separate query, not yet applied to LDR/STR.
-        self.sctlr_el1 = 0;
+        // TTBR0/TCR/SCTLR are NOT preloaded here — the demo program brings them
+        // up via MSR so the boot sequence is visible step-by-step.
     }
 
     fn do_translate(&self, va: u64) -> TranslationResult {
@@ -440,7 +549,7 @@ impl Cpu {
             let shift = 12 + 9 * (3 - level as u32);
             let index = ((va >> shift) & 0x1FF) as u32;
             let entry_addr = table_addr + (index as u64) * 8;
-            let descriptor = match self.load64(entry_addr) {
+            let descriptor = match self.read_pa_u64(entry_addr) {
                 Ok(d) => d,
                 Err(e) => {
                     steps.push(WalkStep {
@@ -587,6 +696,33 @@ const fn b_self() -> u32 {
     0x1400_0000
 }
 
+const fn msr_sysreg(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
+    // MSR Xt, sysreg :: 1101 0101 000 1 op0 op1 CRn CRm op2 Rt
+    0xD500_0000
+        | ((op0 & 0x3) << 19)
+        | ((op1 & 0x7) << 16)
+        | ((crn & 0xF) << 12)
+        | ((crm & 0xF) << 8)
+        | ((op2 & 0x7) << 5)
+        | (rt & 0x1F)
+}
+
+const fn msr_ttbr0(rt: u32) -> u32 {
+    msr_sysreg(rt, 3, 0, 2, 0, 0)
+}
+
+const fn msr_tcr(rt: u32) -> u32 {
+    msr_sysreg(rt, 3, 0, 2, 0, 2)
+}
+
+const fn msr_sctlr(rt: u32) -> u32 {
+    msr_sysreg(rt, 3, 0, 1, 0, 0)
+}
+
+const fn isb() -> u32 {
+    0xD503_3FDF
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,9 +749,16 @@ mod tests {
         assert_eq!(cpu.x[0], 12);
     }
 
+    /// Run only the demo's MMU bring-up sequence (the 7 instructions before
+    /// the Hello loop) so do_translate has TTBR0/TCR populated.
+    fn boot_mmu(cpu: &mut Cpu) {
+        cpu.run(7);
+    }
+
     #[test]
     fn translate_program_page() {
-        let cpu = Cpu::new();
+        let mut cpu = Cpu::new();
+        boot_mmu(&mut cpu);
         let r = cpu.do_translate(0x4000);
         assert!(r.fault.is_none(), "fault: {:?}", r.fault);
         assert_eq!(r.pa, Some(0x4000));
@@ -627,16 +770,33 @@ mod tests {
 
     #[test]
     fn translate_uart_page_with_offset() {
-        let cpu = Cpu::new();
+        let mut cpu = Cpu::new();
+        boot_mmu(&mut cpu);
         let r = cpu.do_translate(0x1abc);
         assert_eq!(r.pa, Some(0x1abc));
     }
 
     #[test]
     fn translate_unmapped_va_faults() {
-        let cpu = Cpu::new();
-        let r = cpu.do_translate(0x2000); // not in our 2-page identity map
+        let mut cpu = Cpu::new();
+        boot_mmu(&mut cpu);
+        let r = cpu.do_translate(0x2000);
         assert!(r.pa.is_none());
         assert!(r.fault.is_some());
+    }
+
+    #[test]
+    fn mmu_enables_after_msr_sctlr() {
+        let mut cpu = Cpu::new();
+        assert_eq!(cpu.sctlr_el1 & 1, 0);
+        boot_mmu(&mut cpu);
+        assert_eq!(cpu.ttbr0_el1, L1_TABLE_PA);
+        assert_eq!(cpu.tcr_el1, 25);
+        assert_eq!(cpu.sctlr_el1 & 1, 1);
+        // Continuing past MMU bring-up still works — fetches are now translated.
+        cpu.run(1000);
+        assert!(cpu.halted);
+        assert!(cpu.last_trap.is_none(), "trap: {:?}", cpu.last_trap);
+        assert_eq!(cpu.output(), "Hello\n");
     }
 }

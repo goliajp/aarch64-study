@@ -175,7 +175,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.2</Badge>
+          <Badge color="info">v0.3</Badge>
           {state.halted ? (
             <Badge color={state.last_trap ? 'danger' : 'success'}>
               {state.last_trap ? 'TRAP' : 'HALTED'}
@@ -185,9 +185,9 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          Tiny AArch64 simulator running in WASM. The demo program writes "Hello\n" to a
-          memory-mapped UART at 0x1000. Stage-1 page tables are pre-loaded — translation is shown
-          live below; SCTLR_EL1.M=0 so LDR/STR still bypass the MMU.
+          Tiny AArch64 simulator running in WASM. The demo program first uses MSR to point TTBR0_EL1
+          at the pre-built tables and then sets SCTLR_EL1.M=1 — every subsequent fetch and STR runs
+          through the MMU. Watch the panel below flip from M=0 to M=1 mid-run.
         </p>
       </header>
 
@@ -337,6 +337,16 @@ function MmuPanel({
         <div className="text-fg-muted text-xs">
           T0SZ={t0sz} · VA={vaBits} bits · 4 KiB granule · start level{' '}
           {trace && trace.steps.length > 0 ? trace.steps[0].level : '?'}
+        </div>
+
+        <div
+          className={`rounded border px-3 py-1.5 text-xs ${
+            mmuOn ? 'border-success/40 bg-success/10 text-success' : 'border-border text-fg-muted'
+          }`}
+        >
+          {mmuOn
+            ? 'Translation active — every fetch and LDR/STR runs through this walk.'
+            : 'Translation is a query only — fetches and LDR/STR bypass the MMU until SCTLR_EL1.M=1.'}
         </div>
 
         <div className="flex items-center gap-2">
