@@ -4,6 +4,7 @@
 export class Cpu {
     free(): void;
     [Symbol.dispose](): void;
+    aic_state(): any;
     entry_pc(): bigint;
     l1_table_pa(): bigint;
     mem_slice(start: number, len: number): Uint8Array;
@@ -17,14 +18,14 @@ export class Cpu {
      */
     state(): any;
     /**
-     * Step every core once. On the way in: bump system_steps; if the timer is
-     * due, raise irq_pending on core 0. Each core then either takes a pending
-     * IRQ (if DAIF.I clear) or executes one instruction.
+     * Step every core once. On the way in: bump system_steps; if the timer
+     * is due, broadcast IRQ_TIMER to all cores via AIC. Each core then either
+     * takes a pending IRQ (when DAIF.I is clear) or executes one instruction.
      */
     step(): boolean;
     /**
-     * Step a single core. Honours pending IRQs on that core (timer firing
-     * happens in `step()` only, but IPIs would land here in future versions).
+     * Step a single core. Honours pending IRQs on that core (set either by
+     * the system timer in `step()` or by another core via IPI MMIO).
      */
     step_core(idx: number): boolean;
     system_steps(): bigint;
@@ -46,6 +47,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_cpu_free: (a: number, b: number) => void;
+    readonly cpu_aic_state: (a: number) => [number, number, number];
     readonly cpu_mem_slice: (a: number, b: number, c: number) => [number, number];
     readonly cpu_new: () => number;
     readonly cpu_num_cores: (a: number) => number;
@@ -56,18 +58,18 @@ export interface InitOutput {
     readonly cpu_step: (a: number) => number;
     readonly cpu_step_core: (a: number, b: number) => number;
     readonly cpu_translate: (a: number, b: bigint, c: number) => [number, number, number];
-    readonly cpu_system_steps: (a: number) => bigint;
-    readonly cpu_timer_remaining: (a: number) => bigint;
     readonly cpu_entry_pc: (a: number) => bigint;
     readonly cpu_l1_table_pa: (a: number) => bigint;
     readonly cpu_timer_period: (a: number) => bigint;
     readonly cpu_uart_addr: (a: number) => bigint;
+    readonly cpu_timer_remaining: (a: number) => bigint;
+    readonly cpu_system_steps: (a: number) => bigint;
     readonly cpu_timer_ticks: (a: number) => bigint;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __externref_table_dealloc: (a: number) => void;
+    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_start: () => void;
 }
 

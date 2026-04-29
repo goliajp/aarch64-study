@@ -12,6 +12,16 @@ export class Cpu {
         wasm.__wbg_cpu_free(ptr, 0);
     }
     /**
+     * @returns {any}
+     */
+    aic_state() {
+        const ret = wasm.cpu_aic_state(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
      * @returns {bigint}
      */
     entry_pc() {
@@ -87,9 +97,9 @@ export class Cpu {
         return takeFromExternrefTable0(ret[0]);
     }
     /**
-     * Step every core once. On the way in: bump system_steps; if the timer is
-     * due, raise irq_pending on core 0. Each core then either takes a pending
-     * IRQ (if DAIF.I clear) or executes one instruction.
+     * Step every core once. On the way in: bump system_steps; if the timer
+     * is due, broadcast IRQ_TIMER to all cores via AIC. Each core then either
+     * takes a pending IRQ (when DAIF.I is clear) or executes one instruction.
      * @returns {boolean}
      */
     step() {
@@ -97,8 +107,8 @@ export class Cpu {
         return ret !== 0;
     }
     /**
-     * Step a single core. Honours pending IRQs on that core (timer firing
-     * happens in `step()` only, but IPIs would land here in future versions).
+     * Step a single core. Honours pending IRQs on that core (set either by
+     * the system timer in `step()` or by another core via IPI MMIO).
      * @param {number} idx
      * @returns {boolean}
      */

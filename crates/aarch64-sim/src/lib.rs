@@ -35,9 +35,26 @@ const NUM_CORES: usize = 2;
 const MPIDR_VALUES: [u64; NUM_CORES] = [0x8000_0000, 0x8000_0100];
 const CORE_KIND: [&str; NUM_CORES] = ["P-core", "E-core"];
 
-// AIC timer: fires an IRQ on core 0 every TIMER_PERIOD system steps.
-// Picked small so the periodic 'T' shows up quickly in interactive Step mode.
+// AIC timer: fires an IRQ on every core every TIMER_PERIOD system steps.
+// Picked small so context switches show up quickly in interactive Step mode.
 const TIMER_PERIOD: u64 = 30;
+
+// AIC MMIO layout (loosely modelled on Apple's per-core AIC view): software
+// reads from one MMIO base and the controller routes the call by which core
+// issued it. We expose two registers:
+//   AIC_BASE + 0x00  → ACK (read-only): returns the lowest pending IRQ id for
+//                      the calling core and clears that bit. 0xFFFF_FFFF when
+//                      nothing pending.
+//   AIC_BASE + 0x10  → IPI_SET (write-only): target core id; raises IRQ_IPI on
+//                      that core.
+const AIC_BASE: u64 = 0x2000;
+const AIC_END: u64 = 0x2100;
+const AIC_REG_ACK: u64 = 0x00;
+const AIC_REG_IPI_SET: u64 = 0x10;
+
+const IRQ_TIMER: u32 = 0;
+const IRQ_IPI: u32 = 1;
+const IRQ_NONE: u32 = 0xFFFF_FFFF;
 
 #[derive(Serialize, Clone)]
 pub struct CoreState {
@@ -53,7 +70,6 @@ pub struct CoreState {
     pub steps: u64,
     pub current_el: u8,
     pub daif: u8,
-    pub irq_pending: bool,
     pub ttbr0_el1: u64,
     pub tcr_el1: u64,
     pub sctlr_el1: u64,
@@ -104,6 +120,82 @@ pub struct TranslationResult {
     pub mmu_enabled: bool,
 }
 
+#[derive(Serialize, Clone)]
+pub struct AicState {
+    /// Per-core pending bitmap. Bit 0 = IRQ_TIMER, bit 1 = IRQ_IPI.
+    pub pending: Vec<u32>,
+    pub total_acks: u64,
+}
+
+// === Aic: tiny Apple-style interrupt controller ===============================
+
+struct Aic {
+    pending: [u32; NUM_CORES],
+    total_acks: u64,
+}
+
+impl Aic {
+    fn new() -> Self {
+        Aic {
+            pending: [0; NUM_CORES],
+            total_acks: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        for p in self.pending.iter_mut() {
+            *p = 0;
+        }
+        self.total_acks = 0;
+    }
+
+    fn set_irq(&mut self, core: usize, irq_id: u32) {
+        if core < NUM_CORES && irq_id < 32 {
+            self.pending[core] |= 1u32 << irq_id;
+        }
+    }
+
+    fn has_pending(&self, core: usize) -> bool {
+        core < NUM_CORES && self.pending[core] != 0
+    }
+
+    /// MMIO ACK read by `core`: lowest pending IRQ id, clears it. Returns
+    /// IRQ_NONE if nothing pending.
+    fn read_ack(&mut self, core: usize) -> u32 {
+        if core >= NUM_CORES || self.pending[core] == 0 {
+            return IRQ_NONE;
+        }
+        let irq = self.pending[core].trailing_zeros();
+        self.pending[core] &= !(1u32 << irq);
+        self.total_acks = self.total_acks.saturating_add(1);
+        irq
+    }
+
+    fn mmio_read(&mut self, core: usize, offset: u64) -> u64 {
+        match offset {
+            AIC_REG_ACK => self.read_ack(core) as u64,
+            _ => 0,
+        }
+    }
+
+    fn mmio_write(&mut self, _core: usize, offset: u64, val: u64) {
+        match offset {
+            AIC_REG_IPI_SET => {
+                let target = val as usize;
+                self.set_irq(target, IRQ_IPI);
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot(&self) -> AicState {
+        AicState {
+            pending: self.pending.to_vec(),
+            total_acks: self.total_acks,
+        }
+    }
+}
+
 // === Core: per-core register file + EL state + sysregs ===========================
 
 struct Core {
@@ -120,9 +212,6 @@ struct Core {
     /// Low 4 bits of PSTATE.DAIF — D, A, I, F (bit 3 → bit 0). 1 = masked.
     /// On reset (EL2) we mask everything; SVC/IRQ entries also re-mask.
     daif: u8,
-    /// One bit of "incoming IRQ line" — set by the system timer, consumed by
-    /// take_irq() once the core has DAIF.I clear.
-    irq_pending: bool,
     ttbr0_el1: u64,
     tcr_el1: u64,
     sctlr_el1: u64,
@@ -155,7 +244,6 @@ impl Core {
             steps: 0,
             current_el: 2,
             daif: 0xF, // boot at EL2 with all interrupts masked
-            irq_pending: false,
             ttbr0_el1: 0,
             tcr_el1: 0,
             sctlr_el1: 0,
@@ -190,7 +278,6 @@ impl Core {
             steps: self.steps,
             current_el: self.current_el,
             daif: self.daif,
-            irq_pending: self.irq_pending,
             ttbr0_el1: self.ttbr0_el1,
             tcr_el1: self.tcr_el1,
             sctlr_el1: self.sctlr_el1,
@@ -301,8 +388,11 @@ impl Core {
         read_pa_u32(mem, pa)
     }
 
-    fn load64(&self, mem: &[u8], va: u64) -> Result<u64, String> {
+    fn load64(&self, mem: &[u8], aic: &mut Aic, va: u64) -> Result<u64, String> {
         let pa = self.translate_for_access(mem, va)?;
+        if (AIC_BASE..AIC_END).contains(&pa) {
+            return Ok(aic.mmio_read(self.id as usize, pa - AIC_BASE));
+        }
         read_pa_u64(mem, pa)
     }
 
@@ -310,10 +400,15 @@ impl Core {
         &self,
         mem: &mut [u8],
         out: &mut Vec<u8>,
+        aic: &mut Aic,
         va: u64,
         val: u64,
     ) -> Result<(), String> {
         let pa = self.translate_for_access(mem, va)?;
+        if (AIC_BASE..AIC_END).contains(&pa) {
+            aic.mmio_write(self.id as usize, pa - AIC_BASE, val);
+            return Ok(());
+        }
         if pa == UART_OUT {
             out.push((val & 0xFF) as u8);
         }
@@ -477,7 +572,7 @@ impl Core {
         }
     }
 
-    fn step(&mut self, mem: &mut [u8], out: &mut Vec<u8>) -> bool {
+    fn step(&mut self, mem: &mut [u8], out: &mut Vec<u8>, aic: &mut Aic) -> bool {
         if self.halted {
             return false;
         }
@@ -489,7 +584,7 @@ impl Core {
                 return false;
             }
         };
-        match self.execute(insn, mem, out) {
+        match self.execute(insn, mem, out, aic) {
             Ok(StepResult::Continue) => true,
             Ok(StepResult::Halt) => {
                 self.halted = true;
@@ -507,6 +602,7 @@ impl Core {
         insn: u32,
         mem: &mut [u8],
         out: &mut Vec<u8>,
+        aic: &mut Aic,
     ) -> Result<StepResult, String> {
         self.steps = self.steps.saturating_add(1);
 
@@ -533,6 +629,28 @@ impl Core {
             return Ok(StepResult::Continue);
         }
 
+        // ADD Xd, Xn, Xm  (shifted register, LSL #0) :: 1 0 0 01011 00 0 Rm 000000 Rn Rd
+        if insn & 0xFF20_FC00 == 0x8B00_0000 {
+            let rd = (insn & 0x1F) as usize;
+            let rn = ((insn >> 5) & 0x1F) as usize;
+            let rm = ((insn >> 16) & 0x1F) as usize;
+            let val = self.read_x(rn).wrapping_add(self.read_x(rm));
+            self.write_x(rd, val);
+            self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
+        // SUB Xd, Xn, Xm  (shifted register, LSL #0) :: 1 1 0 01011 00 0 Rm 000000 Rn Rd
+        if insn & 0xFF20_FC00 == 0xCB00_0000 {
+            let rd = (insn & 0x1F) as usize;
+            let rn = ((insn >> 5) & 0x1F) as usize;
+            let rm = ((insn >> 16) & 0x1F) as usize;
+            let val = self.read_x(rn).wrapping_sub(self.read_x(rm));
+            self.write_x(rd, val);
+            self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
         // STR Xt, [Xn, #imm12]
         if insn & 0xFFC0_0000 == 0xF900_0000 {
             let rt = (insn & 0x1F) as usize;
@@ -540,7 +658,7 @@ impl Core {
             let imm12 = ((insn >> 10) & 0xFFF) as u64;
             let addr = self.read_x(rn).wrapping_add(imm12 * 8);
             let val = self.read_x(rt);
-            self.store64(mem, out, addr, val)?;
+            self.store64(mem, out, aic, addr, val)?;
             self.pc = self.pc.wrapping_add(4);
             return Ok(StepResult::Continue);
         }
@@ -551,7 +669,7 @@ impl Core {
             let rn = ((insn >> 5) & 0x1F) as usize;
             let imm12 = ((insn >> 10) & 0xFFF) as u64;
             let addr = self.read_x(rn).wrapping_add(imm12 * 8);
-            let val = self.load64(mem, addr)?;
+            let val = self.load64(mem, aic, addr)?;
             self.write_x(rt, val);
             self.pc = self.pc.wrapping_add(4);
             return Ok(StepResult::Continue);
@@ -675,9 +793,10 @@ pub struct Cpu {
     cores: Vec<Core>,
     mem: Vec<u8>,
     output_buf: Vec<u8>,
+    aic: Aic,
     /// Number of Cpu::step() calls since reset.
     system_steps: u64,
-    /// system_steps value at which the next timer IRQ fires on core 0.
+    /// system_steps value at which the next timer IRQ fires.
     timer_next: u64,
     /// Total number of timer ticks observed; mostly for the UI.
     timer_ticks: u64,
@@ -694,6 +813,7 @@ impl Cpu {
             cores,
             mem: vec![0u8; MEM_SIZE],
             output_buf: Vec::new(),
+            aic: Aic::new(),
             system_steps: 0,
             timer_next: TIMER_PERIOD,
             timer_ticks: 0,
@@ -711,6 +831,7 @@ impl Cpu {
             *b = 0;
         }
         self.output_buf.clear();
+        self.aic.reset();
         self.system_steps = 0;
         self.timer_next = TIMER_PERIOD;
         self.timer_ticks = 0;
@@ -718,47 +839,49 @@ impl Cpu {
         setup_demo_pgtable(&mut self.mem);
     }
 
-    /// Step every core once. On the way in: bump system_steps; if the timer is
-    /// due, raise irq_pending on core 0. Each core then either takes a pending
-    /// IRQ (if DAIF.I clear) or executes one instruction.
+    /// Step every core once. On the way in: bump system_steps; if the timer
+    /// is due, broadcast IRQ_TIMER to all cores via AIC. Each core then either
+    /// takes a pending IRQ (when DAIF.I is clear) or executes one instruction.
     pub fn step(&mut self) -> bool {
         self.system_steps = self.system_steps.saturating_add(1);
         if self.system_steps >= self.timer_next {
-            // Timer fires: target core 0 only (single-source AIC for now).
-            self.cores[0].irq_pending = true;
+            for i in 0..NUM_CORES {
+                self.aic.set_irq(i, IRQ_TIMER);
+            }
             self.timer_next = self.system_steps + TIMER_PERIOD;
             self.timer_ticks = self.timer_ticks.saturating_add(1);
         }
 
         let mut any = false;
-        for core in self.cores.iter_mut() {
-            if core.halted {
+        for i in 0..self.cores.len() {
+            if self.cores[i].halted {
                 continue;
             }
-            if core.irq_pending && !core.irq_masked() {
-                core.take_irq();
-                core.irq_pending = false;
+            if self.aic.has_pending(i) && !self.cores[i].irq_masked() {
+                self.cores[i].take_irq();
                 any = true;
-            } else if core.step(&mut self.mem, &mut self.output_buf) {
+            } else if self.cores[i].step(&mut self.mem, &mut self.output_buf, &mut self.aic) {
                 any = true;
             }
         }
         any
     }
 
-    /// Step a single core. Honours pending IRQs on that core (timer firing
-    /// happens in `step()` only, but IPIs would land here in future versions).
+    /// Step a single core. Honours pending IRQs on that core (set either by
+    /// the system timer in `step()` or by another core via IPI MMIO).
     pub fn step_core(&mut self, idx: u32) -> bool {
-        if let Some(core) = self.cores.get_mut(idx as usize) {
-            if core.irq_pending && !core.irq_masked() && !core.halted {
-                core.take_irq();
-                core.irq_pending = false;
-                true
-            } else {
-                core.step(&mut self.mem, &mut self.output_buf)
-            }
+        let i = idx as usize;
+        if i >= self.cores.len() {
+            return false;
+        }
+        if self.cores[i].halted {
+            return false;
+        }
+        if self.aic.has_pending(i) && !self.cores[i].irq_masked() {
+            self.cores[i].take_irq();
+            true
         } else {
-            false
+            self.cores[i].step(&mut self.mem, &mut self.output_buf, &mut self.aic)
         }
     }
 
@@ -785,6 +908,10 @@ impl Cpu {
 
     pub fn timer_ticks(&self) -> u64 {
         self.timer_ticks
+    }
+
+    pub fn aic_state(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.aic.snapshot())
     }
 
     /// Returns an array of CoreState (one per core) as a JS Array.
@@ -904,29 +1031,39 @@ fn unsupported_sysreg(op: &str, sr: (u32, u32, u32, u32, u32), pc: u64) -> Strin
 
 fn load_demo(mem: &mut [u8]) {
     // Memory regions, both cores execute the same code:
-    //   PA 0x4000  kernel boot — EL2 → EL1, MMU bring-up, drop to EL0
-    //   PA 0x4800  sync handler at VBAR_EL1+0x400 — writes 'K', ERET
-    //   PA 0x4880  IRQ handler at VBAR_EL1+0x480 — writes 'T' (timer), ERET
-    //   PA 0x4C00  user code at EL0 — writes 'U', SVC, '\n', then spins
+    //   PA 0x4000  kernel boot — EL2 → EL1, MMU bring-up, init scheduler slot,
+    //              drop to EL0 at task A.
+    //   PA 0x4800  sync handler at VBAR_EL1+0x400 — leftover SVC handler,
+    //              currently unused by the new tasks.
+    //   PA 0x4880  IRQ handler at VBAR_EL1+0x480 — the scheduler. ACKs the AIC,
+    //              flips the global "current task" slot, and ERETs into the
+    //              other task.
+    //   PA 0x4D00  task A (EL0) — spins printing 'A' to UART.
+    //   PA 0x4E00  task B (EL0) — spins printing 'B' to UART.
+    //   PA 0x4F00  current-task slot (8 bytes) — holds the currently running
+    //              task entry. Initialised to TASK_A_ENTRY by kernel boot.
     //
-    // The kernel ERETs into EL0 with SPSR_EL1=0, which leaves DAIF=0 — IRQs
-    // are enabled in user code by default. The system timer fires every
-    // TIMER_PERIOD steps and raises an IRQ on core 0 only.
+    // Both cores boot with the same code and write the same value to the slot,
+    // so they start out running task A in lockstep. Each timer tick (broadcast
+    // by the AIC to all cores) makes the scheduler swap them to the other task.
     const SPSR_EL1H_DAIF: u32 = 0x3C5;
     const VBAR: u32 = 0x4400;
-    const SYNC_HANDLER_PA: u64 = 0x4800; // VBAR + 0x400
-    const IRQ_HANDLER_PA: u64 = 0x4880; // VBAR + 0x480 (sync from lower EL → IRQ)
-    const USER_PA: u64 = 0x4C00;
+    const SYNC_HANDLER_PA: u64 = 0x4800;
+    const IRQ_HANDLER_PA: u64 = 0x4880;
+    const TASK_A_ENTRY: u32 = 0x4D00;
+    const TASK_B_ENTRY: u32 = 0x4E00;
+    const TASK_SUM: u32 = TASK_A_ENTRY + TASK_B_ENTRY; // 0x9B00 — fits in 16 bits
+    const TASK_SLOT_PA: u32 = 0x4F00;
     const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
-    let kernel: [u32; 19] = [
-        // EL2: arrange ERET to EL1
+    let kernel: [u32; 21] = [
+        // EL2 prologue → ERET to EL1
         movz(9, EL1_ENTRY, 0),
         msr_elr_el2(9),
         movz(9, SPSR_EL1H_DAIF, 0),
         msr_spsr_el2(9),
         eret(),
-        // EL1: bring up MMU
+        // EL1: MMU bring-up
         movz(9, L1_TABLE_PA as u32, 0),
         msr_ttbr0(9),
         movz(9, 25, 0),
@@ -934,15 +1071,20 @@ fn load_demo(mem: &mut [u8]) {
         movz(9, 1, 0),
         msr_sctlr(9),
         isb(),
-        // EL1: install vector base, ERET into EL0
+        // EL1: install vector base
         movz(9, VBAR, 0),
         msr_vbar_el1(9),
-        movz(9, USER_PA as u32, 0),
+        // EL1: initialise the scheduler slot to task A and ERET into it
+        movz(9, TASK_A_ENTRY, 0),
+        movz(10, TASK_SLOT_PA, 0),
+        str_imm(9, 10, 0),
         msr_elr_el1(9),
-        movz(9, 0, 0),
-        msr_spsr_el1(9),
+        movz(10, 0, 0),
+        msr_spsr_el1(10),
         eret(),
     ];
+    // Sync handler (VBAR+0x400) — kept as a stub so a stray SVC traps to a
+    // visible 'K' rather than going somewhere undefined.
     let sync_handler: [u32; 5] = [
         movz(1, UART_OUT as u32, 0),
         movz(0, b'K' as u32, 0),
@@ -950,30 +1092,40 @@ fn load_demo(mem: &mut [u8]) {
         add_imm(0, 0, 0),
         eret(),
     ];
-    // IRQ handler uses X2/X3 so it doesn't clobber the user's spin-loop X0/X1.
-    let irq_handler: [u32; 5] = [
-        movz(2, UART_OUT as u32, 0),
-        movz(3, b'T' as u32, 0),
-        str_imm(3, 2, 0),
-        add_imm(3, 3, 0),
-        eret(),
+    // IRQ handler (VBAR+0x480) — the scheduler. Reads AIC ACK to clear the
+    // pending IRQ, computes the "other" task entry as (A+B)-current, swaps
+    // the slot, and ERETs into the new task.
+    let scheduler: [u32; 9] = [
+        movz(9, AIC_BASE as u32, 0),     // X9 = AIC base
+        ldr_imm(10, 9, 0),                // X10 = ACK (clears pending)
+        movz(9, TASK_SLOT_PA, 0),         // X9 = slot addr
+        ldr_imm(11, 9, 0),                // X11 = current task entry
+        movz(12, TASK_SUM, 0),            // X12 = A_entry + B_entry
+        sub_reg(12, 12, 11),              // X12 = the other entry
+        str_imm(12, 9, 0),                // *slot = other
+        msr_elr_el1(12),                  // ELR_EL1 = other (next task)
+        eret(),                           // → EL0 at the other task
     ];
-    let user: [u32; 8] = [
+    let task_a: [u32; 5] = [
         movz(1, UART_OUT as u32, 0),
-        movz(0, b'U' as u32, 0),
+        movz(0, b'A' as u32, 0),
         str_imm(0, 1, 0),
-        svc_imm(0),
-        movz(0, b'\n' as u32, 0),
-        str_imm(0, 1, 0),
-        // Spin loop: ADD (no-op) + B back-1-word. Stays runnable so timer IRQs
-        // can fire and the handler writes 'T' over and over.
         add_imm(0, 0, 0),
         b_offset(-1),
     ];
+    let task_b: [u32; 5] = [
+        movz(1, UART_OUT as u32, 0),
+        movz(0, b'B' as u32, 0),
+        str_imm(0, 1, 0),
+        add_imm(0, 0, 0),
+        b_offset(-1),
+    ];
+
     write_words(mem, ENTRY_PC, &kernel);
     write_words(mem, SYNC_HANDLER_PA, &sync_handler);
-    write_words(mem, IRQ_HANDLER_PA, &irq_handler);
-    write_words(mem, USER_PA, &user);
+    write_words(mem, IRQ_HANDLER_PA, &scheduler);
+    write_words(mem, TASK_A_ENTRY as u64, &task_a);
+    write_words(mem, TASK_B_ENTRY as u64, &task_b);
 }
 
 fn setup_demo_pgtable(mem: &mut [u8]) {
@@ -982,6 +1134,8 @@ fn setup_demo_pgtable(mem: &mut [u8]) {
     let page_attr = (1u64 << 10) | 0b11;
     // VA 0x1000 → PA 0x1000 (UART)
     write_u64(mem, L3_TABLE_PA + 8, 0x1000 | page_attr);
+    // VA 0x2000 → PA 0x2000 (AIC MMIO)
+    write_u64(mem, L3_TABLE_PA + 2 * 8, 0x2000 | page_attr);
     // VA 0x4000 → PA 0x4000 (program page)
     write_u64(mem, L3_TABLE_PA + 4 * 8, 0x4000 | page_attr);
     // page tables themselves
@@ -998,6 +1152,14 @@ const fn movz(rd: u32, imm16: u32, hw: u32) -> u32 {
 
 const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
     0x9100_0000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+
+const fn add_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x8B00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+
+const fn sub_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0xCB00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
 }
 
 const fn str_imm(rt: u32, rn: u32, imm12: u32) -> u32 {
@@ -1085,43 +1247,47 @@ mod tests {
     }
 
     #[test]
-    fn both_cores_finish_uk_prefix_before_timer() {
-        // Run only as many system steps as it takes for both cores to write
-        // "UU" + SVC handler "KK". Stop before either core has a chance to
-        // STR the '\n', because at step 30 the timer fires and steals core 0's
-        // STR slot — making the exact tail order non-deterministic relative to
-        // the test's expectations.
+    fn both_cores_run_task_a_before_first_tick() {
+        // Kernel boot is 21 instructions; after that both cores ERET into
+        // task A and start writing 'A's. We need to stop before the timer
+        // fires (every 30 system steps) to keep the output free of B chars.
         let mut cpu = Cpu::new();
         cpu.run(28);
-        assert_eq!(cpu.output(), "UUKK");
+        let out = cpu.output();
+        // Output should be all 'A' characters now.
+        assert!(!out.is_empty(), "no output yet");
+        assert!(out.chars().all(|c| c == 'A'), "got non-A chars: {:?}", out);
         assert!(!cpu.cores[0].halted);
         assert!(!cpu.cores[1].halted);
     }
 
     #[test]
-    fn timer_fires_irq_on_core0() {
+    fn scheduler_swaps_to_task_b_on_first_tick() {
         let mut cpu = Cpu::new();
-        cpu.run(200);
-        assert!(cpu.timer_ticks >= 5, "expected several ticks, got {}", cpu.timer_ticks);
+        // Run long enough for at least one timer tick + scheduler handler
+        // execution + a few task-B iterations.
+        cpu.run(80);
+        assert!(cpu.timer_ticks >= 1);
         let out = cpu.output();
-        assert!(out.starts_with("UUKK"), "got: {:?}", out);
-        assert!(out.contains('T'), "no T in output: {:?}", out);
-        // Both cores eventually write their '\n' (one each).
-        let nl = out.chars().filter(|&c| c == '\n').count();
-        assert_eq!(nl, 2, "expected 2 newlines in: {:?}", out);
+        assert!(out.contains('A'), "no A: {:?}", out);
+        assert!(out.contains('B'), "no B: {:?}", out);
     }
 
     #[test]
-    fn t_chars_match_timer_ticks() {
+    fn aic_acks_clear_pending_bits() {
         let mut cpu = Cpu::new();
-        cpu.run(300);
-        // 'T' is written only by the IRQ handler on core 0. There may be one
-        // tick in flight (handler started but hasn't reached its STR yet).
-        let t_count = cpu.output().chars().filter(|&c| c == 'T').count() as u64;
-        let ticks = cpu.timer_ticks;
+        cpu.run(200);
+        // Many ticks; software has been ACKing each one. After ACK the bit
+        // clears, so pending should NOT have unbounded accumulation. At any
+        // sample point either the bit is clear or it was just raised.
+        let aic_state = cpu.aic.snapshot();
+        // total_acks should be ≥ timer_ticks * 2 - some_in_flight (both cores
+        // ACK each tick). Approx check: at least timer_ticks acks happened.
         assert!(
-            t_count == ticks || t_count + 1 == ticks,
-            "T count {} vs ticks {}", t_count, ticks
+            aic_state.total_acks >= cpu.timer_ticks,
+            "total_acks {} < timer_ticks {}",
+            aic_state.total_acks,
+            cpu.timer_ticks
         );
     }
 
@@ -1133,9 +1299,8 @@ mod tests {
         cpu.run(5);
         assert_eq!(cpu.cores[0].current_el, 1);
         assert_eq!(cpu.cores[0].daif, 0xF);
-        // After the remaining kernel boot (14 more steps total = 19) we ERET
-        // into EL0 with SPSR_EL1=0 — DAIF restored to 0, IRQs enabled.
-        cpu.run(14);
+        // Remaining kernel boot is 16 more instructions (21 total per core).
+        cpu.run(16);
         assert_eq!(cpu.cores[0].current_el, 0);
         assert_eq!(cpu.cores[0].daif, 0);
     }

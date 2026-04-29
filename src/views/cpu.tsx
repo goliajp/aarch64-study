@@ -16,7 +16,6 @@ interface CoreState {
   steps: bigint
   current_el: number
   daif: number
-  irq_pending: boolean
   ttbr0_el1: bigint
   tcr_el1: bigint
   sctlr_el1: bigint
@@ -28,6 +27,11 @@ interface CoreState {
   elr_el2: bigint
   spsr_el2: bigint
   esr_el2: bigint
+}
+
+interface AicState {
+  pending: number[]
+  total_acks: bigint
 }
 
 interface SystemInfo {
@@ -93,6 +97,7 @@ function parseHex(text: string): bigint | null {
 export function CpuView() {
   const [cpu, setCpu] = useState<Cpu | null>(null)
   const [cores, setCores] = useState<CoreState[] | null>(null)
+  const [aic, setAic] = useState<AicState | null>(null)
   const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null)
   const [memory, setMemory] = useState<Uint8Array>(new Uint8Array(MEMORY_VIEW_BYTES))
   const [output, setOutput] = useState('')
@@ -104,6 +109,7 @@ export function CpuView() {
   const refresh = useCallback((c: Cpu) => {
     const s = c.state() as CoreState[]
     setCores(s)
+    setAic(c.aic_state() as AicState)
     setSysInfo({
       systemSteps: c.system_steps(),
       timerPeriod: c.timer_period(),
@@ -198,7 +204,7 @@ export function CpuView() {
     }
   }, [cpu, cores, vaText, translateCoreIdx])
 
-  if (!cpu || !cores || !sysInfo) {
+  if (!cpu || !cores || !sysInfo || !aic) {
     return <div className="text-fg-muted text-sm">Loading WASM…</div>
   }
 
@@ -217,7 +223,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.7</Badge>
+          <Badge color="info">v0.8</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -228,14 +234,17 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          AIC timer fires an IRQ on core 0 every {sysInfo.timerPeriod.toString()} system steps. Once
-          user code has DAIF.I clear, the IRQ is taken: PC jumps to <code>VBAR_EL1+0x480</code>, the
-          handler writes 'T' to UART, ERET restores DAIF + EL. Hit <strong>Run</strong> and watch
-          the output grow with periodic 'T' chars.
+          AIC broadcasts an IRQ to every core every {sysInfo.timerPeriod.toString()} system steps.
+          The IRQ handler at <code>VBAR_EL1+0x480</code> reads <code>AIC_BASE+0x00</code> to ACK,
+          computes the other task entry as <code>(A_entry+B_entry)-current</code>, swaps the global
+          slot, and ERETs into the new task. Both cores boot into task A; each tick swaps them to B
+          and back.
         </p>
       </header>
 
       <SystemInfoBar info={sysInfo} totalCoreSteps={cores.reduce((a, c) => a + c.steps, 0n)} />
+
+      <AicPanel aic={aic} />
 
       <div className="flex flex-wrap items-center gap-2">
         <GlassButton onClick={onStep} size="sm" variant="accent">
@@ -274,6 +283,66 @@ export function CpuView() {
         vaText={vaText}
       />
     </div>
+  )
+}
+
+const IRQ_NAMES = ['TIMER', 'IPI']
+const TASK_A_ENTRY = 0x4d00
+const TASK_B_ENTRY = 0x4e00
+
+function inferTaskLabel(pc: bigint): string | null {
+  const p = Number(pc)
+  if (p >= TASK_A_ENTRY && p < TASK_A_ENTRY + 0x20) return 'task A'
+  if (p >= TASK_B_ENTRY && p < TASK_B_ENTRY + 0x20) return 'task B'
+  if (p >= 0x4880 && p < 0x4900) return 'IRQ handler (sched)'
+  if (p >= 0x4800 && p < 0x4880) return 'sync handler'
+  if (p >= 0x4000 && p < 0x4400) return 'kernel boot'
+  return null
+}
+
+function AicPanel({ aic }: { aic: AicState }) {
+  return (
+    <GlassCard>
+      <div className="space-y-2 p-4">
+        <div className="text-fg-muted flex items-center justify-between">
+          <span className="text-[10px] font-semibold tracking-wider uppercase">
+            AIC · Apple-style interrupt controller
+          </span>
+          <span className="font-mono text-[10px]">
+            base 0x2000 · ACK reads cleared {aic.total_acks.toString()}
+          </span>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          {aic.pending.map((bits, i) => (
+            <div
+              className="border-border bg-bg/40 rounded border px-3 py-2 font-mono text-xs"
+              key={i}
+            >
+              <div className="text-fg-muted mb-1 text-[10px] tracking-wider uppercase">
+                core {i} pending
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-fg">0x{bits.toString(16).padStart(8, '0')}</span>
+                <span className="flex gap-1">
+                  {IRQ_NAMES.map((name, b) => (
+                    <span
+                      className={
+                        (bits & (1 << b)) !== 0
+                          ? 'rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-amber-300'
+                          : 'border-border text-fg-muted rounded border px-1.5 py-0.5'
+                      }
+                      key={name}
+                    >
+                      {name}
+                    </span>
+                  ))}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </GlassCard>
   )
 }
 
@@ -350,11 +419,14 @@ function CoreColumn({ core, onStep }: { core: CoreState; onStep: () => void }) {
         <div className="flex flex-wrap items-center gap-2">
           <CoreChip core={core} />
           <DaifChip daif={core.daif} />
-          {core.irq_pending && (
-            <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] tracking-wider text-amber-300">
-              IRQ pending
-            </span>
-          )}
+          {(() => {
+            const label = inferTaskLabel(core.pc)
+            return label ? (
+              <span className="border-border bg-bg/40 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] tracking-wider">
+                {label}
+              </span>
+            ) : null
+          })()}
           {core.halted && (
             <Badge color={core.last_trap ? 'danger' : 'success'}>
               {core.last_trap ? 'TRAP' : 'HALTED'}
