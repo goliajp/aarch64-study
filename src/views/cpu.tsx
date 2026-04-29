@@ -11,9 +11,16 @@ interface CpuState {
   halted: boolean
   last_trap: string | null
   steps: bigint
+  current_el: number
   ttbr0_el1: bigint
   tcr_el1: bigint
   sctlr_el1: bigint
+  vbar_el1: bigint
+  elr_el1: bigint
+  spsr_el1: bigint
+  vbar_el2: bigint
+  elr_el2: bigint
+  spsr_el2: bigint
 }
 
 interface PageAttrs {
@@ -175,7 +182,8 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.3</Badge>
+          <Badge color="info">v0.4</Badge>
+          <ElBadge el={state.current_el} />
           {state.halted ? (
             <Badge color={state.last_trap ? 'danger' : 'success'}>
               {state.last_trap ? 'TRAP' : 'HALTED'}
@@ -185,9 +193,10 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          Tiny AArch64 simulator running in WASM. The demo program first uses MSR to point TTBR0_EL1
-          at the pre-built tables and then sets SCTLR_EL1.M=1 — every subsequent fetch and STR runs
-          through the MMU. Watch the panel below flip from M=0 to M=1 mid-run.
+          Cold boot lands at EL2 (matching how m1n1 hands off on Apple Silicon). The first 5
+          instructions configure ELR_EL2 + SPSR_EL2 and ERET into EL1; the next 7 bring up the MMU;
+          the rest writes "Hello\n" through the live MMU. Watch the EL badge change and the MMU
+          panel flip from M=0 to M=1.
         </p>
       </header>
 
@@ -219,8 +228,61 @@ export function CpuView() {
 
       <MemoryPanel base={memBaseAddr} bytes={memory} pc={Number(state.pc)} />
 
+      <ExceptionPanel state={state} />
+
       <MmuPanel state={state} trace={trace} vaText={vaText} onVaChange={setVaText} />
     </div>
+  )
+}
+
+function ElBadge({ el }: { el: number }) {
+  // Visually distinct color per EL: EL2 = cyan (hypervisor), EL1 = violet
+  // (kernel), EL0 = neutral (user). We don't model EL3.
+  const cls =
+    el === 2
+      ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+      : el === 1
+        ? 'bg-violet-500/20 text-violet-300 border-violet-500/40'
+        : 'bg-neutral-500/20 text-neutral-300 border-neutral-500/40'
+  return (
+    <span
+      className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wider ${cls}`}
+    >
+      EL{el}
+    </span>
+  )
+}
+
+function ExceptionPanel({ state }: { state: CpuState }) {
+  return (
+    <GlassCard>
+      <div className="space-y-3 p-4">
+        <div className="text-fg-muted flex items-center justify-between">
+          <span className="text-[10px] font-semibold tracking-wider uppercase">
+            Exception Levels
+          </span>
+          <ElBadge el={state.current_el} />
+        </div>
+        <div className="grid gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-2">
+          <div className="text-fg-muted col-span-full text-[10px] tracking-wider uppercase">
+            EL2 (hypervisor)
+          </div>
+          <RegRow label="VBAR_EL2" value={state.vbar_el2} />
+          <RegRow label="ELR_EL2" value={state.elr_el2} />
+          <RegRow label="SPSR_EL2" value={state.spsr_el2} />
+          <div className="text-fg-muted col-span-full mt-2 text-[10px] tracking-wider uppercase">
+            EL1 (kernel)
+          </div>
+          <RegRow label="VBAR_EL1" value={state.vbar_el1} />
+          <RegRow label="ELR_EL1" value={state.elr_el1} />
+          <RegRow label="SPSR_EL1" value={state.spsr_el1} />
+        </div>
+        <div className="text-fg-muted text-xs">
+          ERET reads ELR_EL{state.current_el} into PC and decodes the new EL from SPSR_EL
+          {state.current_el}.M[3:2].
+        </div>
+      </div>
+    </GlassCard>
   )
 }
 

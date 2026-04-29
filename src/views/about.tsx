@@ -24,12 +24,13 @@ export function AboutView() {
           <pre className="text-fg-muted overflow-x-auto p-4 font-mono text-xs leading-relaxed">
             {`v0.1  registers + 5 instructions (MOVZ ADD LDR STR B) + MMIO UART
 v0.2  + MMU stage-1 page-table walk (4 KiB granule, identity-map demo)
-v0.3  + MSR/MRS + SCTLR_EL1.M honoured (LDR/STR/fetch all through MMU)  ← here
-v0.4  + EL0/EL1/EL2 exception levels
-v0.5  + two cores (P-core / E-core) side by side       ← Apple-specific
-v0.6  + AIC interrupt controller (timeline)
-v0.7  + scheduler (per-core run queues)
-v0.8  + virtio device (Type-1 hypervisor seed)
+v0.3  + MSR/MRS + SCTLR_EL1.M honoured (LDR/STR/fetch all through MMU)
+v0.4  + EL2 boot + ERET drops to EL1 (current_el visible, ELR/SPSR sysregs)  ← here
+v0.5  + SVC raises EL0 → EL1, ERET returns (full round-trip)
+v0.6  + two cores (P-core / E-core) side by side       ← Apple-specific
+v0.7  + AIC interrupt controller (timeline)
+v0.8  + scheduler (per-core run queues)
+v0.9  + virtio device (Type-1 hypervisor seed)
 v1.0  same Rust code on bare metal via m1n1`}
           </pre>
         </Card>

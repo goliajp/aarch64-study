@@ -36,9 +36,16 @@ pub struct CpuState {
     pub halted: bool,
     pub last_trap: Option<String>,
     pub steps: u64,
+    pub current_el: u8,
     pub ttbr0_el1: u64,
     pub tcr_el1: u64,
     pub sctlr_el1: u64,
+    pub vbar_el1: u64,
+    pub elr_el1: u64,
+    pub spsr_el1: u64,
+    pub vbar_el2: u64,
+    pub elr_el2: u64,
+    pub spsr_el2: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -94,9 +101,16 @@ pub struct Cpu {
     halted: bool,
     last_trap: Option<String>,
     steps: u64,
+    current_el: u8,
     ttbr0_el1: u64,
     tcr_el1: u64,
     sctlr_el1: u64,
+    vbar_el1: u64,
+    elr_el1: u64,
+    spsr_el1: u64,
+    vbar_el2: u64,
+    elr_el2: u64,
+    spsr_el2: u64,
 }
 
 #[wasm_bindgen]
@@ -113,9 +127,19 @@ impl Cpu {
             halted: false,
             last_trap: None,
             steps: 0,
+            // CPU comes out of reset at the highest implemented EL. We model
+            // EL2 as the boot level (consistent with where m1n1 hands off on
+            // Apple Silicon).
+            current_el: 2,
             ttbr0_el1: 0,
             tcr_el1: 0,
             sctlr_el1: 0,
+            vbar_el1: 0,
+            elr_el1: 0,
+            spsr_el1: 0,
+            vbar_el2: 0,
+            elr_el2: 0,
+            spsr_el2: 0,
         };
         cpu.load_demo();
         cpu.setup_demo_pgtable();
@@ -134,9 +158,16 @@ impl Cpu {
         self.halted = false;
         self.last_trap = None;
         self.steps = 0;
+        self.current_el = 2;
         self.ttbr0_el1 = 0;
         self.tcr_el1 = 0;
         self.sctlr_el1 = 0;
+        self.vbar_el1 = 0;
+        self.elr_el1 = 0;
+        self.spsr_el1 = 0;
+        self.vbar_el2 = 0;
+        self.elr_el2 = 0;
+        self.spsr_el2 = 0;
         self.load_demo();
         self.setup_demo_pgtable();
     }
@@ -185,9 +216,16 @@ impl Cpu {
             halted: self.halted,
             last_trap: self.last_trap.clone(),
             steps: self.steps,
+            current_el: self.current_el,
             ttbr0_el1: self.ttbr0_el1,
             tcr_el1: self.tcr_el1,
             sctlr_el1: self.sctlr_el1,
+            vbar_el1: self.vbar_el1,
+            elr_el1: self.elr_el1,
+            spsr_el1: self.spsr_el1,
+            vbar_el2: self.vbar_el2,
+            elr_el2: self.elr_el2,
+            spsr_el2: self.spsr_el2,
         })
     }
 
@@ -385,44 +423,40 @@ impl Cpu {
                 ));
             }
 
-            match (op0, op1, crn, crm, op2) {
-                // TTBR0_EL1 = S3_0_C2_C0_0
-                (3, 0, 2, 0, 0) => {
-                    if l == 0 {
-                        self.ttbr0_el1 = self.read_x(rt);
-                    } else {
-                        let v = self.ttbr0_el1;
-                        self.write_x(rt, v);
-                    }
-                }
-                // TCR_EL1 = S3_0_C2_C0_2
-                (3, 0, 2, 0, 2) => {
-                    if l == 0 {
-                        self.tcr_el1 = self.read_x(rt);
-                    } else {
-                        let v = self.tcr_el1;
-                        self.write_x(rt, v);
-                    }
-                }
-                // SCTLR_EL1 = S3_0_C1_C0_0
-                (3, 0, 1, 0, 0) => {
-                    if l == 0 {
-                        self.sctlr_el1 = self.read_x(rt);
-                    } else {
-                        let v = self.sctlr_el1;
-                        self.write_x(rt, v);
-                    }
-                }
-                _ => {
-                    return Err(format!(
-                        "{} of unsupported sysreg S{}_{}_C{}_C{}_{} at pc={:#x}",
-                        if l == 1 { "MRS" } else { "MSR" },
-                        op0, op1, crn, crm, op2,
-                        self.pc
-                    ));
-                }
+            let sr = (op0, op1, crn, crm, op2);
+            if l == 0 {
+                let val = self.read_x(rt);
+                self.write_sysreg(sr, val)?;
+            } else {
+                let val = self.read_sysreg(sr)?;
+                self.write_x(rt, val);
             }
             self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
+        // ERET :: 1101 0110 1001 1111 0000 0011 1110 0000
+        // Restores PC ← ELR_EL<current>, EL ← SPSR_EL<current>.M[3:2].
+        if insn == 0xD69F_03E0 {
+            let (elr, spsr) = match self.current_el {
+                2 => (self.elr_el2, self.spsr_el2),
+                1 => (self.elr_el1, self.spsr_el1),
+                _ => {
+                    return Err(format!(
+                        "ERET from EL{} (no exception state) at pc={:#x}",
+                        self.current_el, self.pc
+                    ));
+                }
+            };
+            let new_el = ((spsr >> 2) & 0x3) as u8;
+            if new_el > self.current_el {
+                return Err(format!(
+                    "ERET would raise EL{} → EL{} (illegal) at pc={:#x}",
+                    self.current_el, new_el, self.pc
+                ));
+            }
+            self.current_el = new_el;
+            self.pc = elr;
             return Ok(StepResult::Continue);
         }
 
@@ -455,12 +489,63 @@ impl Cpu {
         }
     }
 
+    /// Sysreg dispatch — keyed on (op0, op1, CRn, CRm, op2). Privilege
+    /// checks are intentionally skipped in this toy: a kernel at any EL can
+    /// read/write any sysreg we model.
+    fn read_sysreg(&self, sr: (u32, u32, u32, u32, u32)) -> Result<u64, String> {
+        Ok(match sr {
+            (3, 0, 2, 0, 0) => self.ttbr0_el1,
+            (3, 0, 2, 0, 2) => self.tcr_el1,
+            (3, 0, 1, 0, 0) => self.sctlr_el1,
+            (3, 0, 12, 0, 0) => self.vbar_el1,
+            (3, 0, 4, 0, 0) => self.spsr_el1,
+            (3, 0, 4, 0, 1) => self.elr_el1,
+            (3, 4, 12, 0, 0) => self.vbar_el2,
+            (3, 4, 4, 0, 0) => self.spsr_el2,
+            (3, 4, 4, 0, 1) => self.elr_el2,
+            // CurrentEL is read-only; bits [3:2] = current_el.
+            (3, 0, 4, 2, 2) => (self.current_el as u64) << 2,
+            _ => return Err(unsupported_sysreg("MRS", sr, self.pc)),
+        })
+    }
+
+    fn write_sysreg(&mut self, sr: (u32, u32, u32, u32, u32), val: u64) -> Result<(), String> {
+        match sr {
+            (3, 0, 2, 0, 0) => self.ttbr0_el1 = val,
+            (3, 0, 2, 0, 2) => self.tcr_el1 = val,
+            (3, 0, 1, 0, 0) => self.sctlr_el1 = val,
+            (3, 0, 12, 0, 0) => self.vbar_el1 = val,
+            (3, 0, 4, 0, 0) => self.spsr_el1 = val,
+            (3, 0, 4, 0, 1) => self.elr_el1 = val,
+            (3, 4, 12, 0, 0) => self.vbar_el2 = val,
+            (3, 4, 4, 0, 0) => self.spsr_el2 = val,
+            (3, 4, 4, 0, 1) => self.elr_el2 = val,
+            // CurrentEL is read-only.
+            (3, 0, 4, 2, 2) => return Err("MSR to CurrentEL (read-only)".into()),
+            _ => return Err(unsupported_sysreg("MSR", sr, self.pc)),
+        }
+        Ok(())
+    }
+
     fn load_demo(&mut self) {
-        // Demo program: enable the MMU using MSR, then write "Hello\n" through it.
-        // Page tables (L1/L2/L3) are pre-populated by setup_demo_pgtable; this
-        // routine only points TTBR0/TCR at them and flips SCTLR_EL1.M.
-        let prog: [u32; 21] = [
-            // --- bring up the MMU ---
+        // Two-phase demo:
+        //   Phase 1 (EL2): set ELR_EL2 + SPSR_EL2, ERET to drop into EL1.
+        //   Phase 2 (EL1): bring up MMU, write "Hello\n" via UART.
+        //
+        // SPSR_EL2 value 0x3C5 = M[3:0]=0b0101 (EL1h, use SP_EL1) + DAIF masked.
+        const SPSR_EL1H_DAIF: u32 = 0x3C5;
+        // EL1 entry sits 5 instructions past PC=0x4000 → 0x4014.
+        const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
+
+        let prog: [u32; 26] = [
+            // --- Phase 1 @ EL2: arrange the drop into EL1 ---
+            movz(9, EL1_ENTRY, 0),            // X9 = 0x4014
+            msr_elr_el2(9),                   // ELR_EL2 = X9
+            movz(9, SPSR_EL1H_DAIF, 0),       // X9 = 0x3C5
+            msr_spsr_el2(9),                  // SPSR_EL2 = X9
+            eret(),                           // ERET — now at EL1, PC = 0x4014
+
+            // --- Phase 2 @ EL1: bring up the MMU ---
             movz(9, L1_TABLE_PA as u32, 0),   // X9 = 0x8000 (L1 table PA)
             msr_ttbr0(9),                     // TTBR0_EL1 = X9
             movz(9, 25, 0),                   // X9 = 25  (TCR.T0SZ → 39-bit VA)
@@ -469,10 +554,10 @@ impl Cpu {
             msr_sctlr(9),                     // SCTLR_EL1 = X9 — MMU on
             isb(),                            // realistic barrier; no-op for us
 
-            // --- the original Hello\n through the MMU ---
+            // --- Hello\n through the MMU ---
             movz(1, UART_OUT as u32, 0),      // MOVZ X1, #0x1000 (UART VA)
-            movz(0, b'H' as u32, 0),          // MOVZ X0, #'H'
-            str_imm(0, 1, 0),                 // STR  X0, [X1]   (VA→PA via MMU)
+            movz(0, b'H' as u32, 0),
+            str_imm(0, 1, 0),
             movz(0, b'e' as u32, 0),
             str_imm(0, 1, 0),
             movz(0, b'l' as u32, 0),
@@ -482,8 +567,8 @@ impl Cpu {
             str_imm(0, 1, 0),
             movz(0, b'\n' as u32, 0),
             str_imm(0, 1, 0),
-            add_imm(0, 0, 0),                 // ADD X0, X0, #0 — ADD demo
-            b_self(),                         // B . — halt
+            add_imm(0, 0, 0),
+            b_self(),                          // halt
         ];
         let mut off = ENTRY_PC as usize;
         for word in prog.iter() {
@@ -663,6 +748,13 @@ fn write_u64(mem: &mut [u8], addr: u64, val: u64) {
     mem[a..a + 8].copy_from_slice(&val.to_le_bytes());
 }
 
+fn unsupported_sysreg(op: &str, sr: (u32, u32, u32, u32, u32), pc: u64) -> String {
+    format!(
+        "{op} of unsupported sysreg S{}_{}_C{}_C{}_{} at pc={:#x}",
+        sr.0, sr.1, sr.2, sr.3, sr.4, pc
+    )
+}
+
 fn decode_attrs(desc: u64) -> PageAttrs {
     PageAttrs {
         af: (desc >> 10) & 1 != 0,
@@ -719,8 +811,20 @@ const fn msr_sctlr(rt: u32) -> u32 {
     msr_sysreg(rt, 3, 0, 1, 0, 0)
 }
 
+const fn msr_elr_el2(rt: u32) -> u32 {
+    msr_sysreg(rt, 3, 4, 4, 0, 1)
+}
+
+const fn msr_spsr_el2(rt: u32) -> u32 {
+    msr_sysreg(rt, 3, 4, 4, 0, 0)
+}
+
 const fn isb() -> u32 {
     0xD503_3FDF
+}
+
+const fn eret() -> u32 {
+    0xD69F_03E0
 }
 
 #[cfg(test)]
@@ -749,10 +853,11 @@ mod tests {
         assert_eq!(cpu.x[0], 12);
     }
 
-    /// Run only the demo's MMU bring-up sequence (the 7 instructions before
-    /// the Hello loop) so do_translate has TTBR0/TCR populated.
+    /// Run the demo's boot prologue (5 EL2 instructions to drop into EL1 +
+    /// 7 EL1 instructions to bring up the MMU) so the rest of the test sees
+    /// a configured machine.
     fn boot_mmu(cpu: &mut Cpu) {
-        cpu.run(7);
+        cpu.run(12);
     }
 
     #[test]
@@ -798,5 +903,21 @@ mod tests {
         assert!(cpu.halted);
         assert!(cpu.last_trap.is_none(), "trap: {:?}", cpu.last_trap);
         assert_eq!(cpu.output(), "Hello\n");
+    }
+
+    #[test]
+    fn boots_at_el2() {
+        let cpu = Cpu::new();
+        assert_eq!(cpu.current_el, 2);
+    }
+
+    #[test]
+    fn eret_drops_to_el1() {
+        let mut cpu = Cpu::new();
+        // First 5 instructions are the EL2 prologue ending in ERET.
+        cpu.run(5);
+        assert_eq!(cpu.current_el, 1);
+        assert_eq!(cpu.pc, ENTRY_PC + 5 * 4);
+        assert!(cpu.last_trap.is_none(), "trap: {:?}", cpu.last_trap);
     }
 }
