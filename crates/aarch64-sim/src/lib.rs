@@ -1,8 +1,11 @@
-//! Tiny AArch64 instruction simulator for v0.1.
+//! Tiny AArch64 instruction simulator.
 //!
-//! Supports 5 instruction families: MOVZ, ADD (imm), LDR (unsigned offset),
-//! STR (unsigned offset), B. Memory is 64 KiB. Address 0x1000 is a memory-mapped
-//! UART: any STR there appends the low byte of the stored value to the output buffer.
+//! v0.1 — MOVZ, ADD (imm), LDR/STR (unsigned offset), B. 64 KiB memory.
+//!        Memory-mapped UART at 0x1000.
+//! v0.2 — Stage-1 MMU translation walk (4 KiB granule, 39-bit VA, levels 1-3).
+//!        Demo page table identity-maps the program page (0x4000) and the UART
+//!        page (0x1000); translation is a separate query method, not yet wired
+//!        into the LDR/STR path (that lands when SCTLR_EL1.M is honoured).
 
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -10,6 +13,11 @@ use wasm_bindgen::prelude::*;
 const MEM_SIZE: usize = 0x10000;
 const UART_OUT: u64 = 0x1000;
 const ENTRY_PC: u64 = 0x4000;
+
+// Demo page-table layout (4 KiB granule, T0SZ=25 → 39-bit VA, start at level 1).
+const L1_TABLE_PA: u64 = 0x8000;
+const L2_TABLE_PA: u64 = 0x9000;
+const L3_TABLE_PA: u64 = 0xA000;
 
 #[derive(Serialize, Clone)]
 pub struct CpuState {
@@ -20,6 +28,51 @@ pub struct CpuState {
     pub halted: bool,
     pub last_trap: Option<String>,
     pub steps: u64,
+    pub ttbr0_el1: u64,
+    pub tcr_el1: u64,
+    pub sctlr_el1: u64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct PageAttrs {
+    pub af: bool,
+    pub ap: u8,
+    pub attr_idx: u8,
+    pub sh: u8,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(tag = "kind")]
+pub enum WalkOutcome {
+    /// Non-leaf descriptor pointing to the next-level table.
+    Table { next_table: u64 },
+    /// Leaf page descriptor (only at level 3 for 4 KiB granule).
+    Page { pa: u64, attrs: PageAttrs },
+    /// Leaf block descriptor at L1 or L2.
+    Block { pa: u64, attrs: PageAttrs, span: u64 },
+    /// Descriptor's valid bit was clear.
+    Invalid,
+    /// Memory access for the descriptor itself faulted.
+    Fault { reason: String },
+}
+
+#[derive(Serialize, Clone)]
+pub struct WalkStep {
+    pub level: u8,
+    pub table_addr: u64,
+    pub index: u32,
+    pub entry_addr: u64,
+    pub descriptor: u64,
+    pub outcome: WalkOutcome,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TranslationResult {
+    pub va: u64,
+    pub steps: Vec<WalkStep>,
+    pub pa: Option<u64>,
+    pub fault: Option<String>,
+    pub mmu_enabled: bool,
 }
 
 #[wasm_bindgen]
@@ -33,6 +86,9 @@ pub struct Cpu {
     halted: bool,
     last_trap: Option<String>,
     steps: u64,
+    ttbr0_el1: u64,
+    tcr_el1: u64,
+    sctlr_el1: u64,
 }
 
 #[wasm_bindgen]
@@ -49,8 +105,12 @@ impl Cpu {
             halted: false,
             last_trap: None,
             steps: 0,
+            ttbr0_el1: 0,
+            tcr_el1: 0,
+            sctlr_el1: 0,
         };
         cpu.load_demo();
+        cpu.setup_demo_pgtable();
         cpu
     }
 
@@ -66,7 +126,11 @@ impl Cpu {
         self.halted = false;
         self.last_trap = None;
         self.steps = 0;
+        self.ttbr0_el1 = 0;
+        self.tcr_el1 = 0;
+        self.sctlr_el1 = 0;
         self.load_demo();
+        self.setup_demo_pgtable();
     }
 
     /// Execute one instruction. Returns true if the CPU is still runnable.
@@ -113,8 +177,22 @@ impl Cpu {
             halted: self.halted,
             last_trap: self.last_trap.clone(),
             steps: self.steps,
+            ttbr0_el1: self.ttbr0_el1,
+            tcr_el1: self.tcr_el1,
+            sctlr_el1: self.sctlr_el1,
         })
         .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Walk the stage-1 page tables for `va` using the current TTBR0/TCR.
+    /// Returns the walk trace plus the resolved physical address (or fault).
+    pub fn translate(&self, va: u64) -> Result<JsValue, JsValue> {
+        let result = self.do_translate(va);
+        serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    pub fn l1_table_pa(&self) -> u64 {
+        L1_TABLE_PA
     }
 
     /// Return a slice of memory as a Uint8Array. `start` and `len` are byte offsets.
@@ -300,6 +378,183 @@ impl Cpu {
             off += 4;
         }
     }
+
+    /// Build a tiny stage-1 page table: identity-map the program page (0x4000)
+    /// and the UART page (0x1000) using a 3-level walk with 4 KiB granule.
+    fn setup_demo_pgtable(&mut self) {
+        // L1[0] -> L2 table.   Descriptor: bits[1:0]=11 (valid table), addr in [47:12].
+        write_u64(&mut self.mem, L1_TABLE_PA, L2_TABLE_PA | 0b11);
+        // L2[0] -> L3 table.
+        write_u64(&mut self.mem, L2_TABLE_PA, L3_TABLE_PA | 0b11);
+
+        // L3 page descriptor format we use: bits[1:0]=11, AF=bit10, valid; output PA in [47:12].
+        let page_attr = (1u64 << 10) | 0b11; // AF=1, valid+page
+        // VA 0x1000 -> PA 0x1000 (UART page). Index = (0x1000 >> 12) & 0x1FF = 1.
+        write_u64(&mut self.mem, L3_TABLE_PA + 1 * 8, 0x1000 | page_attr);
+        // VA 0x4000 -> PA 0x4000 (program page). Index = 4.
+        write_u64(&mut self.mem, L3_TABLE_PA + 4 * 8, 0x4000 | page_attr);
+
+        // TCR_EL1.T0SZ = 25 → 39-bit VA → start level 1 with 4 KiB granule.
+        self.tcr_el1 = 25;
+        self.ttbr0_el1 = L1_TABLE_PA;
+        // SCTLR_EL1.M still 0 — translation is a separate query, not yet applied to LDR/STR.
+        self.sctlr_el1 = 0;
+    }
+
+    fn do_translate(&self, va: u64) -> TranslationResult {
+        let mmu_enabled = self.sctlr_el1 & 1 != 0;
+        let t0sz = self.tcr_el1 & 0x3F;
+        if t0sz == 0 || self.ttbr0_el1 == 0 {
+            return TranslationResult {
+                va,
+                steps: Vec::new(),
+                pa: None,
+                fault: Some("MMU not configured (TTBR0_EL1 or TCR_EL1.T0SZ unset)".into()),
+                mmu_enabled,
+            };
+        }
+
+        let va_bits = 64 - t0sz;
+        // Choose start level for 4 KiB granule (each level adds 9 bits).
+        let start_level: u8 = if va_bits >= 40 {
+            0
+        } else if va_bits >= 31 {
+            1
+        } else if va_bits >= 22 {
+            2
+        } else {
+            3
+        };
+
+        let mut steps: Vec<WalkStep> = Vec::new();
+        let mut table_addr = self.ttbr0_el1 & 0x0000_FFFF_FFFF_F000;
+        let mut level = start_level;
+
+        loop {
+            let shift = 12 + 9 * (3 - level as u32);
+            let index = ((va >> shift) & 0x1FF) as u32;
+            let entry_addr = table_addr + (index as u64) * 8;
+            let descriptor = match self.load64(entry_addr) {
+                Ok(d) => d,
+                Err(e) => {
+                    steps.push(WalkStep {
+                        level,
+                        table_addr,
+                        index,
+                        entry_addr,
+                        descriptor: 0,
+                        outcome: WalkOutcome::Fault { reason: e.clone() },
+                    });
+                    return TranslationResult {
+                        va,
+                        steps,
+                        pa: None,
+                        fault: Some(e),
+                        mmu_enabled,
+                    };
+                }
+            };
+
+            let valid = descriptor & 1 != 0;
+            let typ = (descriptor >> 1) & 1;
+            if !valid {
+                steps.push(WalkStep {
+                    level,
+                    table_addr,
+                    index,
+                    entry_addr,
+                    descriptor,
+                    outcome: WalkOutcome::Invalid,
+                });
+                return TranslationResult {
+                    va,
+                    steps,
+                    pa: None,
+                    fault: Some(format!("translation fault at level {} (invalid descriptor)", level)),
+                    mmu_enabled,
+                };
+            }
+
+            // Level 3: only valid kind is page descriptor (typ=1).
+            if level == 3 {
+                let pa_base = descriptor & 0x0000_FFFF_FFFF_F000;
+                let pa = pa_base | (va & 0xFFF);
+                let attrs = decode_attrs(descriptor);
+                let af = attrs.af;
+                steps.push(WalkStep {
+                    level: 3,
+                    table_addr,
+                    index,
+                    entry_addr,
+                    descriptor,
+                    outcome: WalkOutcome::Page { pa, attrs },
+                });
+                if !af {
+                    return TranslationResult {
+                        va,
+                        steps,
+                        pa: None,
+                        fault: Some("access flag fault".into()),
+                        mmu_enabled,
+                    };
+                }
+                return TranslationResult { va, steps, pa: Some(pa), fault: None, mmu_enabled };
+            }
+
+            // Non-leaf level: typ=1 → table descriptor, typ=0 → block (huge page).
+            if typ == 1 {
+                let next = descriptor & 0x0000_FFFF_FFFF_F000;
+                steps.push(WalkStep {
+                    level,
+                    table_addr,
+                    index,
+                    entry_addr,
+                    descriptor,
+                    outcome: WalkOutcome::Table { next_table: next },
+                });
+                table_addr = next;
+                level += 1;
+            } else {
+                let block_size = 1u64 << shift;
+                let pa_base = descriptor & !(block_size - 1) & 0x0000_FFFF_FFFF_FFFF;
+                let pa = pa_base | (va & (block_size - 1));
+                let attrs = decode_attrs(descriptor);
+                let af = attrs.af;
+                steps.push(WalkStep {
+                    level,
+                    table_addr,
+                    index,
+                    entry_addr,
+                    descriptor,
+                    outcome: WalkOutcome::Block { pa, attrs, span: block_size },
+                });
+                if !af {
+                    return TranslationResult {
+                        va,
+                        steps,
+                        pa: None,
+                        fault: Some("access flag fault".into()),
+                        mmu_enabled,
+                    };
+                }
+                return TranslationResult { va, steps, pa: Some(pa), fault: None, mmu_enabled };
+            }
+        }
+    }
+}
+
+fn write_u64(mem: &mut [u8], addr: u64, val: u64) {
+    let a = addr as usize;
+    mem[a..a + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+fn decode_attrs(desc: u64) -> PageAttrs {
+    PageAttrs {
+        af: (desc >> 10) & 1 != 0,
+        ap: ((desc >> 6) & 0x3) as u8,
+        attr_idx: ((desc >> 2) & 0x7) as u8,
+        sh: ((desc >> 8) & 0x3) as u8,
+    }
 }
 
 // --- instruction encoders (host-side helpers for the demo program) ---
@@ -350,5 +605,32 @@ mod tests {
         }
         cpu.run(100);
         assert_eq!(cpu.x[0], 12);
+    }
+
+    #[test]
+    fn translate_program_page() {
+        let cpu = Cpu::new();
+        let r = cpu.do_translate(0x4000);
+        assert!(r.fault.is_none(), "fault: {:?}", r.fault);
+        assert_eq!(r.pa, Some(0x4000));
+        assert_eq!(r.steps.len(), 3);
+        assert!(matches!(r.steps[0].outcome, WalkOutcome::Table { .. }));
+        assert!(matches!(r.steps[1].outcome, WalkOutcome::Table { .. }));
+        assert!(matches!(r.steps[2].outcome, WalkOutcome::Page { pa: 0x4000, .. }));
+    }
+
+    #[test]
+    fn translate_uart_page_with_offset() {
+        let cpu = Cpu::new();
+        let r = cpu.do_translate(0x1abc);
+        assert_eq!(r.pa, Some(0x1abc));
+    }
+
+    #[test]
+    fn translate_unmapped_va_faults() {
+        let cpu = Cpu::new();
+        let r = cpu.do_translate(0x2000); // not in our 2-page identity map
+        assert!(r.pa.is_none());
+        assert!(r.fault.is_some());
     }
 }

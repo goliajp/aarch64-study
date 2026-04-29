@@ -22,13 +22,14 @@ export function AboutView() {
         <h2 className="text-fg mb-3 text-sm font-semibold">Roadmap</h2>
         <Card>
           <pre className="text-fg-muted overflow-x-auto p-4 font-mono text-xs leading-relaxed">
-            {`v0.1  registers + 5 instructions (MOVZ ADD LDR STR B) + MMIO UART  ← here
-v0.2  + MMU page tables (animated translation)
-v0.3  + EL0/EL1/EL2 exception levels
-v0.4  + two cores (P-core / E-core) side by side       ← Apple-specific
-v0.5  + AIC interrupt controller (timeline)
-v0.6  + scheduler (per-core run queues)
-v0.7  + virtio device (Type-1 hypervisor seed)
+            {`v0.1  registers + 5 instructions (MOVZ ADD LDR STR B) + MMIO UART
+v0.2  + MMU stage-1 page-table walk (4 KiB granule, identity-map demo)  ← here
+v0.3  + MSR/MRS + SCTLR_EL1.M honoured (LDR/STR through MMU)
+v0.4  + EL0/EL1/EL2 exception levels
+v0.5  + two cores (P-core / E-core) side by side       ← Apple-specific
+v0.6  + AIC interrupt controller (timeline)
+v0.7  + scheduler (per-core run queues)
+v0.8  + virtio device (Type-1 hypervisor seed)
 v1.0  same Rust code on bare metal via m1n1`}
           </pre>
         </Card>

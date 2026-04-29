@@ -1,5 +1,5 @@
 import { Badge, GlassButton, GlassCard } from '@goliapkg/gds'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import init, { Cpu } from 'aarch64-sim'
 
@@ -11,6 +11,40 @@ interface CpuState {
   halted: boolean
   last_trap: string | null
   steps: bigint
+  ttbr0_el1: bigint
+  tcr_el1: bigint
+  sctlr_el1: bigint
+}
+
+interface PageAttrs {
+  af: boolean
+  ap: number
+  attr_idx: number
+  sh: number
+}
+
+type WalkOutcome =
+  | { kind: 'Table'; next_table: bigint }
+  | { kind: 'Page'; pa: bigint; attrs: PageAttrs }
+  | { kind: 'Block'; pa: bigint; attrs: PageAttrs; span: bigint }
+  | { kind: 'Invalid' }
+  | { kind: 'Fault'; reason: string }
+
+interface WalkStep {
+  level: number
+  table_addr: bigint
+  index: number
+  entry_addr: bigint
+  descriptor: bigint
+  outcome: WalkOutcome
+}
+
+interface TranslationResult {
+  va: bigint
+  steps: WalkStep[]
+  pa: bigint | null
+  fault: string | null
+  mmu_enabled: boolean
 }
 
 const REG_LABELS = Array.from({ length: 31 }, (_, i) => `X${i}`)
@@ -25,23 +59,31 @@ function fmtHex32(v: number): string {
   return '0x' + (v >>> 0).toString(16).padStart(8, '0')
 }
 
+function parseHex(text: string): bigint | null {
+  const trimmed = text.trim()
+  if (trimmed === '') return null
+  try {
+    return BigInt(trimmed.startsWith('0x') || trimmed.startsWith('0X') ? trimmed : '0x' + trimmed)
+  } catch {
+    return null
+  }
+}
+
 export function CpuView() {
-  const cpuRef = useRef<Cpu | null>(null)
-  const [ready, setReady] = useState(false)
+  const [cpu, setCpu] = useState<Cpu | null>(null)
   const [state, setState] = useState<CpuState | null>(null)
   const [memory, setMemory] = useState<Uint8Array>(new Uint8Array(MEMORY_VIEW_BYTES))
   const [output, setOutput] = useState('')
   const [running, setRunning] = useState(false)
+  const [vaText, setVaText] = useState('0x4000')
   const runRafRef = useRef<number | null>(null)
 
-  const refresh = useCallback(() => {
-    const cpu = cpuRef.current
-    if (!cpu) return
-    const s = cpu.state() as CpuState
+  const refresh = useCallback((c: Cpu) => {
+    const s = c.state() as CpuState
     setState(s)
     const viewStart = Number(s.pc) & ~0xf
-    setMemory(cpu.mem_slice(viewStart, MEMORY_VIEW_BYTES))
-    setOutput(cpu.output())
+    setMemory(c.mem_slice(viewStart, MEMORY_VIEW_BYTES))
+    setOutput(c.output())
   }, [])
 
   useEffect(() => {
@@ -49,34 +91,31 @@ export function CpuView() {
     void (async () => {
       await init()
       if (cancelled) return
-      cpuRef.current = new Cpu()
-      setReady(true)
-      // initial snapshot
-      const cpu = cpuRef.current
-      const s = cpu.state() as CpuState
-      setState(s)
-      setMemory(cpu.mem_slice(Number(cpu.entry_pc()), MEMORY_VIEW_BYTES))
-      setOutput(cpu.output())
+      const c = new Cpu()
+      setCpu(c)
+      refresh(c)
     })()
     return () => {
       cancelled = true
     }
-  }, [])
-
-  const onStep = useCallback(() => {
-    cpuRef.current?.step()
-    refresh()
   }, [refresh])
 
+  const onStep = useCallback(() => {
+    if (!cpu) return
+    cpu.step()
+    refresh(cpu)
+  }, [cpu, refresh])
+
   const onReset = useCallback(() => {
-    cpuRef.current?.reset()
+    if (!cpu) return
+    cpu.reset()
     setRunning(false)
     if (runRafRef.current != null) {
       cancelAnimationFrame(runRafRef.current)
       runRafRef.current = null
     }
-    refresh()
-  }, [refresh])
+    refresh(cpu)
+  }, [cpu, refresh])
 
   const onRunToggle = useCallback(() => {
     setRunning((r) => !r)
@@ -84,19 +123,15 @@ export function CpuView() {
 
   // run loop via rAF: each frame, do RUN_BURST steps so the user can watch state change.
   useEffect(() => {
-    if (!running) return
+    if (!running || !cpu) return
     const tick = () => {
-      const cpu = cpuRef.current
-      if (!cpu) return
-      const before = (cpu.state() as CpuState).halted
-      if (before) {
+      if ((cpu.state() as CpuState).halted) {
         setRunning(false)
         return
       }
       cpu.run(RUN_BURST)
-      refresh()
-      const after = (cpu.state() as CpuState).halted
-      if (after) {
+      refresh(cpu)
+      if ((cpu.state() as CpuState).halted) {
         setRunning(false)
         return
       }
@@ -109,9 +144,22 @@ export function CpuView() {
         runRafRef.current = null
       }
     }
-  }, [running, refresh])
+  }, [running, cpu, refresh])
 
-  if (!ready || !state) {
+  // Re-translate whenever the user's VA changes or the simulator advances
+  // (memory writes can change the walk; state.steps is the change signal).
+  const trace = useMemo<TranslationResult | null>(() => {
+    if (!cpu || !state) return null
+    const va = parseHex(vaText)
+    if (va === null) return null
+    try {
+      return cpu.translate(va) as TranslationResult
+    } catch {
+      return null
+    }
+  }, [cpu, state, vaText])
+
+  if (!cpu || !state) {
     return <div className="text-fg-muted text-sm">Loading WASM…</div>
   }
 
@@ -127,7 +175,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.1</Badge>
+          <Badge color="info">v0.2</Badge>
           {state.halted ? (
             <Badge color={state.last_trap ? 'danger' : 'success'}>
               {state.last_trap ? 'TRAP' : 'HALTED'}
@@ -138,7 +186,8 @@ export function CpuView() {
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
           Tiny AArch64 simulator running in WASM. The demo program writes "Hello\n" to a
-          memory-mapped UART at 0x1000 by storing one character at a time.
+          memory-mapped UART at 0x1000. Stage-1 page tables are pre-loaded — translation is shown
+          live below; SCTLR_EL1.M=0 so LDR/STR still bypass the MMU.
         </p>
       </header>
 
@@ -169,6 +218,8 @@ export function CpuView() {
       </div>
 
       <MemoryPanel base={memBaseAddr} bytes={memory} pc={Number(state.pc)} />
+
+      <MmuPanel state={state} trace={trace} vaText={vaText} onVaChange={setVaText} />
     </div>
   )
 }
@@ -251,6 +302,135 @@ function MemoryPanel({ base, bytes, pc }: { base: number; bytes: Uint8Array; pc:
       </div>
     </GlassCard>
   )
+}
+
+function MmuPanel({
+  onVaChange,
+  state,
+  trace,
+  vaText,
+}: {
+  onVaChange: (v: string) => void
+  state: CpuState
+  trace: TranslationResult | null
+  vaText: string
+}) {
+  const t0sz = Number(state.tcr_el1 & 0x3fn)
+  const vaBits = t0sz > 0 ? 64 - t0sz : 0
+  const mmuOn = (state.sctlr_el1 & 1n) !== 0n
+
+  return (
+    <GlassCard>
+      <div className="space-y-4 p-4">
+        <div className="text-fg-muted flex items-center justify-between">
+          <span className="text-[10px] font-semibold tracking-wider uppercase">
+            MMU · Stage-1 Translation
+          </span>
+          <Badge color={mmuOn ? 'success' : undefined}>SCTLR_EL1.M={mmuOn ? '1' : '0'}</Badge>
+        </div>
+
+        <div className="grid gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
+          <RegRow label="TTBR0_EL1" value={state.ttbr0_el1} />
+          <RegRow label="TCR_EL1" value={state.tcr_el1} />
+          <RegRow label="SCTLR_EL1" value={state.sctlr_el1} />
+        </div>
+        <div className="text-fg-muted text-xs">
+          T0SZ={t0sz} · VA={vaBits} bits · 4 KiB granule · start level{' '}
+          {trace && trace.steps.length > 0 ? trace.steps[0].level : '?'}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <label className="text-fg-muted font-mono text-xs" htmlFor="va-input">
+            translate VA
+          </label>
+          <input
+            className="border-border bg-bg/40 text-fg focus:border-accent w-40 rounded border px-2 py-1 font-mono text-xs outline-none"
+            id="va-input"
+            onChange={(e) => onVaChange(e.target.value)}
+            placeholder="0x4000"
+            spellCheck={false}
+            value={vaText}
+          />
+          <span className="text-fg-muted text-xs">
+            try 0x4000 (program), 0x1000 (UART), 0x2000 (unmapped)
+          </span>
+        </div>
+
+        {trace && <WalkDisplay trace={trace} />}
+      </div>
+    </GlassCard>
+  )
+}
+
+function WalkDisplay({ trace }: { trace: TranslationResult }) {
+  if (trace.steps.length === 0 && trace.fault) {
+    return (
+      <div className="border-danger/40 bg-danger/10 text-danger rounded border px-3 py-2 font-mono text-xs">
+        {trace.fault}
+      </div>
+    )
+  }
+  return (
+    <div className="space-y-2 font-mono text-xs">
+      {trace.steps.map((s, i) => (
+        <WalkStepRow key={i} step={s} />
+      ))}
+      <div className="border-border mt-2 flex items-center justify-between border-t pt-2">
+        <span className="text-fg-muted">VA {fmtHex64(trace.va)}</span>
+        {trace.pa !== null ? (
+          <span className="text-accent">→ PA {fmtHex64(trace.pa)}</span>
+        ) : (
+          <span className="text-danger">{trace.fault ?? 'no PA'}</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function WalkStepRow({ step }: { step: WalkStep }) {
+  const tone =
+    step.outcome.kind === 'Invalid' || step.outcome.kind === 'Fault' ? 'text-danger' : 'text-fg'
+  return (
+    <div className={`border-border/40 rounded border px-3 py-2 ${tone}`}>
+      <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+        <span className="text-accent font-semibold">L{step.level}</span>
+        <span className="text-fg-muted">
+          table {fmtHex64(step.table_addr)} · idx {step.index}
+        </span>
+        <span className="text-fg-muted">
+          entry@{fmtHex64(step.entry_addr)} = {fmtHex64(step.descriptor)}
+        </span>
+      </div>
+      <div className="text-fg-muted mt-1 text-[11px]">
+        <OutcomeText outcome={step.outcome} />
+      </div>
+    </div>
+  )
+}
+
+function OutcomeText({ outcome }: { outcome: WalkOutcome }) {
+  switch (outcome.kind) {
+    case 'Table':
+      return <>→ next table @ {fmtHex64(outcome.next_table)}</>
+    case 'Page':
+      return (
+        <>
+          → page PA {fmtHex64(outcome.pa)} · AF={outcome.attrs.af ? 1 : 0} · AP=
+          {outcome.attrs.ap}
+        </>
+      )
+    case 'Block':
+      return (
+        <>
+          → block PA {fmtHex64(outcome.pa)} (span {fmtHex64(outcome.span)}) · AF=
+          {outcome.attrs.af ? 1 : 0}
+        </>
+      )
+    case 'Invalid':
+      return <>invalid descriptor (V=0)</>
+    case 'Fault':
+      return <>fault: {outcome.reason}</>
+  }
 }
 
 function MemoryRow({ addr, bytes, pc }: { addr: number; bytes: Uint8Array; pc: number }) {

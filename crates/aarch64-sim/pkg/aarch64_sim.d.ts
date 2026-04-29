@@ -5,6 +5,7 @@ export class Cpu {
     free(): void;
     [Symbol.dispose](): void;
     entry_pc(): bigint;
+    l1_table_pa(): bigint;
     /**
      * Return a slice of memory as a Uint8Array. `start` and `len` are byte offsets.
      */
@@ -21,6 +22,11 @@ export class Cpu {
      * Execute one instruction. Returns true if the CPU is still runnable.
      */
     step(): boolean;
+    /**
+     * Walk the stage-1 page tables for `va` using the current TTBR0/TCR.
+     * Returns the walk trace plus the resolved physical address (or fault).
+     */
+    translate(va: bigint): any;
     uart_addr(): bigint;
 }
 
@@ -36,7 +42,9 @@ export interface InitOutput {
     readonly cpu_run: (a: number, b: number) => number;
     readonly cpu_state: (a: number) => [number, number, number];
     readonly cpu_step: (a: number) => number;
+    readonly cpu_translate: (a: number, b: bigint) => [number, number, number];
     readonly cpu_entry_pc: (a: number) => bigint;
+    readonly cpu_l1_table_pa: (a: number) => bigint;
     readonly cpu_uart_addr: (a: number) => bigint;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

@@ -19,6 +19,13 @@ export class Cpu {
         return BigInt.asUintN(64, ret);
     }
     /**
+     * @returns {bigint}
+     */
+    l1_table_pa() {
+        const ret = wasm.cpu_l1_table_pa(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
      * Return a slice of memory as a Uint8Array. `start` and `len` are byte offsets.
      * @param {number} start
      * @param {number} len
@@ -80,6 +87,19 @@ export class Cpu {
     step() {
         const ret = wasm.cpu_step(this.__wbg_ptr);
         return ret !== 0;
+    }
+    /**
+     * Walk the stage-1 page tables for `va` using the current TTBR0/TCR.
+     * Returns the walk trace plus the resolved physical address (or fault).
+     * @param {bigint} va
+     * @returns {any}
+     */
+    translate(va) {
+        const ret = wasm.cpu_translate(this.__wbg_ptr, va);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
     }
     /**
      * @returns {bigint}
