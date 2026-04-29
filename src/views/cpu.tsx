@@ -18,9 +18,11 @@ interface CpuState {
   vbar_el1: bigint
   elr_el1: bigint
   spsr_el1: bigint
+  esr_el1: bigint
   vbar_el2: bigint
   elr_el2: bigint
   spsr_el2: bigint
+  esr_el2: bigint
 }
 
 interface PageAttrs {
@@ -182,7 +184,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.4</Badge>
+          <Badge color="info">v0.5</Badge>
           <ElBadge el={state.current_el} />
           {state.halted ? (
             <Badge color={state.last_trap ? 'danger' : 'success'}>
@@ -193,10 +195,10 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          Cold boot lands at EL2 (matching how m1n1 hands off on Apple Silicon). The first 5
-          instructions configure ELR_EL2 + SPSR_EL2 and ERET into EL1; the next 7 bring up the MMU;
-          the rest writes "Hello\n" through the live MMU. Watch the EL badge change and the MMU
-          panel flip from M=0 to M=1.
+          Cold boot at EL2 → MMU bring-up at EL1 → ERET to user code at EL0. The user writes 'U',
+          executes <code>SVC #0</code> which traps into the EL1 handler at VBAR_EL1+0x400, the
+          handler writes 'K' and ERETs back, the user writes '\n'. Output: <code>UK\n</code>. Watch
+          the EL badge bounce 2 → 1 → 0 → 1 → 0 across the run.
         </p>
       </header>
 
@@ -254,6 +256,8 @@ function ElBadge({ el }: { el: number }) {
 }
 
 function ExceptionPanel({ state }: { state: CpuState }) {
+  const ec = Number((state.esr_el1 >> 26n) & 0x3fn)
+  const ecName = decodeEc(ec)
   return (
     <GlassCard>
       <div className="space-y-3 p-4">
@@ -270,20 +274,53 @@ function ExceptionPanel({ state }: { state: CpuState }) {
           <RegRow label="VBAR_EL2" value={state.vbar_el2} />
           <RegRow label="ELR_EL2" value={state.elr_el2} />
           <RegRow label="SPSR_EL2" value={state.spsr_el2} />
+          <RegRow label="ESR_EL2" value={state.esr_el2} />
           <div className="text-fg-muted col-span-full mt-2 text-[10px] tracking-wider uppercase">
             EL1 (kernel)
           </div>
           <RegRow label="VBAR_EL1" value={state.vbar_el1} />
           <RegRow label="ELR_EL1" value={state.elr_el1} />
           <RegRow label="SPSR_EL1" value={state.spsr_el1} />
+          <RegRow label="ESR_EL1" value={state.esr_el1} />
         </div>
+        {state.esr_el1 !== 0n && (
+          <div className="text-fg-muted text-xs">
+            ESR_EL1.EC = 0x{ec.toString(16).padStart(2, '0')} → {ecName}
+          </div>
+        )}
         <div className="text-fg-muted text-xs">
-          ERET reads ELR_EL{state.current_el} into PC and decodes the new EL from SPSR_EL
-          {state.current_el}.M[3:2].
+          Sync exceptions from EL0 vector to <span className="font-mono">VBAR_EL1+0x400</span> (
+          {state.vbar_el1 !== 0n ? fmtHex64(state.vbar_el1 + 0x400n) : 'unset'}). ERET reads ELR_EL
+          {state.current_el} into PC and decodes the new EL from SPSR.M[3:2].
         </div>
       </div>
     </GlassCard>
   )
+}
+
+function decodeEc(ec: number): string {
+  switch (ec) {
+    case 0x00:
+      return 'unknown'
+    case 0x15:
+      return 'SVC (AArch64)'
+    case 0x16:
+      return 'HVC (AArch64)'
+    case 0x17:
+      return 'SMC (AArch64)'
+    case 0x20:
+      return 'instruction abort, lower EL'
+    case 0x21:
+      return 'instruction abort, current EL'
+    case 0x24:
+      return 'data abort, lower EL'
+    case 0x25:
+      return 'data abort, current EL'
+    case 0x3c:
+      return 'BRK (AArch64)'
+    default:
+      return '—'
+  }
 }
 
 function RegistersPanel({ state }: { state: CpuState }) {

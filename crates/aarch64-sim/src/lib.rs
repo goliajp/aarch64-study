@@ -43,9 +43,11 @@ pub struct CpuState {
     pub vbar_el1: u64,
     pub elr_el1: u64,
     pub spsr_el1: u64,
+    pub esr_el1: u64,
     pub vbar_el2: u64,
     pub elr_el2: u64,
     pub spsr_el2: u64,
+    pub esr_el2: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -108,9 +110,11 @@ pub struct Cpu {
     vbar_el1: u64,
     elr_el1: u64,
     spsr_el1: u64,
+    esr_el1: u64,
     vbar_el2: u64,
     elr_el2: u64,
     spsr_el2: u64,
+    esr_el2: u64,
 }
 
 #[wasm_bindgen]
@@ -137,9 +141,11 @@ impl Cpu {
             vbar_el1: 0,
             elr_el1: 0,
             spsr_el1: 0,
+            esr_el1: 0,
             vbar_el2: 0,
             elr_el2: 0,
             spsr_el2: 0,
+            esr_el2: 0,
         };
         cpu.load_demo();
         cpu.setup_demo_pgtable();
@@ -165,9 +171,11 @@ impl Cpu {
         self.vbar_el1 = 0;
         self.elr_el1 = 0;
         self.spsr_el1 = 0;
+        self.esr_el1 = 0;
         self.vbar_el2 = 0;
         self.elr_el2 = 0;
         self.spsr_el2 = 0;
+        self.esr_el2 = 0;
         self.load_demo();
         self.setup_demo_pgtable();
     }
@@ -223,9 +231,11 @@ impl Cpu {
             vbar_el1: self.vbar_el1,
             elr_el1: self.elr_el1,
             spsr_el1: self.spsr_el1,
+            esr_el1: self.esr_el1,
             vbar_el2: self.vbar_el2,
             elr_el2: self.elr_el2,
             spsr_el2: self.spsr_el2,
+            esr_el2: self.esr_el2,
         })
     }
 
@@ -435,6 +445,28 @@ impl Cpu {
             return Ok(StepResult::Continue);
         }
 
+        // SVC #imm16 :: 1101 0100 000 imm16 0 0001
+        // Raises a synchronous exception from EL0 to EL1 (we only model that path).
+        if insn & 0xFFE0_001F == 0xD400_0001 {
+            let imm16 = ((insn >> 5) & 0xFFFF) as u16;
+            if self.current_el != 0 {
+                return Err(format!(
+                    "SVC from EL{} not modeled at pc={:#x}",
+                    self.current_el, self.pc
+                ));
+            }
+            // Save state into the EL1 exception sysregs.
+            self.elr_el1 = self.pc.wrapping_add(4);
+            // SPSR.M[3:0] = 0b0000 (came from EL0t). Other PSTATE bits are 0
+            // since this toy doesn't model condition flags or DAIF beyond NZCV.
+            self.spsr_el1 = 0;
+            // ESR_EL1.EC = 0x15 (SVC AArch64), IL = 1, ISS = imm16.
+            self.esr_el1 = (0x15u64 << 26) | (1 << 25) | (imm16 as u64);
+            self.current_el = 1;
+            self.pc = self.vbar_el1.wrapping_add(0x400);
+            return Ok(StepResult::Continue);
+        }
+
         // ERET :: 1101 0110 1001 1111 0000 0011 1110 0000
         // Restores PC ← ELR_EL<current>, EL ← SPSR_EL<current>.M[3:2].
         if insn == 0xD69F_03E0 {
@@ -500,9 +532,11 @@ impl Cpu {
             (3, 0, 12, 0, 0) => self.vbar_el1,
             (3, 0, 4, 0, 0) => self.spsr_el1,
             (3, 0, 4, 0, 1) => self.elr_el1,
+            (3, 0, 5, 2, 0) => self.esr_el1,
             (3, 4, 12, 0, 0) => self.vbar_el2,
             (3, 4, 4, 0, 0) => self.spsr_el2,
             (3, 4, 4, 0, 1) => self.elr_el2,
+            (3, 4, 5, 2, 0) => self.esr_el2,
             // CurrentEL is read-only; bits [3:2] = current_el.
             (3, 0, 4, 2, 2) => (self.current_el as u64) << 2,
             _ => return Err(unsupported_sysreg("MRS", sr, self.pc)),
@@ -517,9 +551,11 @@ impl Cpu {
             (3, 0, 12, 0, 0) => self.vbar_el1 = val,
             (3, 0, 4, 0, 0) => self.spsr_el1 = val,
             (3, 0, 4, 0, 1) => self.elr_el1 = val,
+            (3, 0, 5, 2, 0) => self.esr_el1 = val,
             (3, 4, 12, 0, 0) => self.vbar_el2 = val,
             (3, 4, 4, 0, 0) => self.spsr_el2 = val,
             (3, 4, 4, 0, 1) => self.elr_el2 = val,
+            (3, 4, 5, 2, 0) => self.esr_el2 = val,
             // CurrentEL is read-only.
             (3, 0, 4, 2, 2) => return Err("MSR to CurrentEL (read-only)".into()),
             _ => return Err(unsupported_sysreg("MSR", sr, self.pc)),
@@ -528,53 +564,75 @@ impl Cpu {
     }
 
     fn load_demo(&mut self) {
-        // Two-phase demo:
-        //   Phase 1 (EL2): set ELR_EL2 + SPSR_EL2, ERET to drop into EL1.
-        //   Phase 2 (EL1): bring up MMU, write "Hello\n" via UART.
+        // Three-region demo demonstrating a full EL2 → EL1 → EL0 → EL1 → EL0 round trip.
         //
-        // SPSR_EL2 value 0x3C5 = M[3:0]=0b0101 (EL1h, use SP_EL1) + DAIF masked.
+        //   PA 0x4000  kernel boot — runs at EL2, drops to EL1, sets up MMU + VBAR,
+        //              then drops to EL0 via a second ERET.
+        //   PA 0x4800  SVC handler — VBAR_EL1 + 0x400 (sync from lower EL, AArch64).
+        //              Writes 'K' through the UART, then ERET back to EL0.
+        //   PA 0x4C00  user code at EL0 — writes 'U', SVC #0, then writes '\n', halts.
+        //
+        // Output sequence: 'U' (EL0) → 'K' (EL1 handler) → '\n' (EL0) = "UK\n".
+        //
+        // SPSR_EL2 = 0x3C5 → drop into EL1h with DAIF masked.
+        // SPSR_EL1 written by kernel = 0x000 → drop into EL0t.
         const SPSR_EL1H_DAIF: u32 = 0x3C5;
+        const VBAR: u32 = 0x4400;
+        const HANDLER_PA: u64 = 0x4800; // = VBAR + 0x400
+        const USER_PA: u64 = 0x4C00;
         // EL1 entry sits 5 instructions past PC=0x4000 → 0x4014.
         const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
-        let prog: [u32; 26] = [
-            // --- Phase 1 @ EL2: arrange the drop into EL1 ---
+        let kernel: [u32; 19] = [
+            // --- @ EL2: arrange ERET into EL1 ---
             movz(9, EL1_ENTRY, 0),            // X9 = 0x4014
-            msr_elr_el2(9),                   // ELR_EL2 = X9
-            movz(9, SPSR_EL1H_DAIF, 0),       // X9 = 0x3C5
-            msr_spsr_el2(9),                  // SPSR_EL2 = X9
-            eret(),                           // ERET — now at EL1, PC = 0x4014
+            msr_elr_el2(9),
+            movz(9, SPSR_EL1H_DAIF, 0),
+            msr_spsr_el2(9),
+            eret(),                           // → EL1, PC = 0x4014
 
-            // --- Phase 2 @ EL1: bring up the MMU ---
-            movz(9, L1_TABLE_PA as u32, 0),   // X9 = 0x8000 (L1 table PA)
-            msr_ttbr0(9),                     // TTBR0_EL1 = X9
-            movz(9, 25, 0),                   // X9 = 25  (TCR.T0SZ → 39-bit VA)
-            msr_tcr(9),                       // TCR_EL1 = X9
-            movz(9, 1, 0),                    // X9 = 1   (SCTLR.M = 1)
-            msr_sctlr(9),                     // SCTLR_EL1 = X9 — MMU on
-            isb(),                            // realistic barrier; no-op for us
+            // --- @ EL1: bring up the MMU ---
+            movz(9, L1_TABLE_PA as u32, 0),
+            msr_ttbr0(9),
+            movz(9, 25, 0),
+            msr_tcr(9),
+            movz(9, 1, 0),
+            msr_sctlr(9),
+            isb(),
 
-            // --- Hello\n through the MMU ---
-            movz(1, UART_OUT as u32, 0),      // MOVZ X1, #0x1000 (UART VA)
-            movz(0, b'H' as u32, 0),
+            // --- @ EL1: install the vector base and arrange ERET into EL0 ---
+            movz(9, VBAR, 0),                 // VBAR_EL1 = 0x4400
+            msr_vbar_el1(9),
+            movz(9, USER_PA as u32, 0),       // ELR_EL1 = user entry
+            msr_elr_el1(9),
+            movz(9, 0, 0),                    // SPSR_EL1 = 0 → EL0t
+            msr_spsr_el1(9),
+            eret(),                           // → EL0, PC = 0x4C00
+        ];
+        let handler: [u32; 5] = [
+            // --- @ EL1 (sync exception from EL0, sync vector at VBAR+0x400) ---
+            movz(1, UART_OUT as u32, 0),
+            movz(0, b'K' as u32, 0),
             str_imm(0, 1, 0),
-            movz(0, b'e' as u32, 0),
+            add_imm(0, 0, 0),                 // ADD X0,X0,#0 — pad
+            eret(),                           // → EL0, PC = ELR_EL1 = SVC return
+        ];
+        let user: [u32; 8] = [
+            // --- @ EL0 ---
+            movz(1, UART_OUT as u32, 0),
+            movz(0, b'U' as u32, 0),
             str_imm(0, 1, 0),
-            movz(0, b'l' as u32, 0),
-            str_imm(0, 1, 0),
-            str_imm(0, 1, 0),
-            movz(0, b'o' as u32, 0),
-            str_imm(0, 1, 0),
+            svc_imm(0),                       // SVC #0 — trap into EL1 handler
             movz(0, b'\n' as u32, 0),
             str_imm(0, 1, 0),
-            add_imm(0, 0, 0),
-            b_self(),                          // halt
+            add_imm(0, 0, 0),                 // pad
+            b_self(),                         // halt at EL0
         ];
-        let mut off = ENTRY_PC as usize;
-        for word in prog.iter() {
-            self.mem[off..off + 4].copy_from_slice(&word.to_le_bytes());
-            off += 4;
-        }
+
+        // Place each region at its physical address.
+        write_words(&mut self.mem, ENTRY_PC, &kernel);
+        write_words(&mut self.mem, HANDLER_PA, &handler);
+        write_words(&mut self.mem, USER_PA, &user);
     }
 
     /// Build a tiny stage-1 page table: identity-map the program page (0x4000)
@@ -748,6 +806,14 @@ fn write_u64(mem: &mut [u8], addr: u64, val: u64) {
     mem[a..a + 8].copy_from_slice(&val.to_le_bytes());
 }
 
+fn write_words(mem: &mut [u8], base: u64, words: &[u32]) {
+    let mut off = base as usize;
+    for w in words.iter() {
+        mem[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        off += 4;
+    }
+}
+
 fn unsupported_sysreg(op: &str, sr: (u32, u32, u32, u32, u32), pc: u64) -> String {
     format!(
         "{op} of unsupported sysreg S{}_{}_C{}_C{}_{} at pc={:#x}",
@@ -819,6 +885,18 @@ const fn msr_spsr_el2(rt: u32) -> u32 {
     msr_sysreg(rt, 3, 4, 4, 0, 0)
 }
 
+const fn msr_vbar_el1(rt: u32) -> u32 {
+    msr_sysreg(rt, 3, 0, 12, 0, 0)
+}
+
+const fn msr_elr_el1(rt: u32) -> u32 {
+    msr_sysreg(rt, 3, 0, 4, 0, 1)
+}
+
+const fn msr_spsr_el1(rt: u32) -> u32 {
+    msr_sysreg(rt, 3, 0, 4, 0, 0)
+}
+
 const fn isb() -> u32 {
     0xD503_3FDF
 }
@@ -827,16 +905,24 @@ const fn eret() -> u32 {
     0xD69F_03E0
 }
 
+const fn svc_imm(imm16: u32) -> u32 {
+    // SVC #imm16 :: 1101 0100 000 imm16 0 0001
+    0xD400_0001 | ((imm16 & 0xFFFF) << 5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn demo_writes_hello() {
+    fn demo_writes_uk_via_round_trip() {
         let mut cpu = Cpu::new();
         cpu.run(1000);
         assert!(cpu.halted);
-        assert_eq!(cpu.output(), "Hello\n");
+        assert!(cpu.last_trap.is_none(), "trap: {:?}", cpu.last_trap);
+        assert_eq!(cpu.output(), "UK\n");
+        // After halting at EL0 user code (the final B .), current_el should be 0.
+        assert_eq!(cpu.current_el, 0);
     }
 
     #[test]
@@ -902,7 +988,7 @@ mod tests {
         cpu.run(1000);
         assert!(cpu.halted);
         assert!(cpu.last_trap.is_none(), "trap: {:?}", cpu.last_trap);
-        assert_eq!(cpu.output(), "Hello\n");
+        assert_eq!(cpu.output(), "UK\n");
     }
 
     #[test]
@@ -919,5 +1005,40 @@ mod tests {
         assert_eq!(cpu.current_el, 1);
         assert_eq!(cpu.pc, ENTRY_PC + 5 * 4);
         assert!(cpu.last_trap.is_none(), "trap: {:?}", cpu.last_trap);
+    }
+
+    #[test]
+    fn svc_traps_into_handler_and_eret_returns() {
+        let mut cpu = Cpu::new();
+        // Run kernel boot: 5 EL2 + 7 MMU + 7 (VBAR/ELR/SPSR/eret to EL0) = 19 inst.
+        // After that we're at EL0 running user code.
+        cpu.run(19);
+        assert_eq!(cpu.current_el, 0);
+        assert_eq!(cpu.vbar_el1, 0x4400);
+
+        // 3 user inst before SVC: MOVZ X1, MOVZ X0, STR. After those, output = "U".
+        cpu.run(3);
+        assert_eq!(cpu.output(), "U");
+        assert_eq!(cpu.current_el, 0);
+
+        // 4th user inst is SVC #0 — trap into EL1 handler at VBAR+0x400.
+        cpu.run(1);
+        assert_eq!(cpu.current_el, 1);
+        assert_eq!(cpu.pc, 0x4800);
+        assert_eq!(cpu.elr_el1, 0x4C00 + 4 * 4); // SVC PC + 4
+        // ESR_EL1.EC should be 0x15 (SVC AArch64).
+        assert_eq!(cpu.esr_el1 >> 26 & 0x3F, 0x15);
+
+        // Run handler to completion: 4 inst before ERET, then ERET.
+        cpu.run(5);
+        // ERET sends us back to EL0, just past the SVC.
+        assert_eq!(cpu.current_el, 0);
+        assert_eq!(cpu.pc, 0x4C00 + 4 * 4);
+        assert_eq!(cpu.output(), "UK");
+
+        // Finish: user writes '\n' then halts.
+        cpu.run(100);
+        assert!(cpu.halted);
+        assert_eq!(cpu.output(), "UK\n");
     }
 }

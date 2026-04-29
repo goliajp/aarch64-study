@@ -25,8 +25,8 @@ export function AboutView() {
             {`v0.1  registers + 5 instructions (MOVZ ADD LDR STR B) + MMIO UART
 v0.2  + MMU stage-1 page-table walk (4 KiB granule, identity-map demo)
 v0.3  + MSR/MRS + SCTLR_EL1.M honoured (LDR/STR/fetch all through MMU)
-v0.4  + EL2 boot + ERET drops to EL1 (current_el visible, ELR/SPSR sysregs)  ← here
-v0.5  + SVC raises EL0 → EL1, ERET returns (full round-trip)
+v0.4  + EL2 boot + ERET drops to EL1 (current_el visible, ELR/SPSR sysregs)
+v0.5  + SVC raises EL0 → EL1 + ERET returns (full syscall round-trip)  ← here
 v0.6  + two cores (P-core / E-core) side by side       ← Apple-specific
 v0.7  + AIC interrupt controller (timeline)
 v0.8  + scheduler (per-core run queues)
