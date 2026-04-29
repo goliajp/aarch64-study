@@ -6,27 +6,29 @@ export class Cpu {
     [Symbol.dispose](): void;
     entry_pc(): bigint;
     l1_table_pa(): bigint;
-    /**
-     * Return a slice of memory as a Uint8Array. `start` and `len` are byte offsets.
-     */
     mem_slice(start: number, len: number): Uint8Array;
     constructor();
+    num_cores(): number;
     output(): string;
     reset(): void;
-    /**
-     * Run up to `max` steps or until halted/trapped. Returns steps actually executed.
-     */
     run(max: number): number;
+    /**
+     * Returns an array of CoreState (one per core) as a JS Array.
+     */
     state(): any;
     /**
-     * Execute one instruction. Returns true if the CPU is still runnable.
+     * Step every core once (deterministic order, core 0 first). Returns true
+     * if any core was runnable (i.e., made forward progress).
      */
     step(): boolean;
     /**
-     * Walk the stage-1 page tables for `va` using the current TTBR0/TCR.
-     * Returns the walk trace plus the resolved physical address (or fault).
+     * Step a single core. Useful for "advance only this core" UI controls.
      */
-    translate(va: bigint): any;
+    step_core(idx: number): boolean;
+    /**
+     * Walk page tables for `va` using the sysregs of `core_idx`.
+     */
+    translate(va: bigint, core_idx: number): any;
     uart_addr(): bigint;
 }
 
@@ -37,12 +39,14 @@ export interface InitOutput {
     readonly __wbg_cpu_free: (a: number, b: number) => void;
     readonly cpu_mem_slice: (a: number, b: number, c: number) => [number, number];
     readonly cpu_new: () => number;
+    readonly cpu_num_cores: (a: number) => number;
     readonly cpu_output: (a: number) => [number, number];
     readonly cpu_reset: (a: number) => void;
     readonly cpu_run: (a: number, b: number) => number;
     readonly cpu_state: (a: number) => [number, number, number];
     readonly cpu_step: (a: number) => number;
-    readonly cpu_translate: (a: number, b: bigint) => [number, number, number];
+    readonly cpu_step_core: (a: number, b: number) => number;
+    readonly cpu_translate: (a: number, b: bigint, c: number) => [number, number, number];
     readonly cpu_entry_pc: (a: number) => bigint;
     readonly cpu_l1_table_pa: (a: number) => bigint;
     readonly cpu_uart_addr: (a: number) => bigint;

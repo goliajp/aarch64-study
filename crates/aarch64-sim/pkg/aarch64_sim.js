@@ -26,7 +26,6 @@ export class Cpu {
         return BigInt.asUintN(64, ret);
     }
     /**
-     * Return a slice of memory as a Uint8Array. `start` and `len` are byte offsets.
      * @param {number} start
      * @param {number} len
      * @returns {Uint8Array}
@@ -42,6 +41,13 @@ export class Cpu {
         this.__wbg_ptr = ret;
         CpuFinalization.register(this, this.__wbg_ptr, this);
         return this;
+    }
+    /**
+     * @returns {number}
+     */
+    num_cores() {
+        const ret = wasm.cpu_num_cores(this.__wbg_ptr);
+        return ret >>> 0;
     }
     /**
      * @returns {string}
@@ -62,7 +68,6 @@ export class Cpu {
         wasm.cpu_reset(this.__wbg_ptr);
     }
     /**
-     * Run up to `max` steps or until halted/trapped. Returns steps actually executed.
      * @param {number} max
      * @returns {number}
      */
@@ -71,6 +76,7 @@ export class Cpu {
         return ret >>> 0;
     }
     /**
+     * Returns an array of CoreState (one per core) as a JS Array.
      * @returns {any}
      */
     state() {
@@ -81,7 +87,8 @@ export class Cpu {
         return takeFromExternrefTable0(ret[0]);
     }
     /**
-     * Execute one instruction. Returns true if the CPU is still runnable.
+     * Step every core once (deterministic order, core 0 first). Returns true
+     * if any core was runnable (i.e., made forward progress).
      * @returns {boolean}
      */
     step() {
@@ -89,13 +96,22 @@ export class Cpu {
         return ret !== 0;
     }
     /**
-     * Walk the stage-1 page tables for `va` using the current TTBR0/TCR.
-     * Returns the walk trace plus the resolved physical address (or fault).
+     * Step a single core. Useful for "advance only this core" UI controls.
+     * @param {number} idx
+     * @returns {boolean}
+     */
+    step_core(idx) {
+        const ret = wasm.cpu_step_core(this.__wbg_ptr, idx);
+        return ret !== 0;
+    }
+    /**
+     * Walk page tables for `va` using the sysregs of `core_idx`.
      * @param {bigint} va
+     * @param {number} core_idx
      * @returns {any}
      */
-    translate(va) {
-        const ret = wasm.cpu_translate(this.__wbg_ptr, va);
+    translate(va, core_idx) {
+        const ret = wasm.cpu_translate(this.__wbg_ptr, va, core_idx);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
