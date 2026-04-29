@@ -1,0 +1,15 @@
+{
+  "name": "aarch64-sim",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "aarch64_sim_bg.wasm",
+    "aarch64_sim.js",
+    "aarch64_sim.d.ts"
+  ],
+  "main": "aarch64_sim.js",
+  "types": "aarch64_sim.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
