@@ -17,14 +17,23 @@ export class Cpu {
      */
     state(): any;
     /**
-     * Step every core once (deterministic order, core 0 first). Returns true
-     * if any core was runnable (i.e., made forward progress).
+     * Step every core once. On the way in: bump system_steps; if the timer is
+     * due, raise irq_pending on core 0. Each core then either takes a pending
+     * IRQ (if DAIF.I clear) or executes one instruction.
      */
     step(): boolean;
     /**
-     * Step a single core. Useful for "advance only this core" UI controls.
+     * Step a single core. Honours pending IRQs on that core (timer firing
+     * happens in `step()` only, but IPIs would land here in future versions).
      */
     step_core(idx: number): boolean;
+    system_steps(): bigint;
+    timer_period(): bigint;
+    /**
+     * System steps until the next timer IRQ fires (0 if it's due now).
+     */
+    timer_remaining(): bigint;
+    timer_ticks(): bigint;
     /**
      * Walk page tables for `va` using the sysregs of `core_idx`.
      */
@@ -47,9 +56,13 @@ export interface InitOutput {
     readonly cpu_step: (a: number) => number;
     readonly cpu_step_core: (a: number, b: number) => number;
     readonly cpu_translate: (a: number, b: bigint, c: number) => [number, number, number];
+    readonly cpu_system_steps: (a: number) => bigint;
+    readonly cpu_timer_remaining: (a: number) => bigint;
     readonly cpu_entry_pc: (a: number) => bigint;
     readonly cpu_l1_table_pa: (a: number) => bigint;
+    readonly cpu_timer_period: (a: number) => bigint;
     readonly cpu_uart_addr: (a: number) => bigint;
+    readonly cpu_timer_ticks: (a: number) => bigint;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;

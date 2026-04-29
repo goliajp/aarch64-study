@@ -15,6 +15,8 @@ interface CoreState {
   last_trap: string | null
   steps: bigint
   current_el: number
+  daif: number
+  irq_pending: boolean
   ttbr0_el1: bigint
   tcr_el1: bigint
   sctlr_el1: bigint
@@ -26,6 +28,13 @@ interface CoreState {
   elr_el2: bigint
   spsr_el2: bigint
   esr_el2: bigint
+}
+
+interface SystemInfo {
+  systemSteps: bigint
+  timerPeriod: bigint
+  timerRemaining: bigint
+  timerTicks: bigint
 }
 
 interface PageAttrs {
@@ -61,7 +70,7 @@ interface TranslationResult {
 
 const REG_LABELS = Array.from({ length: 31 }, (_, i) => `X${i}`)
 const MEMORY_VIEW_BYTES = 256
-const RUN_BURST = 1
+const RUN_BURST = 2
 
 function fmtHex64(v: bigint): string {
   return '0x' + v.toString(16).padStart(16, '0')
@@ -84,6 +93,7 @@ function parseHex(text: string): bigint | null {
 export function CpuView() {
   const [cpu, setCpu] = useState<Cpu | null>(null)
   const [cores, setCores] = useState<CoreState[] | null>(null)
+  const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null)
   const [memory, setMemory] = useState<Uint8Array>(new Uint8Array(MEMORY_VIEW_BYTES))
   const [output, setOutput] = useState('')
   const [running, setRunning] = useState(false)
@@ -94,6 +104,12 @@ export function CpuView() {
   const refresh = useCallback((c: Cpu) => {
     const s = c.state() as CoreState[]
     setCores(s)
+    setSysInfo({
+      systemSteps: c.system_steps(),
+      timerPeriod: c.timer_period(),
+      timerRemaining: c.timer_remaining(),
+      timerTicks: c.timer_ticks(),
+    })
     // Center memory on core 0's PC.
     const viewStart = Number(s[0].pc) & ~0xf
     setMemory(c.mem_slice(viewStart, MEMORY_VIEW_BYTES))
@@ -182,13 +198,12 @@ export function CpuView() {
     }
   }, [cpu, cores, vaText, translateCoreIdx])
 
-  if (!cpu || !cores) {
+  if (!cpu || !cores || !sysInfo) {
     return <div className="text-fg-muted text-sm">Loading WASM…</div>
   }
 
   const allHalted = cores.every((c) => c.halted)
   const anyTrap = cores.find((c) => c.last_trap != null)
-  const totalSteps = cores.reduce((acc, c) => acc + c.steps, 0n)
   const memBaseAddr = Number(cores[0].pc) & ~0xf
   const corePcs = cores.map((c) => Number(c.pc))
 
@@ -202,7 +217,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.6</Badge>
+          <Badge color="info">v0.7</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -213,12 +228,14 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          Two cores share physical memory and the UART. Both run the same kernel image; each has
-          independent register file, EL state, and sysregs (incl. <code>MPIDR_EL1</code>). Output
-          should come out as <code>UUKK\n\n</code> — both cores write 'U', both trap into their own
-          EL1 handler that writes 'K', both ERET back and write '\n'.
+          AIC timer fires an IRQ on core 0 every {sysInfo.timerPeriod.toString()} system steps. Once
+          user code has DAIF.I clear, the IRQ is taken: PC jumps to <code>VBAR_EL1+0x480</code>, the
+          handler writes 'T' to UART, ERET restores DAIF + EL. Hit <strong>Run</strong> and watch
+          the output grow with periodic 'T' chars.
         </p>
       </header>
+
+      <SystemInfoBar info={sysInfo} totalCoreSteps={cores.reduce((a, c) => a + c.steps, 0n)} />
 
       <div className="flex flex-wrap items-center gap-2">
         <GlassButton onClick={onStep} size="sm" variant="accent">
@@ -230,9 +247,6 @@ export function CpuView() {
         <GlassButton onClick={onReset} size="sm">
           Reset
         </GlassButton>
-        <div className="text-fg-muted ml-auto self-center font-mono text-xs">
-          total steps: {totalSteps.toString()}
-        </div>
       </div>
 
       {anyTrap && anyTrap.last_trap && (
@@ -263,6 +277,53 @@ export function CpuView() {
   )
 }
 
+function SystemInfoBar({ info, totalCoreSteps }: { info: SystemInfo; totalCoreSteps: bigint }) {
+  return (
+    <div className="border-border bg-bg/40 flex flex-wrap items-center gap-x-6 gap-y-1 rounded border px-3 py-2 font-mono text-xs">
+      <span className="text-fg-muted">
+        system steps: <span className="text-fg">{info.systemSteps.toString()}</span>
+      </span>
+      <span className="text-fg-muted">
+        retired (sum): <span className="text-fg">{totalCoreSteps.toString()}</span>
+      </span>
+      <span className="text-fg-muted">
+        timer period: <span className="text-fg">{info.timerPeriod.toString()}</span>
+      </span>
+      <span className="text-fg-muted">
+        next IRQ in:{' '}
+        <span className={info.timerRemaining === 0n ? 'text-warn text-amber-400' : 'text-fg'}>
+          {info.timerRemaining.toString()}
+        </span>
+      </span>
+      <span className="text-fg-muted">
+        timer ticks: <span className="text-fg">{info.timerTicks.toString()}</span>
+      </span>
+    </div>
+  )
+}
+
+function DaifChip({ daif }: { daif: number }) {
+  // Internal layout: bit 3=D, bit 2=A, bit 1=I, bit 0=F. 1 = masked.
+  const bits = [
+    { name: 'D', set: (daif & 0b1000) !== 0 },
+    { name: 'A', set: (daif & 0b0100) !== 0 },
+    { name: 'I', set: (daif & 0b0010) !== 0 },
+    { name: 'F', set: (daif & 0b0001) !== 0 },
+  ]
+  return (
+    <span
+      className="border-border bg-bg/40 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[10px] tracking-wider"
+      title="PSTATE.DAIF — 1 = masked, 0 = enabled"
+    >
+      {bits.map((b) => (
+        <span className={b.set ? 'text-fg-muted' : 'text-success font-semibold'} key={b.name}>
+          {b.name}
+        </span>
+      ))}
+    </span>
+  )
+}
+
 function CoreChip({ core }: { core: CoreState }) {
   const elClass =
     core.current_el === 2
@@ -286,8 +347,14 @@ function CoreColumn({ core, onStep }: { core: CoreState; onStep: () => void }) {
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <CoreChip core={core} />
+          <DaifChip daif={core.daif} />
+          {core.irq_pending && (
+            <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] tracking-wider text-amber-300">
+              IRQ pending
+            </span>
+          )}
           {core.halted && (
             <Badge color={core.last_trap ? 'danger' : 'success'}>
               {core.last_trap ? 'TRAP' : 'HALTED'}
@@ -337,7 +404,9 @@ function RegistersCard({ core }: { core: CoreState }) {
 
 function ExceptionCard({ core }: { core: CoreState }) {
   const ec = Number((core.esr_el1 >> 26n) & 0x3fn)
-  const ecName = decodeEc(ec)
+  // ESR_EL1=0 with current_el=1 typically means we entered via IRQ (no syndrome).
+  const inIrq = core.current_el === 1 && core.esr_el1 === 0n && core.elr_el1 !== 0n
+  const ecName = inIrq ? 'IRQ (no ESR syndrome)' : decodeEc(ec)
   return (
     <GlassCard>
       <div className="space-y-2 p-3">
@@ -360,9 +429,11 @@ function ExceptionCard({ core }: { core: CoreState }) {
           <RegRow label="SPSR_EL1" value={core.spsr_el1} />
           <RegRow label="ESR_EL1" value={core.esr_el1} />
         </div>
-        {core.esr_el1 !== 0n && (
+        {(core.esr_el1 !== 0n || inIrq) && (
           <div className="text-fg-muted text-[11px]">
-            ESR_EL1.EC = 0x{ec.toString(16).padStart(2, '0')} → {ecName}
+            {inIrq
+              ? `entered via ${ecName} (vector VBAR_EL1+0x480)`
+              : `ESR_EL1.EC = 0x${ec.toString(16).padStart(2, '0')} → ${ecName}`}
           </div>
         )}
       </div>

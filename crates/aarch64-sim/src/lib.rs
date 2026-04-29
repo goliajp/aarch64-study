@@ -35,6 +35,10 @@ const NUM_CORES: usize = 2;
 const MPIDR_VALUES: [u64; NUM_CORES] = [0x8000_0000, 0x8000_0100];
 const CORE_KIND: [&str; NUM_CORES] = ["P-core", "E-core"];
 
+// AIC timer: fires an IRQ on core 0 every TIMER_PERIOD system steps.
+// Picked small so the periodic 'T' shows up quickly in interactive Step mode.
+const TIMER_PERIOD: u64 = 30;
+
 #[derive(Serialize, Clone)]
 pub struct CoreState {
     pub id: u8,
@@ -48,6 +52,8 @@ pub struct CoreState {
     pub last_trap: Option<String>,
     pub steps: u64,
     pub current_el: u8,
+    pub daif: u8,
+    pub irq_pending: bool,
     pub ttbr0_el1: u64,
     pub tcr_el1: u64,
     pub sctlr_el1: u64,
@@ -111,6 +117,12 @@ struct Core {
     last_trap: Option<String>,
     steps: u64,
     current_el: u8,
+    /// Low 4 bits of PSTATE.DAIF — D, A, I, F (bit 3 → bit 0). 1 = masked.
+    /// On reset (EL2) we mask everything; SVC/IRQ entries also re-mask.
+    daif: u8,
+    /// One bit of "incoming IRQ line" — set by the system timer, consumed by
+    /// take_irq() once the core has DAIF.I clear.
+    irq_pending: bool,
     ttbr0_el1: u64,
     tcr_el1: u64,
     sctlr_el1: u64,
@@ -142,6 +154,8 @@ impl Core {
             last_trap: None,
             steps: 0,
             current_el: 2,
+            daif: 0xF, // boot at EL2 with all interrupts masked
+            irq_pending: false,
             ttbr0_el1: 0,
             tcr_el1: 0,
             sctlr_el1: 0,
@@ -175,6 +189,8 @@ impl Core {
             last_trap: self.last_trap.clone(),
             steps: self.steps,
             current_el: self.current_el,
+            daif: self.daif,
+            irq_pending: self.irq_pending,
             ttbr0_el1: self.ttbr0_el1,
             tcr_el1: self.tcr_el1,
             sctlr_el1: self.sctlr_el1,
@@ -202,6 +218,33 @@ impl Core {
     fn trap(&mut self, msg: String) {
         self.last_trap = Some(msg);
         self.halted = true;
+    }
+
+    /// Pack the current EL+SP context and DAIF into an SPSR-shaped value, suitable
+    /// for storing in SPSR_EL<x> on exception entry.
+    fn build_spsr(&self) -> u64 {
+        let m_low: u64 = match self.current_el {
+            0 => 0b0000,           // EL0t (no SP_ELx)
+            1 => 0b0101,           // EL1h (uses SP_EL1)
+            2 => 0b1001,           // EL2h
+            _ => 0,
+        };
+        m_low | ((self.daif as u64) << 6)
+    }
+
+    /// Take an asynchronous IRQ exception into EL1, vectoring to VBAR_EL1+0x480.
+    /// Caller is responsible for verifying DAIF.I is clear and irq_pending is set.
+    fn take_irq(&mut self) {
+        self.elr_el1 = self.pc; // resume at the not-yet-fetched instruction
+        self.spsr_el1 = self.build_spsr();
+        self.esr_el1 = 0; // IRQ has no syndrome
+        self.current_el = 1;
+        self.daif = 0xF; // exception entry masks everything
+        self.pc = self.vbar_el1.wrapping_add(0x480);
+    }
+
+    fn irq_masked(&self) -> bool {
+        self.daif & 0b0010 != 0 // I bit (bit 1 of low nibble: D=8, A=4, I=2, F=1)
     }
 
     fn read_sysreg(&self, sr: (u32, u32, u32, u32, u32)) -> Result<u64, String> {
@@ -530,6 +573,22 @@ impl Core {
                     self.pc = self.pc.wrapping_add(4);
                     return Ok(StepResult::Continue);
                 }
+                // MSR <pstatefield>, #imm — same major class with op0=00, op1=011,
+                // CRn=0100. Distinguished from DAIFSet/DAIFClr by op2.
+                //   op2=110 → MSR DAIFSet, #imm4
+                //   op2=111 → MSR DAIFClr, #imm4
+                // The imm4 (D=8/A=4/I=2/F=1) maps directly onto our internal
+                // 4-bit daif representation.
+                if op0 == 0 && op1 == 3 && crn == 4 && (op2 == 6 || op2 == 7) {
+                    let imm4 = (crm & 0xF) as u8;
+                    if op2 == 6 {
+                        self.daif |= imm4; // DAIFSet
+                    } else {
+                        self.daif &= !imm4; // DAIFClr
+                    }
+                    self.pc = self.pc.wrapping_add(4);
+                    return Ok(StepResult::Continue);
+                }
                 return Err(format!(
                     "unsupported system instruction {:#010x} at pc={:#x}",
                     insn, self.pc
@@ -558,9 +617,10 @@ impl Core {
                 ));
             }
             self.elr_el1 = self.pc.wrapping_add(4);
-            self.spsr_el1 = 0;
+            self.spsr_el1 = self.build_spsr();
             self.esr_el1 = (0x15u64 << 26) | (1 << 25) | (imm16 as u64);
             self.current_el = 1;
+            self.daif = 0xF; // exception entry masks DAIF
             self.pc = self.vbar_el1.wrapping_add(0x400);
             return Ok(StepResult::Continue);
         }
@@ -584,7 +644,9 @@ impl Core {
                     self.current_el, new_el, self.pc
                 ));
             }
+            let new_daif = ((spsr >> 6) & 0xF) as u8;
             self.current_el = new_el;
+            self.daif = new_daif;
             self.pc = elr;
             return Ok(StepResult::Continue);
         }
@@ -613,6 +675,12 @@ pub struct Cpu {
     cores: Vec<Core>,
     mem: Vec<u8>,
     output_buf: Vec<u8>,
+    /// Number of Cpu::step() calls since reset.
+    system_steps: u64,
+    /// system_steps value at which the next timer IRQ fires on core 0.
+    timer_next: u64,
+    /// Total number of timer ticks observed; mostly for the UI.
+    timer_ticks: u64,
 }
 
 #[wasm_bindgen]
@@ -626,6 +694,9 @@ impl Cpu {
             cores,
             mem: vec![0u8; MEM_SIZE],
             output_buf: Vec::new(),
+            system_steps: 0,
+            timer_next: TIMER_PERIOD,
+            timer_ticks: 0,
         };
         load_demo(&mut sys.mem);
         setup_demo_pgtable(&mut sys.mem);
@@ -640,26 +711,52 @@ impl Cpu {
             *b = 0;
         }
         self.output_buf.clear();
+        self.system_steps = 0;
+        self.timer_next = TIMER_PERIOD;
+        self.timer_ticks = 0;
         load_demo(&mut self.mem);
         setup_demo_pgtable(&mut self.mem);
     }
 
-    /// Step every core once (deterministic order, core 0 first). Returns true
-    /// if any core was runnable (i.e., made forward progress).
+    /// Step every core once. On the way in: bump system_steps; if the timer is
+    /// due, raise irq_pending on core 0. Each core then either takes a pending
+    /// IRQ (if DAIF.I clear) or executes one instruction.
     pub fn step(&mut self) -> bool {
+        self.system_steps = self.system_steps.saturating_add(1);
+        if self.system_steps >= self.timer_next {
+            // Timer fires: target core 0 only (single-source AIC for now).
+            self.cores[0].irq_pending = true;
+            self.timer_next = self.system_steps + TIMER_PERIOD;
+            self.timer_ticks = self.timer_ticks.saturating_add(1);
+        }
+
         let mut any = false;
         for core in self.cores.iter_mut() {
-            if core.step(&mut self.mem, &mut self.output_buf) {
+            if core.halted {
+                continue;
+            }
+            if core.irq_pending && !core.irq_masked() {
+                core.take_irq();
+                core.irq_pending = false;
+                any = true;
+            } else if core.step(&mut self.mem, &mut self.output_buf) {
                 any = true;
             }
         }
         any
     }
 
-    /// Step a single core. Useful for "advance only this core" UI controls.
+    /// Step a single core. Honours pending IRQs on that core (timer firing
+    /// happens in `step()` only, but IPIs would land here in future versions).
     pub fn step_core(&mut self, idx: u32) -> bool {
         if let Some(core) = self.cores.get_mut(idx as usize) {
-            core.step(&mut self.mem, &mut self.output_buf)
+            if core.irq_pending && !core.irq_masked() && !core.halted {
+                core.take_irq();
+                core.irq_pending = false;
+                true
+            } else {
+                core.step(&mut self.mem, &mut self.output_buf)
+            }
         } else {
             false
         }
@@ -671,6 +768,23 @@ impl Cpu {
             n += 1;
         }
         n
+    }
+
+    pub fn system_steps(&self) -> u64 {
+        self.system_steps
+    }
+
+    pub fn timer_period(&self) -> u64 {
+        TIMER_PERIOD
+    }
+
+    /// System steps until the next timer IRQ fires (0 if it's due now).
+    pub fn timer_remaining(&self) -> u64 {
+        self.timer_next.saturating_sub(self.system_steps)
+    }
+
+    pub fn timer_ticks(&self) -> u64 {
+        self.timer_ticks
     }
 
     /// Returns an array of CoreState (one per core) as a JS Array.
@@ -789,15 +903,19 @@ fn unsupported_sysreg(op: &str, sr: (u32, u32, u32, u32, u32), pc: u64) -> Strin
 // === Demo program =============================================================
 
 fn load_demo(mem: &mut [u8]) {
-    // Three regions, both cores execute the same code:
+    // Memory regions, both cores execute the same code:
     //   PA 0x4000  kernel boot — EL2 → EL1, MMU bring-up, drop to EL0
     //   PA 0x4800  sync handler at VBAR_EL1+0x400 — writes 'K', ERET
-    //   PA 0x4C00  user code at EL0 — writes 'U', SVC, '\n', halt
+    //   PA 0x4880  IRQ handler at VBAR_EL1+0x480 — writes 'T' (timer), ERET
+    //   PA 0x4C00  user code at EL0 — writes 'U', SVC, '\n', then spins
     //
-    // With two cores, output becomes interleaved: typically "UUKK\n\n".
+    // The kernel ERETs into EL0 with SPSR_EL1=0, which leaves DAIF=0 — IRQs
+    // are enabled in user code by default. The system timer fires every
+    // TIMER_PERIOD steps and raises an IRQ on core 0 only.
     const SPSR_EL1H_DAIF: u32 = 0x3C5;
     const VBAR: u32 = 0x4400;
-    const HANDLER_PA: u64 = 0x4800;
+    const SYNC_HANDLER_PA: u64 = 0x4800; // VBAR + 0x400
+    const IRQ_HANDLER_PA: u64 = 0x4880; // VBAR + 0x480 (sync from lower EL → IRQ)
     const USER_PA: u64 = 0x4C00;
     const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
@@ -825,11 +943,19 @@ fn load_demo(mem: &mut [u8]) {
         msr_spsr_el1(9),
         eret(),
     ];
-    let handler: [u32; 5] = [
+    let sync_handler: [u32; 5] = [
         movz(1, UART_OUT as u32, 0),
         movz(0, b'K' as u32, 0),
         str_imm(0, 1, 0),
         add_imm(0, 0, 0),
+        eret(),
+    ];
+    // IRQ handler uses X2/X3 so it doesn't clobber the user's spin-loop X0/X1.
+    let irq_handler: [u32; 5] = [
+        movz(2, UART_OUT as u32, 0),
+        movz(3, b'T' as u32, 0),
+        str_imm(3, 2, 0),
+        add_imm(3, 3, 0),
         eret(),
     ];
     let user: [u32; 8] = [
@@ -839,11 +965,14 @@ fn load_demo(mem: &mut [u8]) {
         svc_imm(0),
         movz(0, b'\n' as u32, 0),
         str_imm(0, 1, 0),
+        // Spin loop: ADD (no-op) + B back-1-word. Stays runnable so timer IRQs
+        // can fire and the handler writes 'T' over and over.
         add_imm(0, 0, 0),
-        b_self(),
+        b_offset(-1),
     ];
     write_words(mem, ENTRY_PC, &kernel);
-    write_words(mem, HANDLER_PA, &handler);
+    write_words(mem, SYNC_HANDLER_PA, &sync_handler);
+    write_words(mem, IRQ_HANDLER_PA, &irq_handler);
     write_words(mem, USER_PA, &user);
 }
 
@@ -882,6 +1011,12 @@ const fn ldr_imm(rt: u32, rn: u32, imm12: u32) -> u32 {
 
 const fn b_self() -> u32 {
     0x1400_0000
+}
+
+/// Encode `B label` with a signed instruction-word offset (-1 = previous insn).
+const fn b_offset(words: i32) -> u32 {
+    let imm26 = (words as u32) & 0x03FF_FFFF;
+    0x1400_0000 | imm26
 }
 
 const fn msr_sysreg(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
@@ -950,20 +1085,74 @@ mod tests {
     }
 
     #[test]
-    fn both_cores_complete_round_trip() {
+    fn both_cores_finish_uk_prefix_before_timer() {
+        // Run only as many system steps as it takes for both cores to write
+        // "UU" + SVC handler "KK". Stop before either core has a chance to
+        // STR the '\n', because at step 30 the timer fires and steals core 0's
+        // STR slot — making the exact tail order non-deterministic relative to
+        // the test's expectations.
         let mut cpu = Cpu::new();
-        cpu.run(2000);
-        assert!(cpu.cores[0].halted, "core 0 didn't halt");
-        assert!(cpu.cores[1].halted, "core 1 didn't halt");
-        assert!(cpu.cores[0].last_trap.is_none(), "core 0 trap: {:?}", cpu.cores[0].last_trap);
-        assert!(cpu.cores[1].last_trap.is_none(), "core 1 trap: {:?}", cpu.cores[1].last_trap);
-        // Both cores wrote U, K, \n. Order is core-0-first per step():
-        //   step n:  core0-U, core1-U → "UU"
-        //   step n+1: SVC for both, handler runs both, K K → "UUKK"
-        //   final:    \n \n → "UUKK\n\n"
-        assert_eq!(cpu.output(), "UUKK\n\n");
+        cpu.run(28);
+        assert_eq!(cpu.output(), "UUKK");
+        assert!(!cpu.cores[0].halted);
+        assert!(!cpu.cores[1].halted);
+    }
+
+    #[test]
+    fn timer_fires_irq_on_core0() {
+        let mut cpu = Cpu::new();
+        cpu.run(200);
+        assert!(cpu.timer_ticks >= 5, "expected several ticks, got {}", cpu.timer_ticks);
+        let out = cpu.output();
+        assert!(out.starts_with("UUKK"), "got: {:?}", out);
+        assert!(out.contains('T'), "no T in output: {:?}", out);
+        // Both cores eventually write their '\n' (one each).
+        let nl = out.chars().filter(|&c| c == '\n').count();
+        assert_eq!(nl, 2, "expected 2 newlines in: {:?}", out);
+    }
+
+    #[test]
+    fn t_chars_match_timer_ticks() {
+        let mut cpu = Cpu::new();
+        cpu.run(300);
+        // 'T' is written only by the IRQ handler on core 0. There may be one
+        // tick in flight (handler started but hasn't reached its STR yet).
+        let t_count = cpu.output().chars().filter(|&c| c == 'T').count() as u64;
+        let ticks = cpu.timer_ticks;
+        assert!(
+            t_count == ticks || t_count + 1 == ticks,
+            "T count {} vs ticks {}", t_count, ticks
+        );
+    }
+
+    #[test]
+    fn daif_restored_through_eret() {
+        let mut cpu = Cpu::new();
+        // After 5 steps the EL2 prologue ERETs into EL1 with SPSR_EL2=0x3C5
+        // (M[3:0]=EL1h, DAIF all set) — kernel runs with IRQs masked.
+        cpu.run(5);
+        assert_eq!(cpu.cores[0].current_el, 1);
+        assert_eq!(cpu.cores[0].daif, 0xF);
+        // After the remaining kernel boot (14 more steps total = 19) we ERET
+        // into EL0 with SPSR_EL1=0 — DAIF restored to 0, IRQs enabled.
+        cpu.run(14);
         assert_eq!(cpu.cores[0].current_el, 0);
-        assert_eq!(cpu.cores[1].current_el, 0);
+        assert_eq!(cpu.cores[0].daif, 0);
+    }
+
+    #[test]
+    fn daifclr_clears_i_bit() {
+        // Verify the MSR DAIFClr immediate path — start at EL2 with daif=0xF,
+        // run a hand-built program that does DAIFClr #2 (clear I).
+        let mut cpu = Cpu::new();
+        // Encode MSR DAIFClr #2: 0xD503_42FF.
+        let prog = [0xD503_42FFu32, b_self()];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+        cpu.cores[0].sctlr_el1 = 0; // identity-map by bypassing MMU
+        cpu.cores[0].daif = 0xF;
+        cpu.run(5);
+        // DAIFClr #2 = clear bit 1 (I) → daif = 0xD.
+        assert_eq!(cpu.cores[0].daif, 0xD);
     }
 
     #[test]

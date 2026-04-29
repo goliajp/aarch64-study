@@ -87,8 +87,9 @@ export class Cpu {
         return takeFromExternrefTable0(ret[0]);
     }
     /**
-     * Step every core once (deterministic order, core 0 first). Returns true
-     * if any core was runnable (i.e., made forward progress).
+     * Step every core once. On the way in: bump system_steps; if the timer is
+     * due, raise irq_pending on core 0. Each core then either takes a pending
+     * IRQ (if DAIF.I clear) or executes one instruction.
      * @returns {boolean}
      */
     step() {
@@ -96,13 +97,43 @@ export class Cpu {
         return ret !== 0;
     }
     /**
-     * Step a single core. Useful for "advance only this core" UI controls.
+     * Step a single core. Honours pending IRQs on that core (timer firing
+     * happens in `step()` only, but IPIs would land here in future versions).
      * @param {number} idx
      * @returns {boolean}
      */
     step_core(idx) {
         const ret = wasm.cpu_step_core(this.__wbg_ptr, idx);
         return ret !== 0;
+    }
+    /**
+     * @returns {bigint}
+     */
+    system_steps() {
+        const ret = wasm.cpu_system_steps(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {bigint}
+     */
+    timer_period() {
+        const ret = wasm.cpu_timer_period(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * System steps until the next timer IRQ fires (0 if it's due now).
+     * @returns {bigint}
+     */
+    timer_remaining() {
+        const ret = wasm.cpu_timer_remaining(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {bigint}
+     */
+    timer_ticks() {
+        const ret = wasm.cpu_timer_ticks(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
     }
     /**
      * Walk page tables for `va` using the sysregs of `core_idx`.
