@@ -8,7 +8,15 @@
 //!        into the LDR/STR path (that lands when SCTLR_EL1.M is honoured).
 
 use serde::Serialize;
+use serde_wasm_bindgen::Serializer;
 use wasm_bindgen::prelude::*;
+
+/// Build a JsValue from any serde value, keeping u64/i64/u128/i128 as JS BigInt
+/// rather than the lossy Number default serde-wasm-bindgen ships.
+fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+    let serializer = Serializer::new().serialize_large_number_types_as_bigints(true);
+    value.serialize(&serializer).map_err(|e| JsValue::from_str(&e.to_string()))
+}
 
 const MEM_SIZE: usize = 0x10000;
 const UART_OUT: u64 = 0x1000;
@@ -169,7 +177,7 @@ impl Cpu {
     }
 
     pub fn state(&self) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&CpuState {
+        to_js(&CpuState {
             x: self.x,
             sp: self.sp,
             pc: self.pc,
@@ -181,14 +189,12 @@ impl Cpu {
             tcr_el1: self.tcr_el1,
             sctlr_el1: self.sctlr_el1,
         })
-        .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Walk the stage-1 page tables for `va` using the current TTBR0/TCR.
     /// Returns the walk trace plus the resolved physical address (or fault).
     pub fn translate(&self, va: u64) -> Result<JsValue, JsValue> {
-        let result = self.do_translate(va);
-        serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
+        to_js(&self.do_translate(va))
     }
 
     pub fn l1_table_pa(&self) -> u64 {
