@@ -84,6 +84,17 @@ function tlbHitPct(cores: CoreState[]): string {
   return Number((hits * 100n) / total).toString() + '%'
 }
 
+function icHitPct(cores: CoreState[]): string {
+  let hits = 0n
+  let total = 0n
+  for (const c of cores) {
+    hits += c.icache.hits
+    total += c.icache.hits + c.icache.misses
+  }
+  if (total === 0n) return '—'
+  return Number((hits * 100n) / total).toString() + '%'
+}
+
 function Stats({ aic, block, cores, info, totalCoreSteps, uartBytes }: StatsProps) {
   const aicPending = aic.pending.reduce((a, b) => a | b, 0)
   const stats: { label: string; value: string; emphasize?: boolean }[] = [
@@ -106,6 +117,7 @@ function Stats({ aic, block, cores, info, totalCoreSteps, uartBytes }: StatsProp
     { label: 'cores el', value: `${cores[0]?.current_el ?? 0} / ${cores[1]?.current_el ?? 0}` },
     { label: 'atomic ctr', value: info.atomicCounter.toString() },
     { label: 'tlb hit %', value: tlbHitPct(cores) },
+    { label: 'i$ hit %', value: icHitPct(cores) },
   ]
   return (
     <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">

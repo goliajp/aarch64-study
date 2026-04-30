@@ -11,6 +11,7 @@ import { CoreMonitor } from '../components/panels/core-monitor'
 import { DisassemblyPanel } from '../components/panels/disassembly-panel'
 import { MemoryPanel } from '../components/panels/memory-panel'
 import { MmuPanel } from '../components/panels/mmu-panel'
+import { ICachePanel } from '../components/panels/icache-panel'
 import { TlbPanel } from '../components/panels/tlb-panel'
 import { OutputPanel } from '../components/panels/output-panel'
 import { SavePanel } from '../components/panels/save-panel'
@@ -209,7 +210,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge variant="info">v0.21</Badge>
+          <Badge variant="info">v0.22</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -278,6 +279,7 @@ export function CpuView() {
           <SavePanel slots={coreSlots} />
           <AicPanel aic={aic} />
           <TlbPanel cores={cores} />
+          <ICachePanel cores={cores} />
         </div>
 
         <div className="space-y-4">

@@ -27,6 +27,21 @@ export interface CoreState {
   spsr_el2: bigint
   esr_el2: bigint
   tlb: TlbState
+  icache: ICacheState
+}
+
+export interface ICacheLine {
+  valid: boolean
+  tag: bigint
+  insns: number[]
+}
+
+export interface ICacheState {
+  lines: ICacheLine[]
+  hits: bigint
+  misses: bigint
+  fills: bigint
+  invalidates: bigint
 }
 
 export interface TlbEntry {

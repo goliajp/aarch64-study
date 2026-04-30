@@ -100,6 +100,7 @@ pub struct CoreState {
     pub spsr_el2: u64,
     pub esr_el2: u64,
     pub tlb: TlbState,
+    pub icache: ICacheState,
 }
 
 #[derive(Serialize, Clone)]
@@ -350,6 +351,97 @@ impl Block {
     }
 }
 
+// === ICache: per-core PIPT instruction cache =====================================
+
+const ICACHE_LINES: usize = 4;
+const ICACHE_LINE_INSNS: usize = 8; // 32-byte line at 4-byte instructions
+const ICACHE_LINE_BYTES: u64 = (ICACHE_LINE_INSNS as u64) * 4;
+
+#[derive(Serialize, Clone, Copy, Debug)]
+pub struct ICacheLine {
+    pub valid: bool,
+    /// Line address tag — `(pa >> 5)` for our 32-byte lines.
+    pub tag: u64,
+    pub insns: [u32; ICACHE_LINE_INSNS],
+}
+
+impl Default for ICacheLine {
+    fn default() -> Self {
+        ICacheLine { valid: false, tag: 0, insns: [0; ICACHE_LINE_INSNS] }
+    }
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ICacheState {
+    pub lines: Vec<ICacheLine>,
+    pub hits: u64,
+    pub misses: u64,
+    pub fills: u64,
+    pub invalidates: u64,
+}
+
+#[derive(Clone)]
+struct ICache {
+    lines: [ICacheLine; ICACHE_LINES],
+    hits: u64,
+    misses: u64,
+    fills: u64,
+    invalidates: u64,
+}
+
+impl ICache {
+    fn new() -> Self {
+        ICache {
+            lines: [ICacheLine::default(); ICACHE_LINES],
+            hits: 0,
+            misses: 0,
+            fills: 0,
+            invalidates: 0,
+        }
+    }
+
+    fn fetch(&mut self, mem: &[u8], pa: u64) -> Result<u32, String> {
+        let line_addr = pa & !(ICACHE_LINE_BYTES - 1);
+        let tag = line_addr >> 5;
+        let idx = (tag as usize) % ICACHE_LINES;
+        let off = ((pa & (ICACHE_LINE_BYTES - 1)) >> 2) as usize;
+        let line = &self.lines[idx];
+        if line.valid && line.tag == tag {
+            self.hits = self.hits.saturating_add(1);
+            return Ok(line.insns[off]);
+        }
+        self.misses = self.misses.saturating_add(1);
+        // Fill the whole line.
+        let mut insns = [0u32; ICACHE_LINE_INSNS];
+        for i in 0..ICACHE_LINE_INSNS {
+            insns[i] = read_pa_u32(mem, line_addr + (i as u64) * 4)?;
+        }
+        self.lines[idx] = ICacheLine { valid: true, tag, insns };
+        self.fills = self.fills.saturating_add(1);
+        Ok(insns[off])
+    }
+
+    /// IC IVAU semantics: invalidate the cache line containing `pa`.
+    fn invalidate_pa(&mut self, pa: u64) {
+        let tag = (pa & !(ICACHE_LINE_BYTES - 1)) >> 5;
+        let idx = (tag as usize) % ICACHE_LINES;
+        if self.lines[idx].valid && self.lines[idx].tag == tag {
+            self.lines[idx].valid = false;
+        }
+        self.invalidates = self.invalidates.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> ICacheState {
+        ICacheState {
+            lines: self.lines.to_vec(),
+            hits: self.hits,
+            misses: self.misses,
+            fills: self.fills,
+            invalidates: self.invalidates,
+        }
+    }
+}
+
 // === Tlb: per-core stage-1 translation cache ====================================
 
 const TLB_ENTRIES: usize = 8;
@@ -503,6 +595,9 @@ struct Core {
     /// Per-core stage-1 TLB. Filled on every translate_for_access miss,
     /// invalidated by TLBI VMALLE1 / VAE1 / ASIDE1.
     tlb: Tlb,
+    /// Per-core PIPT instruction cache. Fed by fetch_u32 after MMU
+    /// translation; invalidated by IC IVAU.
+    icache: ICache,
 }
 
 enum StepResult {
@@ -540,6 +635,7 @@ impl Core {
             spsr_el2: 0,
             esr_el2: 0,
             tlb: Tlb::new(),
+            icache: ICache::new(),
         }
     }
 
@@ -577,6 +673,7 @@ impl Core {
             spsr_el2: self.spsr_el2,
             esr_el2: self.esr_el2,
             tlb: self.tlb.snapshot(),
+            icache: self.icache.snapshot(),
         }
     }
 
@@ -738,7 +835,7 @@ impl Core {
 
     fn fetch_u32(&mut self, mem: &[u8], va: u64) -> Result<u32, String> {
         let pa = self.translate_for_access(mem, va)?;
-        read_pa_u32(mem, pa)
+        self.icache.fetch(mem, pa)
     }
 
     fn load64(&mut self, mem: &[u8], aic: &mut Aic, block: &Block, va: u64) -> Result<u64, String> {
@@ -1260,11 +1357,44 @@ impl Core {
                 ));
             }
 
-            // SYS instruction class (op0 = 01) — TLBI is the only variant we
-            // model. ARM ARM "TLB invalidate operations":
-            //   TLBI VMALLE1   :: SYS #0, c8, c7, #0     (CRm=7, op2=0)
-            //   TLBI VAE1, Xt  :: SYS #0, c8, c7, #1     (CRm=7, op2=1)
-            //   TLBI ASIDE1,Xt :: SYS #0, c8, c7, #2     (CRm=7, op2=2)
+            // SYS instruction class (op0 = 01) — TLBI + cache maintenance.
+            //   TLBI VMALLE1   :: SYS #0, c8, c7, #0     (op1=0, CRn=8, CRm=7, op2=0)
+            //   TLBI VAE1, Xt  :: SYS #0, c8, c7, #1     (op1=0, CRn=8, CRm=7, op2=1)
+            //   TLBI ASIDE1,Xt :: SYS #0, c8, c7, #2     (op1=0, CRn=8, CRm=7, op2=2)
+            //   IC IVAU, Xt    :: SYS #3, c7, c5, #1     (op1=3, CRn=7, CRm=5, op2=1)
+            //   DC CIVAC, Xt   :: SYS #3, c7, c14, #1    (op1=3, CRn=7, CRm=14, op2=1)
+            // Cache maintenance — IC IVAU invalidates an I-cache line by VA;
+            // DC CIVAC is a no-op for us (no D-cache modeled).
+            if op0 == 1 && l == 0 && op1 == 3 && crn == 7 {
+                let xt = self.read_x(rt);
+                match (crm, op2) {
+                    (5, 1) => {
+                        // IC IVAU, Xt — translate the VA, then invalidate the
+                        // I-cache line at that PA. With MMU off, the VA is
+                        // already physical.
+                        let pa = if self.sctlr_el1 & 1 == 0 {
+                            xt
+                        } else {
+                            self.translate_for_access(mem, xt)?
+                        };
+                        self.icache.invalidate_pa(pa);
+                    }
+                    (14, 1) => {
+                        // DC CIVAC, Xt — clean+invalidate D-cache. We do not
+                        // model the D-cache, so this is just a recognised
+                        // no-op (still required to terminate self-modifying
+                        // code sequences in real systems).
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unsupported cache op CRm={crm} op2={op2} at pc={:#x}",
+                            self.pc
+                        ))
+                    }
+                }
+                self.pc = self.pc.wrapping_add(4);
+                return Ok(StepResult::Continue);
+            }
             if op0 == 1 && l == 0 && op1 == 0 && crn == 8 {
                 match (crm, op2) {
                     (7, 0) => self.tlb.invalidate_all(),
@@ -1891,6 +2021,14 @@ pub fn disassemble(insn: u32, pc: u64) -> String {
                 _ => format!(".word {insn:#010x}"),
             };
         }
+        // Cache maintenance (SYS class, op0=01, op1=011, CRn=0111).
+        if op0 == 1 && l == 0 && op1 == 3 && crn == 7 {
+            return match (crm, op2) {
+                (5, 1) => format!("ic ivau, x{rt}"),
+                (14, 1) => format!("dc civac, x{rt}"),
+                _ => format!(".word {insn:#010x}"),
+            };
+        }
         if op0 >= 2 {
             let sr = sysreg_name(op0, op1, crn, crm, op2);
             return if l == 0 {
@@ -2350,6 +2488,18 @@ const fn tlbi_aside1(rt: u32) -> u32 {
     0xD508_8740 | (rt & 0x1F)
 }
 
+/// IC IVAU, Xt — invalidate I-cache line by VA.
+#[allow(dead_code)]
+const fn ic_ivau(rt: u32) -> u32 {
+    0xD50B_7520 | (rt & 0x1F)
+}
+
+/// DC CIVAC, Xt — clean+invalidate D-cache line by VA (no-op in this sim).
+#[allow(dead_code)]
+const fn dc_civac(rt: u32) -> u32 {
+    0xD50B_7E20 | (rt & 0x1F)
+}
+
 const fn eret() -> u32 {
     0xD69F_03E0
 }
@@ -2407,6 +2557,9 @@ mod tests {
         assert_eq!(disassemble(tlbi_vmalle1(), 0x4000), "tlbi vmalle1");
         assert_eq!(disassemble(tlbi_vae1(0), 0x4000), "tlbi vae1, x0");
         assert_eq!(disassemble(tlbi_aside1(7), 0x4000), "tlbi aside1, x7");
+        // Cache maintenance.
+        assert_eq!(disassemble(ic_ivau(9), 0x4000), "ic ivau, x9");
+        assert_eq!(disassemble(dc_civac(11), 0x4000), "dc civac, x11");
         assert_eq!(disassemble(msr_ttbr0(9), 0x4000), "msr ttbr0_el1, x9");
         assert_eq!(disassemble(mrs_mpidr(14), 0x4000), "mrs x14, mpidr_el1");
         assert_eq!(disassemble(0xD503_42FFu32, 0x4000), "msr DAIFClr, #0x2");
@@ -2591,18 +2744,15 @@ mod tests {
         cpu.cores[1].sctlr_el1 = 0;
         cpu.run(50);
         assert_eq!(cpu.cores[0].x[0], 0);
-        // LDRB at PA 0x1000 (in real memory or UART range — no UART side effect
-        // for a load): make sure byte zero-extends into a u64.
+        // LDRB at PA 0x100 — make sure byte zero-extends into a u64. v0.22's
+        // I-cache makes us use a fresh Cpu here (the previous program's
+        // bytes at ENTRY_PC are still cached on the old core).
+        let mut cpu = Cpu::new();
         cpu.mem[0x100] = 0xAB;
-        let prog2 = [
-            movz(1, 0x100, 0),
-            ldrb_imm(2, 1, 0),
-            b_self(),
-        ];
-        cpu.cores[0].pc = ENTRY_PC;
-        cpu.cores[0].halted = false;
-        cpu.cores[0].steps = 0;
+        let prog2 = [movz(1, 0x100, 0), ldrb_imm(2, 1, 0), b_self()];
         write_words(&mut cpu.mem, ENTRY_PC, &prog2);
+        cpu.cores[0].sctlr_el1 = 0;
+        cpu.cores[1].halted = true;
         cpu.run(20);
         assert_eq!(cpu.cores[0].x[2], 0xAB);
     }
@@ -2980,6 +3130,81 @@ mod tests {
         assert!(
             cpu.cores[0].tlb.flushes > before,
             "TLBI VMALLE1 should have bumped flushes counter"
+        );
+    }
+
+    #[test]
+    fn icache_returns_stale_without_ic_ivau() {
+        // The v0.22 lesson, encoded as a test: rewrite the next instruction
+        // in physical memory after it has been fetched once, and prove that
+        // the next fetch still returns the OLD insn until IC IVAU runs.
+        let mut cpu = Cpu::new();
+        cpu.cores[0].sctlr_el1 = 0; // identity-mapped
+        cpu.cores[1].halted = true;
+
+        // Layout (EL2, no MMU):
+        //   0x4000  movz x0, #1
+        //   0x4004  movz x1, #1   ; will be overwritten with `movz x1, #2`
+        //   0x4008  b .            ; halt
+        let prog = [movz(0, 1, 0), movz(1, 1, 0), b_self()];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+
+        // Step once → fetch+execute movz x0,#1. I-cache fills with the line.
+        cpu.step();
+        assert_eq!(cpu.cores[0].x[0], 1);
+        // Now rewrite PA 0x4004 with `movz x1, #2`. Memory updated, but the
+        // I-cache still holds the OLD line (with `movz x1, #1`).
+        let new_insn = movz(1, 2, 0);
+        cpu.mem[0x4004..0x4008].copy_from_slice(&new_insn.to_le_bytes());
+        // Step → fetch reads cached, stale value → X1 ends up at 1, not 2.
+        cpu.step();
+        assert_eq!(
+            cpu.cores[0].x[1], 1,
+            "without IC IVAU the cache should hand back the stale instruction"
+        );
+    }
+
+    #[test]
+    fn ic_ivau_lets_self_modifying_code_take_effect() {
+        let mut cpu = Cpu::new();
+        cpu.cores[0].sctlr_el1 = 0;
+        cpu.cores[1].halted = true;
+        // Same setup, but interpose `ic ivau, x9` between the rewrite and the
+        // second fetch. The rewriting code prepares X9=0x4008 (the line
+        // address; any address inside the line works) and issues IC IVAU.
+        let prog = [
+            movz(0, 1, 0),       // 0x4000
+            movz(2, 1, 0),       // 0x4004 (placeholder, will be rewritten)
+            movz(9, 0x4000, 0),  // 0x4008
+            ic_ivau(9),          // 0x400C
+            isb(),               // 0x4010 — synchronises the new fetch
+            b_self(),            // 0x4014 (will be replaced too as the target)
+        ];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+        // Pre-execute the first three instructions to seed the I-cache for
+        // the line containing 0x4004.
+        for _ in 0..3 {
+            cpu.step();
+        }
+        // Rewrite 0x4004 — change movz x2,#1 → movz x2,#42.
+        let new_insn = movz(2, 42, 0);
+        cpu.mem[0x4004..0x4008].copy_from_slice(&new_insn.to_le_bytes());
+        // Now run IC IVAU + ISB.
+        cpu.step(); // IC IVAU
+        cpu.step(); // ISB
+        // Re-execute 0x4004 by jumping back. We patch 0x4014 with `b -4`
+        // (= back to 0x4004), then step once more to make the branch fire,
+        // then once to fetch+execute the now-fresh insn at 0x4004.
+        let back = b_offset(-4);
+        cpu.mem[0x4014..0x4018].copy_from_slice(&back.to_le_bytes());
+        // Invalidate the line that holds the new branch too, otherwise the
+        // I-cache still has the old `b .` cached for 0x4014.
+        cpu.cores[0].icache.invalidate_pa(0x4014);
+        cpu.step(); // execute b -4 (now lands on 0x4004)
+        cpu.step(); // execute movz x2,#42 (now picked up after IC IVAU)
+        assert_eq!(
+            cpu.cores[0].x[2], 42,
+            "after IC IVAU the freshly written instruction should run"
         );
     }
 

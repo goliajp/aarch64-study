@@ -36,7 +36,7 @@ bun run dev            # vite dev server on http://127.0.0.1:32030
 
 | Script               | What it runs                                    |
 | -------------------- | ----------------------------------------------- |
-| `bun run test:sim`   | `cargo test` the Rust simulator (34 tests)      |
+| `bun run test:sim`   | `cargo test` the Rust simulator (36 tests)      |
 | `cargo run --features cli --bin aarch64-sim -- run` | run the simulator from the command line |
 | `bun run test`       | Vitest the React side                           |
 | `bun run check`      | tsc + eslint + prettier                         |

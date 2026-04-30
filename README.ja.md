@@ -33,7 +33,7 @@ bun run dev            # vite dev server（http://127.0.0.1:32030）
 
 | スクリプト             | 内容                                            |
 | --------------------- | ----------------------------------------------- |
-| `bun run test:sim`    | `cargo test`（34 件）                           |
+| `bun run test:sim`    | `cargo test`（36 件）                           |
 | `bun run test`        | React 側の vitest                               |
 | `bun run check`       | tsc + eslint + prettier                         |
 | `bun run build`       | `./dist` への本番ビルド                         |

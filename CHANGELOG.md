@@ -2,6 +2,36 @@
 
 Each entry is one architectural concept added on top of the previous one.
 
+## v0.22
+
+Per-core I-cache + cache maintenance — the self-modifying-code lesson.
+
+- New `ICache` struct: 4-line direct-mapped, 32-byte (8-instruction)
+  lines, PIPT (line-tagged by `pa >> 5`). Per-core stats (`hits`,
+  `misses`, `fills`, `invalidates`).
+- `fetch_u32` now goes through the I-cache: translate VA → PA, check
+  the cache line, and on miss fill the whole line from memory.
+- New decoders for cache maintenance ops:
+  - `IC IVAU, Xt`  (`0xD50B_7520 | Rt`) — invalidate I-cache by VA
+  - `DC CIVAC, Xt` (`0xD50B_7E20 | Rt`) — clean+invalidate D-cache
+    (no-op since we don't model a D-cache, but recognised so SMC
+    sequences `dc civac; dsb; ic ivau; isb` parse cleanly)
+- The classic self-modifying-code lesson is now a real test pair:
+  `icache_returns_stale_without_ic_ivau` shows the cached I-cache
+  returning the *old* instruction after a store rewrites it;
+  `ic_ivau_lets_self_modifying_code_take_effect` proves IC IVAU is
+  what makes the new instruction visible.
+- One pre-existing test had to be updated: `ldrb_cbz_sub_imm_loop`
+  used to splice a second program over the first at the same PA on
+  the same Cpu — that worked when fetch was direct, but with the
+  I-cache it would (correctly) return the stale program. The test
+  now spins up a fresh `Cpu` for the second program, which is what
+  any non-toy code would do anyway.
+- UI: new `ICachePanel` showing each core's 4 lines (line PA, valid,
+  first cached instruction, hit/miss/fill/invalidate stats). Header
+  strip gains an `i$ hit %` system-wide stat.
+- Total cargo tests: 36.
+
 ## v0.21
 
 Per-core TLB + ASID-tagged entries + `TLBI` invalidation.
