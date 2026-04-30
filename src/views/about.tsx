@@ -30,8 +30,9 @@ v0.5  + SVC raises EL0 → EL1 + ERET returns (full syscall round-trip)
 v0.6  + two cores (P-core / E-core) sharing memory + MPIDR_EL1
 v0.7  + DAIF + AIC timer IRQ + IRQ vector (VBAR+0x480)
 v0.8  + AIC abstraction + scheduler swaps tasks A/B on every tick
-v0.9  + LDP/STP + real context switch (X0–X3 persist across switches)  ← here
-v1.0  + virtio block device (hypervisor seed) and bare-metal port via m1n1`}
+v0.9  + LDP/STP + real context switch (X0–X3 persist across switches)
+v0.10 + Block device (virtio-blk-shaped) — kernel reads sector 0 at boot  ← here
+v1.0  + bare-metal port via m1n1 (same Rust crate runs on real Apple Silicon)`}
           </pre>
         </Card>
       </div>

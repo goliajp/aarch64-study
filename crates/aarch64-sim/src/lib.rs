@@ -36,8 +36,9 @@ const MPIDR_VALUES: [u64; NUM_CORES] = [0x8000_0000, 0x8000_0100];
 const CORE_KIND: [&str; NUM_CORES] = ["P-core", "E-core"];
 
 // AIC timer: fires an IRQ on every core every TIMER_PERIOD system steps.
-// Picked small so context switches show up quickly in interactive Step mode.
-const TIMER_PERIOD: u64 = 30;
+// Sized so the 30-instruction kernel boot completes before the first tick,
+// leaving room for a few task iterations per period.
+const TIMER_PERIOD: u64 = 50;
 
 // AIC MMIO layout (loosely modelled on Apple's per-core AIC view): software
 // reads from one MMIO base and the controller routes the call by which core
@@ -55,6 +56,24 @@ const AIC_REG_IPI_SET: u64 = 0x10;
 const IRQ_TIMER: u32 = 0;
 const IRQ_IPI: u32 = 1;
 const IRQ_NONE: u32 = 0xFFFF_FFFF;
+
+// Block-device MMIO. Loosely virtio-blk-shaped but with a fixed-size 64-byte
+// sector and a synchronous "write CMD → transfer happens before the STR
+// returns". 8 sectors × 64 bytes = 512 bytes total disk image.
+const BLK_BASE: u64 = 0x3000;
+const BLK_END: u64 = 0x3100;
+const BLK_REG_SECTOR: u64 = 0x00;
+const BLK_REG_BUF_ADDR: u64 = 0x08;
+const BLK_REG_CMD: u64 = 0x10;
+const BLK_REG_STATUS: u64 = 0x18;
+const SECTOR_SIZE: u64 = 64;
+const NUM_SECTORS: u64 = 8;
+const DISK_SIZE: u64 = SECTOR_SIZE * NUM_SECTORS;
+const BLK_CMD_READ: u64 = 0;
+const BLK_CMD_WRITE: u64 = 1;
+const BLK_STATUS_IDLE: u64 = 0;
+const BLK_STATUS_OK: u64 = 1;
+const BLK_STATUS_FAULT: u64 = 2;
 
 #[derive(Serialize, Clone)]
 pub struct CoreState {
@@ -192,6 +211,117 @@ impl Aic {
         AicState {
             pending: self.pending.to_vec(),
             total_acks: self.total_acks,
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct BlockState {
+    pub sector: u64,
+    pub buf_addr: u64,
+    pub last_command: u64,
+    pub status: u64,
+    pub total_reads: u64,
+    pub total_writes: u64,
+    pub disk: Vec<u8>,
+}
+
+// === Block: a tiny synchronous "virtio-blk"-shaped device ====================
+
+struct Block {
+    disk: Vec<u8>,
+    sector: u64,
+    buf_addr: u64,
+    last_command: u64,
+    status: u64,
+    total_reads: u64,
+    total_writes: u64,
+}
+
+impl Block {
+    fn new() -> Self {
+        let mut disk = vec![0u8; DISK_SIZE as usize];
+        // Pre-populate sectors with text so a read produces visible content.
+        let inscribe = |b: &mut [u8], sector: u64, text: &str| {
+            let off = (sector * SECTOR_SIZE) as usize;
+            let bytes = text.as_bytes();
+            let n = bytes.len().min(SECTOR_SIZE as usize);
+            b[off..off + n].copy_from_slice(&bytes[..n]);
+        };
+        inscribe(&mut disk, 0, "OSstudy disk image — sector 0\n");
+        inscribe(&mut disk, 1, "Sector 1: kernels run on top of devices\n");
+        inscribe(&mut disk, 2, "Sector 2: virtio is the lingua franca\n");
+        inscribe(&mut disk, 3, "Sector 3: this is a 64-byte sector\n");
+        Self {
+            disk,
+            sector: 0,
+            buf_addr: 0,
+            last_command: 0,
+            status: BLK_STATUS_IDLE,
+            total_reads: 0,
+            total_writes: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        let fresh = Block::new();
+        *self = fresh;
+    }
+
+    fn mmio_read(&self, offset: u64) -> u64 {
+        match offset {
+            BLK_REG_SECTOR => self.sector,
+            BLK_REG_BUF_ADDR => self.buf_addr,
+            BLK_REG_CMD => self.last_command,
+            BLK_REG_STATUS => self.status,
+            _ => 0,
+        }
+    }
+
+    fn mmio_write(&mut self, mem: &mut [u8], offset: u64, val: u64) {
+        match offset {
+            BLK_REG_SECTOR => self.sector = val,
+            BLK_REG_BUF_ADDR => self.buf_addr = val,
+            BLK_REG_CMD => {
+                self.last_command = val;
+                let sec = self.sector as usize * SECTOR_SIZE as usize;
+                let buf = self.buf_addr as usize;
+                let len = SECTOR_SIZE as usize;
+                let in_disk = sec + len <= self.disk.len();
+                let in_mem = buf + len <= mem.len();
+                if !in_disk || !in_mem {
+                    self.status = BLK_STATUS_FAULT;
+                    return;
+                }
+                match val {
+                    BLK_CMD_READ => {
+                        mem[buf..buf + len].copy_from_slice(&self.disk[sec..sec + len]);
+                        self.status = BLK_STATUS_OK;
+                        self.total_reads = self.total_reads.saturating_add(1);
+                    }
+                    BLK_CMD_WRITE => {
+                        self.disk[sec..sec + len].copy_from_slice(&mem[buf..buf + len]);
+                        self.status = BLK_STATUS_OK;
+                        self.total_writes = self.total_writes.saturating_add(1);
+                    }
+                    _ => {
+                        self.status = BLK_STATUS_FAULT;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot(&self) -> BlockState {
+        BlockState {
+            sector: self.sector,
+            buf_addr: self.buf_addr,
+            last_command: self.last_command,
+            status: self.status,
+            total_reads: self.total_reads,
+            total_writes: self.total_writes,
+            disk: self.disk.clone(),
         }
     }
 }
@@ -388,10 +518,13 @@ impl Core {
         read_pa_u32(mem, pa)
     }
 
-    fn load64(&self, mem: &[u8], aic: &mut Aic, va: u64) -> Result<u64, String> {
+    fn load64(&self, mem: &[u8], aic: &mut Aic, block: &Block, va: u64) -> Result<u64, String> {
         let pa = self.translate_for_access(mem, va)?;
         if (AIC_BASE..AIC_END).contains(&pa) {
             return Ok(aic.mmio_read(self.id as usize, pa - AIC_BASE));
+        }
+        if (BLK_BASE..BLK_END).contains(&pa) {
+            return Ok(block.mmio_read(pa - BLK_BASE));
         }
         read_pa_u64(mem, pa)
     }
@@ -401,12 +534,17 @@ impl Core {
         mem: &mut [u8],
         out: &mut Vec<u8>,
         aic: &mut Aic,
+        block: &mut Block,
         va: u64,
         val: u64,
     ) -> Result<(), String> {
         let pa = self.translate_for_access(mem, va)?;
         if (AIC_BASE..AIC_END).contains(&pa) {
             aic.mmio_write(self.id as usize, pa - AIC_BASE, val);
+            return Ok(());
+        }
+        if (BLK_BASE..BLK_END).contains(&pa) {
+            block.mmio_write(mem, pa - BLK_BASE, val);
             return Ok(());
         }
         if pa == UART_OUT {
@@ -572,7 +710,13 @@ impl Core {
         }
     }
 
-    fn step(&mut self, mem: &mut [u8], out: &mut Vec<u8>, aic: &mut Aic) -> bool {
+    fn step(
+        &mut self,
+        mem: &mut [u8],
+        out: &mut Vec<u8>,
+        aic: &mut Aic,
+        block: &mut Block,
+    ) -> bool {
         if self.halted {
             return false;
         }
@@ -584,7 +728,7 @@ impl Core {
                 return false;
             }
         };
-        match self.execute(insn, mem, out, aic) {
+        match self.execute(insn, mem, out, aic, block) {
             Ok(StepResult::Continue) => true,
             Ok(StepResult::Halt) => {
                 self.halted = true;
@@ -603,6 +747,7 @@ impl Core {
         mem: &mut [u8],
         out: &mut Vec<u8>,
         aic: &mut Aic,
+        block: &mut Block,
     ) -> Result<StepResult, String> {
         self.steps = self.steps.saturating_add(1);
 
@@ -658,7 +803,7 @@ impl Core {
             let imm12 = ((insn >> 10) & 0xFFF) as u64;
             let addr = self.read_x(rn).wrapping_add(imm12 * 8);
             let val = self.read_x(rt);
-            self.store64(mem, out, aic, addr, val)?;
+            self.store64(mem, out, aic, block, addr, val)?;
             self.pc = self.pc.wrapping_add(4);
             return Ok(StepResult::Continue);
         }
@@ -669,7 +814,7 @@ impl Core {
             let rn = ((insn >> 5) & 0x1F) as usize;
             let imm12 = ((insn >> 10) & 0xFFF) as u64;
             let addr = self.read_x(rn).wrapping_add(imm12 * 8);
-            let val = self.load64(mem, aic, addr)?;
+            let val = self.load64(mem, aic, block, addr)?;
             self.write_x(rt, val);
             self.pc = self.pc.wrapping_add(4);
             return Ok(StepResult::Continue);
@@ -692,11 +837,11 @@ impl Core {
             if l == 0 {
                 let v1 = self.read_x(rt1);
                 let v2 = self.read_x(rt2);
-                self.store64(mem, out, aic, addr, v1)?;
-                self.store64(mem, out, aic, addr.wrapping_add(8), v2)?;
+                self.store64(mem, out, aic, block, addr, v1)?;
+                self.store64(mem, out, aic, block, addr.wrapping_add(8), v2)?;
             } else {
-                let v1 = self.load64(mem, aic, addr)?;
-                let v2 = self.load64(mem, aic, addr.wrapping_add(8))?;
+                let v1 = self.load64(mem, aic, block, addr)?;
+                let v2 = self.load64(mem, aic, block, addr.wrapping_add(8))?;
                 self.write_x(rt1, v1);
                 self.write_x(rt2, v2);
             }
@@ -823,6 +968,7 @@ pub struct Cpu {
     mem: Vec<u8>,
     output_buf: Vec<u8>,
     aic: Aic,
+    block: Block,
     /// Number of Cpu::step() calls since reset.
     system_steps: u64,
     /// system_steps value at which the next timer IRQ fires.
@@ -843,6 +989,7 @@ impl Cpu {
             mem: vec![0u8; MEM_SIZE],
             output_buf: Vec::new(),
             aic: Aic::new(),
+            block: Block::new(),
             system_steps: 0,
             timer_next: TIMER_PERIOD,
             timer_ticks: 0,
@@ -861,6 +1008,7 @@ impl Cpu {
         }
         self.output_buf.clear();
         self.aic.reset();
+        self.block.reset();
         self.system_steps = 0;
         self.timer_next = TIMER_PERIOD;
         self.timer_ticks = 0;
@@ -889,7 +1037,12 @@ impl Cpu {
             if self.aic.has_pending(i) && !self.cores[i].irq_masked() {
                 self.cores[i].take_irq();
                 any = true;
-            } else if self.cores[i].step(&mut self.mem, &mut self.output_buf, &mut self.aic) {
+            } else if self.cores[i].step(
+                &mut self.mem,
+                &mut self.output_buf,
+                &mut self.aic,
+                &mut self.block,
+            ) {
                 any = true;
             }
         }
@@ -910,7 +1063,12 @@ impl Cpu {
             self.cores[i].take_irq();
             true
         } else {
-            self.cores[i].step(&mut self.mem, &mut self.output_buf, &mut self.aic)
+            self.cores[i].step(
+                &mut self.mem,
+                &mut self.output_buf,
+                &mut self.aic,
+                &mut self.block,
+            )
         }
     }
 
@@ -941,6 +1099,10 @@ impl Cpu {
 
     pub fn aic_state(&self) -> Result<JsValue, JsValue> {
         to_js(&self.aic.snapshot())
+    }
+
+    pub fn block_state(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.block.snapshot())
     }
 
     /// Returns an array of CoreState (one per core) as a JS Array.
@@ -1085,9 +1247,10 @@ fn load_demo(mem: &mut [u8]) {
     const TASK_A_SAVE_PA: u32 = 0x4F10;
     const TASK_B_SAVE_PA: u32 = 0x4F30;
     const TASK_SAVE_SUM: u32 = TASK_A_SAVE_PA + TASK_B_SAVE_PA; // 0x9E40
+    const DISK_BUF_PA: u32 = 0x6000;
     const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
-    let kernel: [u32; 24] = [
+    let kernel: [u32; 31] = [
         // EL2 prologue → ERET to EL1
         movz(9, EL1_ENTRY, 0),
         msr_elr_el2(9),
@@ -1102,16 +1265,25 @@ fn load_demo(mem: &mut [u8]) {
         movz(9, 1, 0),
         msr_sctlr(9),
         isb(),
+        // EL1: read sector 0 → DISK_BUF_PA via the block device.
+        // Issue a synchronous READ: SECTOR=0, BUF_ADDR=DISK_BUF_PA, CMD=0.
+        movz(9, BLK_BASE as u32, 0),
+        movz(10, 0, 0),
+        str_imm(10, 9, 0), // SECTOR = 0  (offset 0 / 8 = 0)
+        movz(10, DISK_BUF_PA, 0),
+        str_imm(10, 9, 1), // BUF_ADDR = DISK_BUF_PA (offset 8 / 8 = 1)
+        movz(10, BLK_CMD_READ as u32, 0),
+        str_imm(10, 9, 2), // CMD = READ → transfer happens here
         // EL1: install vector base
         movz(9, VBAR, 0),
         msr_vbar_el1(9),
         // EL1: initialise scheduler — current task = A, current save area = A's
         movz(9, TASK_A_ENTRY, 0),
         movz(10, TASK_SLOT_PA, 0),
-        str_imm(9, 10, 0),                  // entry slot = A_entry
+        str_imm(9, 10, 0), // entry slot = A_entry
         movz(11, TASK_A_SAVE_PA, 0),
         movz(10, TASK_PTR_SLOT_PA, 0),
-        str_imm(11, 10, 0),                 // ptr slot = A_save_area
+        str_imm(11, 10, 0), // ptr slot = A_save_area
         // EL1: ERET into task A
         msr_elr_el1(9),
         movz(10, 0, 0),
@@ -1189,8 +1361,12 @@ fn setup_demo_pgtable(mem: &mut [u8]) {
     write_u64(mem, L3_TABLE_PA + 8, 0x1000 | page_attr);
     // VA 0x2000 → PA 0x2000 (AIC MMIO)
     write_u64(mem, L3_TABLE_PA + 2 * 8, 0x2000 | page_attr);
+    // VA 0x3000 → PA 0x3000 (block-device MMIO)
+    write_u64(mem, L3_TABLE_PA + 3 * 8, 0x3000 | page_attr);
     // VA 0x4000 → PA 0x4000 (program page)
     write_u64(mem, L3_TABLE_PA + 4 * 8, 0x4000 | page_attr);
+    // VA 0x6000 → PA 0x6000 (disk buffer page)
+    write_u64(mem, L3_TABLE_PA + 6 * 8, 0x6000 | page_attr);
     // page tables themselves
     write_u64(mem, L3_TABLE_PA + 8 * 8, 0x8000 | page_attr);
     write_u64(mem, L3_TABLE_PA + 9 * 8, 0x9000 | page_attr);
@@ -1313,14 +1489,13 @@ mod tests {
 
     #[test]
     fn both_cores_run_task_a_before_first_tick() {
-        // Kernel boot is 21 instructions; after that both cores ERET into
-        // task A and start writing 'A's. We need to stop before the timer
-        // fires (every 30 system steps) to keep the output free of B chars.
+        // Kernel boot is 30 instructions; the timer fires at step 50.
+        // Run 45 system steps so both cores have ERETed into task A and
+        // produced a few 'A' chars but no tick has yet swapped them.
         let mut cpu = Cpu::new();
-        cpu.run(28);
+        cpu.run(45);
         let out = cpu.output();
-        // Output should be all 'A' characters now.
-        assert!(!out.is_empty(), "no output yet");
+        assert!(!out.is_empty(), "no output yet: {:?}", out);
         assert!(out.chars().all(|c| c == 'A'), "got non-A chars: {:?}", out);
         assert!(!cpu.cores[0].halted);
         assert!(!cpu.cores[1].halted);
@@ -1329,9 +1504,9 @@ mod tests {
     #[test]
     fn scheduler_swaps_to_task_b_on_first_tick() {
         let mut cpu = Cpu::new();
-        // Run long enough for at least one timer tick + scheduler handler
-        // execution + a few task-B iterations.
-        cpu.run(80);
+        // First tick at step 50; need the handler to finish + task B to run
+        // a few iterations.
+        cpu.run(120);
         assert!(cpu.timer_ticks >= 1);
         let out = cpu.output();
         assert!(out.contains('A'), "no A: {:?}", out);
@@ -1361,6 +1536,21 @@ mod tests {
     }
 
     #[test]
+    fn kernel_disk_read_populates_buffer() {
+        let mut cpu = Cpu::new();
+        // Run kernel boot (30 inst per core). Both cores issue the same
+        // disk read; both succeed (idempotent).
+        cpu.run(40);
+        // Sector 0 starts with "OSstudy disk image — sector 0\n".
+        let buf = &cpu.mem[0x6000..0x6010];
+        assert_eq!(&buf[..7], b"OSstudy");
+        // Block accounting: total_reads should be ≥ 2 (one per core).
+        let snap = cpu.block.snapshot();
+        assert!(snap.total_reads >= 2, "total_reads = {}", snap.total_reads);
+        assert_eq!(snap.status, BLK_STATUS_OK);
+    }
+
+    #[test]
     fn aic_acks_clear_pending_bits() {
         let mut cpu = Cpu::new();
         cpu.run(200);
@@ -1384,9 +1574,9 @@ mod tests {
         cpu.run(5);
         assert_eq!(cpu.cores[0].current_el, 1);
         assert_eq!(cpu.cores[0].daif, 0xF);
-        // Remaining kernel boot is 19 more instructions (24 total per core)
+        // Remaining kernel boot is 26 more instructions (31 total per core)
         // before ERETing into EL0 with SPSR_EL1=0 — DAIF restored to 0.
-        cpu.run(19);
+        cpu.run(26);
         assert_eq!(cpu.cores[0].current_el, 0);
         assert_eq!(cpu.cores[0].daif, 0);
     }

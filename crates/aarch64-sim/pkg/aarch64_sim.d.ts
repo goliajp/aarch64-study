@@ -5,6 +5,7 @@ export class Cpu {
     free(): void;
     [Symbol.dispose](): void;
     aic_state(): any;
+    block_state(): any;
     entry_pc(): bigint;
     l1_table_pa(): bigint;
     mem_slice(start: number, len: number): Uint8Array;
@@ -48,6 +49,7 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_cpu_free: (a: number, b: number) => void;
     readonly cpu_aic_state: (a: number) => [number, number, number];
+    readonly cpu_block_state: (a: number) => [number, number, number];
     readonly cpu_mem_slice: (a: number, b: number, c: number) => [number, number];
     readonly cpu_new: () => number;
     readonly cpu_num_cores: (a: number) => number;

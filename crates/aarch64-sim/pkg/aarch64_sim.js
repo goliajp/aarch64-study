@@ -22,6 +22,16 @@ export class Cpu {
         return takeFromExternrefTable0(ret[0]);
     }
     /**
+     * @returns {any}
+     */
+    block_state() {
+        const ret = wasm.cpu_block_state(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
      * @returns {bigint}
      */
     entry_pc() {

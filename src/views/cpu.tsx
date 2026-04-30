@@ -34,6 +34,16 @@ interface AicState {
   total_acks: bigint
 }
 
+interface BlockState {
+  sector: bigint
+  buf_addr: bigint
+  last_command: bigint
+  status: bigint
+  total_reads: bigint
+  total_writes: bigint
+  disk: Uint8Array
+}
+
 interface TaskSave {
   x0: bigint
   x1: bigint
@@ -114,6 +124,7 @@ export function CpuView() {
   const [cpu, setCpu] = useState<Cpu | null>(null)
   const [cores, setCores] = useState<CoreState[] | null>(null)
   const [aic, setAic] = useState<AicState | null>(null)
+  const [block, setBlock] = useState<BlockState | null>(null)
   const [saveArea, setSaveArea] = useState<{ a: TaskSave; b: TaskSave } | null>(null)
   const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null)
   const [memory, setMemory] = useState<Uint8Array>(new Uint8Array(MEMORY_VIEW_BYTES))
@@ -127,6 +138,7 @@ export function CpuView() {
     const s = c.state() as CoreState[]
     setCores(s)
     setAic(c.aic_state() as AicState)
+    setBlock(c.block_state() as BlockState)
     setSysInfo({
       systemSteps: c.system_steps(),
       timerPeriod: c.timer_period(),
@@ -224,7 +236,7 @@ export function CpuView() {
     }
   }, [cpu, cores, vaText, translateCoreIdx])
 
-  if (!cpu || !cores || !sysInfo || !aic || !saveArea) {
+  if (!cpu || !cores || !sysInfo || !aic || !saveArea || !block) {
     return <div className="text-fg-muted text-sm">Loading WASM…</div>
   }
 
@@ -243,7 +255,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.9</Badge>
+          <Badge color="info">v0.10</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -254,10 +266,10 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          Real context switching: the IRQ handler now <code>STP</code>s X0–X3 of the outgoing task
-          into its save area before swapping, and <code>LDP</code>s X0–X3 of the incoming task back
-          out. Each task increments X3 every iteration, and that counter survives across switches
-          because the kernel preserves it.
+          Block device added: a tiny virtio-blk-shaped controller at MMIO <code>0x3000</code> with 8
+          × 64-byte sectors. At boot the kernel issues a synchronous <code>READ</code> of sector 0
+          into PA <code>0x6000</code>, so by the time tasks start running the buffer at 0x6000
+          already holds "OSstudy disk image — sector 0".
         </p>
       </header>
 
@@ -266,6 +278,8 @@ export function CpuView() {
       <AicPanel aic={aic} />
 
       <SavePanel save={saveArea} />
+
+      <BlockPanel block={block} />
 
       <div className="flex flex-wrap items-center gap-2">
         <GlassButton onClick={onStep} size="sm" variant="accent">
@@ -319,6 +333,93 @@ function inferTaskLabel(pc: bigint): string | null {
   if (p >= 0x4800 && p < 0x4880) return 'sync handler'
   if (p >= 0x4000 && p < 0x4400) return 'kernel boot'
   return null
+}
+
+const SECTOR_SIZE = 64
+
+function BlockPanel({ block }: { block: BlockState }) {
+  const [sector, setSector] = useState(0)
+  const numSectors = Math.floor(block.disk.length / SECTOR_SIZE)
+  const slice = block.disk.slice(sector * SECTOR_SIZE, (sector + 1) * SECTOR_SIZE)
+  const statusLabel =
+    block.status === 0n
+      ? 'IDLE'
+      : block.status === 1n
+        ? 'OK'
+        : block.status === 2n
+          ? 'FAULT'
+          : `0x${block.status.toString(16)}`
+  return (
+    <GlassCard>
+      <div className="space-y-3 p-4">
+        <div className="text-fg-muted flex items-center justify-between">
+          <span className="text-[10px] font-semibold tracking-wider uppercase">
+            Block device · disk image (8 × 64-byte sectors @ MMIO 0x3000)
+          </span>
+          <span className="font-mono text-[10px]">
+            reads {block.total_reads.toString()} · writes {block.total_writes.toString()}
+          </span>
+        </div>
+        <div className="grid gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-4">
+          <RegRow label="SECTOR" value={block.sector} />
+          <RegRow label="BUF_ADDR" value={block.buf_addr} />
+          <RegRow label="CMD" value={block.last_command} />
+          <div className="flex justify-between gap-2">
+            <span className="text-fg-muted">STATUS</span>
+            <span className="text-fg">{statusLabel}</span>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-1">
+          <span className="text-fg-muted mr-2 text-xs">view sector</span>
+          {Array.from({ length: numSectors }, (_, i) => (
+            <button
+              className={`rounded border px-2 py-0.5 font-mono text-[11px] ${
+                i === sector
+                  ? 'border-accent bg-accent/10 text-accent'
+                  : 'border-border text-fg-muted hover:bg-bg-tertiary'
+              }`}
+              key={i}
+              onClick={() => setSector(i)}
+              type="button"
+            >
+              {i}
+            </button>
+          ))}
+        </div>
+        <DiskHexRow bytes={slice} sector={sector} />
+      </div>
+    </GlassCard>
+  )
+}
+
+function DiskHexRow({ bytes, sector }: { bytes: Uint8Array; sector: number }) {
+  const rows: Uint8Array[] = []
+  for (let i = 0; i < bytes.length; i += 16) {
+    rows.push(bytes.slice(i, i + 16))
+  }
+  const baseAddr = sector * SECTOR_SIZE
+  return (
+    <div className="overflow-x-auto font-mono text-xs">
+      {rows.map((row, ri) => {
+        let ascii = ''
+        for (let i = 0; i < row.length; i++) {
+          const c = row[i]
+          ascii += c >= 0x20 && c < 0x7f ? String.fromCharCode(c) : '.'
+        }
+        return (
+          <div className="flex gap-4 leading-6" key={ri}>
+            <span className="text-fg-muted">
+              {(baseAddr + ri * 16).toString(16).padStart(4, '0')}
+            </span>
+            <span className="text-fg flex-1">
+              {Array.from(row, (b) => b.toString(16).padStart(2, '0')).join(' ')}
+            </span>
+            <span className="text-fg-muted">{ascii}</span>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 function SavePanel({ save }: { save: { a: TaskSave; b: TaskSave } }) {

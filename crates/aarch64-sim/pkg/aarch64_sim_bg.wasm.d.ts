@@ -3,6 +3,7 @@
 export const memory: WebAssembly.Memory;
 export const __wbg_cpu_free: (a: number, b: number) => void;
 export const cpu_aic_state: (a: number) => [number, number, number];
+export const cpu_block_state: (a: number) => [number, number, number];
 export const cpu_mem_slice: (a: number, b: number, c: number) => [number, number];
 export const cpu_new: () => number;
 export const cpu_num_cores: (a: number) => number;
