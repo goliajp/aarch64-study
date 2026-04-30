@@ -1,3 +1,4 @@
+@import url('https://fonts.googleapis.com/css2?family=Roboto+Flex:opsz,wght@8..144,300..700&display=swap');
 @import '@goliapkg/gds/tokens.css';
 @import '@goliapkg/gds/theme.css';
 @import 'tailwindcss';
@@ -11,6 +12,21 @@ body,
   margin: 0;
 }
 
+body,
+button,
+input,
+select,
+textarea {
+  font-family:
+    'Roboto Flex',
+    system-ui,
+    -apple-system,
+    sans-serif;
+  font-feature-settings:
+    'tnum' on,
+    'cv11' on;
+}
+
 body {
   color: var(--color-fg);
   background-color: var(--color-bg);
@@ -22,9 +38,23 @@ body {
     rgb(59 130 246 / 0.08) 100%
   );
   background-attachment: fixed;
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
+}
+
+/* App-wide type scale: only two sizes are allowed.
+ *   .type-base — 13px, used for body / table / data rows
+ *   .type-small — 11px, used for labels / metadata / inline annotations
+ * Combined with Roboto Flex's tabular-nums, hex columns still align. */
+.type-base {
+  font-size: 13px;
+  line-height: 1.45;
+}
+.type-small {
+  font-size: 11px;
+  line-height: 1.4;
+  letter-spacing: 0.01em;
 }
 
 body::before {

@@ -374,7 +374,7 @@ export function CpuView() {
   }, [cpu, cores, vaText, translateCoreIdx])
 
   if (!cpu || !cores || !sysInfo || !aic || !coreSlots || !block) {
-    return <div className="text-fg-muted text-sm">Loading WASM…</div>
+    return <div className="text-fg-muted type-base">Loading WASM…</div>
   }
 
   const allHalted = cores.every((c) => c.halted)
@@ -402,7 +402,7 @@ export function CpuView() {
             <Badge>RUNNING</Badge>
           )}
         </div>
-        <p className="text-fg-muted max-w-2xl text-xs">
+        <p className="text-fg-muted type-small max-w-2xl">
           UI overhaul: live <strong>SCI-FI core monitors</strong> on the right rail (registers, EL,
           peripheral links, activity blip), a <strong>disassembly panel</strong> centered on PC (we
           built a small ARM disassembler in the WASM crate), and an{' '}
@@ -411,63 +411,58 @@ export function CpuView() {
         </p>
       </header>
 
-      <SystemInfoBar info={sysInfo} totalCoreSteps={cores.reduce((a, c) => a + c.steps, 0n)} />
-
-      <div className="flex flex-wrap items-center gap-2">
-        <GlassButton onClick={onStep} size="sm" variant="accent">
-          Step both
-        </GlassButton>
-        <GlassButton onClick={onRunToggle} size="sm">
-          {running ? 'Pause' : 'Run'}
-        </GlassButton>
-        <GlassButton onClick={onReset} size="sm">
-          Reset
-        </GlassButton>
-      </div>
+      <ControlBar
+        block={block}
+        cpu={cpu}
+        onRefresh={refresh}
+        onReset={onReset}
+        onRunToggle={onRunToggle}
+        onStep={onStep}
+        running={running}
+        sysInfo={sysInfo}
+        totalCoreSteps={cores.reduce((a, c) => a + c.steps, 0n)}
+      />
 
       {anyTrap && anyTrap.last_trap && (
-        <div className="border-danger/40 bg-danger/10 text-danger rounded border px-3 py-2 font-mono text-xs">
+        <div className="border-danger/40 bg-danger/10 text-danger type-small rounded border px-3 py-2">
           core {anyTrap.id}: {anyTrap.last_trap}
         </div>
       )}
 
       <OutputPanel output={output} />
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_440px]">
-        <div className="min-w-0 space-y-4">
-          <div className="grid gap-4 lg:grid-cols-2">
-            <DisassemblyPanel cpu={cpu} cores={cores} />
-            <MemoryPanel base={memBaseAddr} bytes={memory} pcs={corePcs} />
-          </div>
-          <MmuPanel
-            cores={cores}
-            onCoreChange={setTranslateCoreIdx}
-            onVaChange={setVaText}
-            selectedCoreIdx={translateCoreIdx}
-            trace={trace}
-            vaText={vaText}
-          />
-          <AicPanel aic={aic} />
-          <BlockPanel block={block} />
-          <SavePanel slots={coreSlots} />
-          <div className="grid gap-4 lg:grid-cols-2">
-            {cores.map((c) => (
-              <CoreColumn core={c} key={c.id} onStep={() => onStepCore(c.id)} />
-            ))}
-          </div>
-        </div>
+      <div className="grid min-w-0 gap-4 xl:grid-cols-3">
+        <DisassemblyPanel cpu={cpu} cores={cores} />
+        <MemoryPanel base={memBaseAddr} bytes={memory} pcs={corePcs} />
+        <SystemDiagram
+          aic={aic}
+          block={block}
+          cores={cores}
+          events={events}
+          output={output}
+          slots={coreSlots}
+        />
+      </div>
 
-        <div className="space-y-4 xl:sticky xl:top-4 xl:self-start">
-          <SystemDiagram
-            aic={aic}
-            block={block}
-            cores={cores}
-            events={events}
-            output={output}
-            slots={coreSlots}
-          />
-          <EditableDisk cpu={cpu} block={block} onChange={refresh} />
-        </div>
+      <MmuPanel
+        cores={cores}
+        onCoreChange={setTranslateCoreIdx}
+        onVaChange={setVaText}
+        selectedCoreIdx={translateCoreIdx}
+        trace={trace}
+        vaText={vaText}
+      />
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <AicPanel aic={aic} />
+        <BlockPanel block={block} />
+        <SavePanel slots={coreSlots} />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        {cores.map((c) => (
+          <CoreColumn core={c} key={c.id} onStep={() => onStepCore(c.id)} />
+        ))}
       </div>
     </div>
   )
@@ -505,14 +500,14 @@ function BlockPanel({ block }: { block: BlockState }) {
     <GlassCard>
       <div className="space-y-3 p-4">
         <div className="text-fg-muted flex items-center justify-between">
-          <span className="text-[10px] font-semibold tracking-wider uppercase">
+          <span className="type-small font-semibold tracking-wider uppercase">
             Block device · disk image (8 × 64-byte sectors @ MMIO 0x3000)
           </span>
-          <span className="font-mono text-[10px]">
+          <span className="type-small">
             reads {block.total_reads.toString()} · writes {block.total_writes.toString()}
           </span>
         </div>
-        <div className="grid gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-4">
+        <div className="type-small grid gap-x-6 gap-y-1 sm:grid-cols-4">
           <RegRow label="SECTOR" value={block.sector} />
           <RegRow label="BUF_ADDR" value={block.buf_addr} />
           <RegRow label="CMD" value={block.last_command} />
@@ -522,10 +517,10 @@ function BlockPanel({ block }: { block: BlockState }) {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-1">
-          <span className="text-fg-muted mr-2 text-xs">view sector</span>
+          <span className="text-fg-muted type-small mr-2">view sector</span>
           {Array.from({ length: numSectors }, (_, i) => (
             <button
-              className={`rounded border px-2 py-0.5 font-mono text-[11px] ${
+              className={`type-small rounded border px-2 py-0.5 ${
                 i === sector
                   ? 'border-accent bg-accent/10 text-accent'
                   : 'border-border text-fg-muted hover:bg-bg-tertiary'
@@ -551,7 +546,7 @@ function DiskHexRow({ bytes, sector }: { bytes: Uint8Array; sector: number }) {
   }
   const baseAddr = sector * SECTOR_SIZE
   return (
-    <div className="overflow-x-auto font-mono text-xs">
+    <div className="type-small overflow-x-auto">
       {rows.map((row, ri) => {
         let ascii = ''
         for (let i = 0; i < row.length; i++) {
@@ -578,7 +573,7 @@ function SavePanel({ slots }: { slots: CoreSlot[] }) {
   return (
     <GlassCard>
       <div className="space-y-2 p-4">
-        <div className="text-fg-muted text-[10px] font-semibold tracking-wider uppercase">
+        <div className="text-fg-muted type-small font-semibold tracking-wider uppercase">
           Per-core scheduler slots — entry + save_ptr + 2 save areas each
         </div>
         <div className="grid gap-3 lg:grid-cols-2">
@@ -586,7 +581,7 @@ function SavePanel({ slots }: { slots: CoreSlot[] }) {
             <CoreSlotCard base={i === 0 ? 0x4f00 : 0x5000} coreId={i} key={i} slot={slot} />
           ))}
         </div>
-        <div className="text-fg-muted text-[11px]">
+        <div className="text-fg-muted type-small">
           Each core derives its slot base from MPIDR_EL1: bit 8 (cluster) maps directly to 0x4F00 /
           0x5000. The scheduler reads "current entry" / "current save_ptr", saves X0–X3 there with
           STP, swaps via the (sum − current) trick, restores the other save area with LDP, and ERETs
@@ -602,8 +597,8 @@ function CoreSlotCard({ base, coreId, slot }: { base: number; coreId: number; sl
   const activeIdx =
     slot.savePtr === BigInt(base + 0x10) ? 0 : slot.savePtr === BigInt(base + 0x30) ? 1 : null
   return (
-    <div className="border-border bg-bg/40 space-y-2 rounded border px-3 py-2 font-mono text-[11px]">
-      <div className="text-fg-muted flex items-center justify-between text-[10px] tracking-wider uppercase">
+    <div className="border-border bg-bg/40 type-small space-y-2 rounded border px-3 py-2">
+      <div className="text-fg-muted type-small flex items-center justify-between tracking-wider uppercase">
         <span>
           core {coreId} slot @ 0x{base.toString(16)}
         </span>
@@ -639,7 +634,7 @@ function SaveAreaCard({ active, label, save }: { active: boolean; label: string;
       }`}
     >
       <div
-        className={`mb-1 flex items-center justify-between text-[10px] tracking-wider uppercase ${
+        className={`type-small mb-1 flex items-center justify-between tracking-wider uppercase ${
           active ? 'text-accent' : 'text-fg-muted'
         }`}
       >
@@ -659,20 +654,17 @@ function AicPanel({ aic }: { aic: AicState }) {
     <GlassCard>
       <div className="space-y-2 p-4">
         <div className="text-fg-muted flex items-center justify-between">
-          <span className="text-[10px] font-semibold tracking-wider uppercase">
+          <span className="type-small font-semibold tracking-wider uppercase">
             AIC · Apple-style interrupt controller
           </span>
-          <span className="font-mono text-[10px]">
+          <span className="type-small">
             base 0x2000 · ACK reads cleared {aic.total_acks.toString()}
           </span>
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           {aic.pending.map((bits, i) => (
-            <div
-              className="border-border bg-bg/40 rounded border px-3 py-2 font-mono text-xs"
-              key={i}
-            >
-              <div className="text-fg-muted mb-1 text-[10px] tracking-wider uppercase">
+            <div className="border-border bg-bg/40 type-small rounded border px-3 py-2" key={i}>
+              <div className="text-fg-muted type-small mb-1 tracking-wider uppercase">
                 core {i} pending
               </div>
               <div className="flex items-center gap-2">
@@ -701,12 +693,16 @@ function AicPanel({ aic }: { aic: AicState }) {
 }
 
 // === System architecture diagram ============================================
-// One SVG that lays out the whole simulated machine: two cores, the system
-// bus (a horizontal trunk), and four peripherals (UART, AIC, Block, RAM).
-// Static structure is drawn in muted strokes; every detected SimEvent is
-// rendered as a small packet that flies along the corresponding link, so
-// what you see moving on screen 1:1 maps to what just happened in the
-// simulator.
+// Dense SoC-style block diagram: two cores up top with their internal
+// sub-blocks (regs / exception / MMU / DAIF) and pin stubs, four lanes of
+// system bus (DATA / ADDR / IRQ / CTRL), peripheral chips (AIC, UART, BLK,
+// DISK) hanging off the bus, and a 4×4 RAM grid showing every named region
+// at the bottom. SimEvents render as coloured packets flying along the
+// matching bus lane.
+
+const SVG_W = 440
+const SVG_H = 480
+const BUS_Y = 188
 
 const NODE_POS: Record<NodeId, { x: number; y: number }> = {
   core0: { x: 110, y: 78 },
@@ -716,9 +712,6 @@ const NODE_POS: Record<NodeId, { x: number; y: number }> = {
   block: { x: 310, y: 280 },
   ram: { x: 220, y: 410 },
 }
-const BUS_Y = 188
-const SVG_W = 440
-const SVG_H = 480
 
 function SystemDiagram({
   aic,
@@ -752,12 +745,10 @@ function SystemDiagram({
   return (
     <div className="border-border bg-bg/60 relative rounded-xl border p-3">
       <div className="text-fg-muted mb-2 flex items-center justify-between">
-        <span className="text-[10px] font-semibold tracking-wider uppercase">
+        <span className="type-small font-semibold tracking-wider uppercase">
           System layout · live event flow
         </span>
-        <span className="font-mono text-[10px]">
-          {events.length > 0 ? `${events.length} active` : 'idle'}
-        </span>
+        <span className="type-small">{events.length > 0 ? `${events.length} active` : 'idle'}</span>
       </div>
       <svg
         className="block w-full"
@@ -775,7 +766,7 @@ function SystemDiagram({
         />
         <text
           fill="rgb(148 163 184 / 0.6)"
-          fontFamily="monospace"
+          fontFamily="'Roboto Flex'"
           fontSize="9"
           x={SVG_W - 24}
           y={BUS_Y - 6}
@@ -870,7 +861,7 @@ function CoreBox({
       />
       <text
         fill={accent}
-        fontFamily="monospace"
+        fontFamily="'Roboto Flex'"
         fontSize="11"
         fontWeight="bold"
         x={pos.x - 72}
@@ -880,7 +871,7 @@ function CoreBox({
       </text>
       <text
         fill="rgb(148 163 184 / 0.85)"
-        fontFamily="monospace"
+        fontFamily="'Roboto Flex'"
         fontSize="9"
         x={pos.x - 72}
         y={pos.y + 26}
@@ -889,7 +880,7 @@ function CoreBox({
       </text>
       <text
         fill={accent}
-        fontFamily="monospace"
+        fontFamily="'Roboto Flex'"
         fontSize="9"
         x={pos.x + 72}
         y={pos.y + 14}
@@ -899,7 +890,7 @@ function CoreBox({
       </text>
       <text
         fill="rgb(241 245 249 / 0.95)"
-        fontFamily="monospace"
+        fontFamily="'Roboto Flex'"
         fontSize="9"
         x={pos.x + 72}
         y={pos.y + 26}
@@ -910,8 +901,8 @@ function CoreBox({
       {/* PC + task */}
       <text
         fill="rgb(241 245 249 / 0.95)"
-        fontFamily="monospace"
-        fontSize="10"
+        fontFamily="'Roboto Flex'"
+        fontSize="11"
         x={pos.x - 72}
         y={pos.y + 44}
       >
@@ -919,7 +910,7 @@ function CoreBox({
       </text>
       <text
         fill="rgb(148 163 184 / 0.85)"
-        fontFamily="monospace"
+        fontFamily="'Roboto Flex'"
         fontSize="9"
         x={pos.x - 72}
         y={pos.y + 56}
@@ -959,8 +950,8 @@ function PeripheralBox({
       />
       <text
         fill={accent}
-        fontFamily="monospace"
-        fontSize="10"
+        fontFamily="'Roboto Flex'"
+        fontSize="11"
         fontWeight="bold"
         x={pos.x}
         y={pos.y - 18}
@@ -971,7 +962,7 @@ function PeripheralBox({
       {lines.map((ln, i) => (
         <text
           fill="rgb(203 213 225 / 0.9)"
-          fontFamily="monospace"
+          fontFamily="'Roboto Flex'"
           fontSize="9"
           key={i}
           x={pos.x}
@@ -1043,8 +1034,8 @@ function RamBox({
       />
       <text
         fill="#60a5fa"
-        fontFamily="monospace"
-        fontSize="10"
+        fontFamily="'Roboto Flex'"
+        fontSize="11"
         fontWeight="bold"
         x={pos.x - W / 2 + 8}
         y={pos.y}
@@ -1068,8 +1059,8 @@ function RamBox({
             />
             <text
               fill="rgb(203 213 225 / 0.85)"
-              fontFamily="monospace"
-              fontSize="7"
+              fontFamily="'Roboto Flex'"
+              fontSize="9"
               x={x + cellW / 2}
               y={pos.y + 17}
               textAnchor="middle"
@@ -1078,8 +1069,8 @@ function RamBox({
             </text>
             <text
               fill="rgb(148 163 184 / 0.7)"
-              fontFamily="monospace"
-              fontSize="6.5"
+              fontFamily="'Roboto Flex'"
+              fontSize="9"
               x={x + cellW / 2}
               y={pos.y + 26}
               textAnchor="middle"
@@ -1176,14 +1167,14 @@ function DisassemblyPanel({ cpu, cores }: { cpu: Cpu; cores: CoreState[] }) {
     <GlassCard>
       <div className="space-y-2 p-4">
         <div className="text-fg-muted flex items-center justify-between">
-          <span className="text-[10px] font-semibold tracking-wider uppercase">
+          <span className="type-small font-semibold tracking-wider uppercase">
             Disassembly · around core 0 PC
           </span>
-          <span className="font-mono text-[10px]">
+          <span className="type-small">
             range {fmtHex32(start)}–{fmtHex32(end - 1)}
           </span>
         </div>
-        <div className="overflow-x-auto font-mono text-[11px]">
+        <div className="type-small overflow-x-auto">
           {rows.map((r) => {
             const isCore0 = r.pa === pc0
             const isCore1 = r.pa === pc1
@@ -1211,19 +1202,82 @@ function DisassemblyPanel({ cpu, cores }: { cpu: Cpu; cores: CoreState[] }) {
   )
 }
 
-function EditableDisk({
+function ControlBar({
   block,
   cpu,
-  onChange,
+  onRefresh,
+  onReset,
+  onRunToggle,
+  onStep,
+  running,
+  sysInfo,
+  totalCoreSteps,
 }: {
   block: BlockState
   cpu: Cpu
-  onChange: (cpu: Cpu) => void
+  onRefresh: (cpu: Cpu) => void
+  onReset: () => void
+  onRunToggle: () => void
+  onStep: () => void
+  running: boolean
+  sysInfo: SystemInfo
+  totalCoreSteps: bigint
 }) {
-  // Decode sector 0 up to the first NUL byte for editing. We use the decoded
-  // value as a React key on the textarea, so when the user clicks Reset and
-  // the disk reverts, the textarea remounts with the fresh default; otherwise
-  // it stays as the user's edits (uncontrolled defaultValue).
+  return (
+    <div className="border-border bg-bg/60 flex flex-wrap items-stretch gap-3 rounded-xl border p-3">
+      <div className="flex items-center gap-2">
+        <GlassButton onClick={onStep} size="sm" variant="accent">
+          Step both
+        </GlassButton>
+        <GlassButton onClick={onRunToggle} size="sm">
+          {running ? 'Pause' : 'Run'}
+        </GlassButton>
+        <GlassButton onClick={onReset} size="sm">
+          Reset
+        </GlassButton>
+      </div>
+      <div className="border-border/40 hidden border-r xl:block" />
+      <SystemInfoStrip info={sysInfo} totalCoreSteps={totalCoreSteps} />
+      <div className="border-border/40 hidden border-r xl:block" />
+      <ControlBarDisk block={block} cpu={cpu} onRefresh={onRefresh} />
+    </div>
+  )
+}
+
+function SystemInfoStrip({ info, totalCoreSteps }: { info: SystemInfo; totalCoreSteps: bigint }) {
+  return (
+    <div className="type-small grid flex-1 grid-cols-3 gap-x-6 gap-y-0.5 sm:grid-cols-5">
+      <Stat label="system steps" value={info.systemSteps.toString()} />
+      <Stat label="retired" value={totalCoreSteps.toString()} />
+      <Stat label="period" value={info.timerPeriod.toString()} />
+      <Stat
+        emphasize={info.timerRemaining === 0n}
+        label="next IRQ"
+        value={info.timerRemaining.toString()}
+      />
+      <Stat label="ticks" value={info.timerTicks.toString()} />
+    </div>
+  )
+}
+
+function Stat({ emphasize, label, value }: { emphasize?: boolean; label: string; value: string }) {
+  return (
+    <div className="flex flex-col">
+      <span className="text-fg-muted type-small">{label}</span>
+      <span className={emphasize ? 'type-base text-amber-400' : 'text-fg type-base'}>{value}</span>
+    </div>
+  )
+}
+
+function ControlBarDisk({
+  block,
+  cpu,
+  onRefresh,
+}: {
+  block: BlockState
+  cpu: Cpu
+  onRefresh: (cpu: Cpu) => void
+}) {
   const initial = useMemo(() => {
     let end = 64
     for (let i = 0; i < 64; i++) {
@@ -1237,55 +1291,23 @@ function EditableDisk({
   }, [block.disk])
   const apply = (next: string) => {
     cpu.set_disk_text(next)
-    onChange(cpu)
+    onRefresh(cpu)
   }
   return (
-    <div className="border-border bg-bg/60 rounded-xl border p-4">
-      <div className="text-fg-muted mb-2 flex items-center justify-between">
-        <span className="text-[10px] font-semibold tracking-wider uppercase">
-          Disk sector 0 · editable
-        </span>
-        <span className="font-mono text-[10px]">{initial.length}/64 bytes</span>
-      </div>
-      <textarea
-        className="border-border bg-bg/40 text-fg focus:border-accent w-full resize-none rounded border px-2 py-1.5 font-mono text-xs outline-none"
+    <label className="flex flex-1 flex-col gap-1">
+      <span className="text-fg-muted type-small">
+        disk sector 0 — task B prints this ({initial.length}/64 bytes)
+      </span>
+      <input
+        className="border-border bg-bg/40 text-fg focus:border-accent type-base w-full rounded border px-2 py-1 outline-none"
         defaultValue={initial}
         key={initial}
         maxLength={64}
         onChange={(e) => apply(e.target.value)}
-        rows={3}
         spellCheck={false}
+        type="text"
       />
-      <p className="text-fg-muted mt-2 text-[11px]">
-        Bytes are written to <code>disk[0..64]</code> AND mirrored to PA <code>0x6000</code>, so
-        task B starts emitting your text on the next iteration.
-      </p>
-    </div>
-  )
-}
-
-function SystemInfoBar({ info, totalCoreSteps }: { info: SystemInfo; totalCoreSteps: bigint }) {
-  return (
-    <div className="border-border bg-bg/40 flex flex-wrap items-center gap-x-6 gap-y-1 rounded border px-3 py-2 font-mono text-xs">
-      <span className="text-fg-muted">
-        system steps: <span className="text-fg">{info.systemSteps.toString()}</span>
-      </span>
-      <span className="text-fg-muted">
-        retired (sum): <span className="text-fg">{totalCoreSteps.toString()}</span>
-      </span>
-      <span className="text-fg-muted">
-        timer period: <span className="text-fg">{info.timerPeriod.toString()}</span>
-      </span>
-      <span className="text-fg-muted">
-        next IRQ in:{' '}
-        <span className={info.timerRemaining === 0n ? 'text-warn text-amber-400' : 'text-fg'}>
-          {info.timerRemaining.toString()}
-        </span>
-      </span>
-      <span className="text-fg-muted">
-        timer ticks: <span className="text-fg">{info.timerTicks.toString()}</span>
-      </span>
-    </div>
+    </label>
   )
 }
 
@@ -1299,7 +1321,7 @@ function DaifChip({ daif }: { daif: number }) {
   ]
   return (
     <span
-      className="border-border bg-bg/40 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[10px] tracking-wider"
+      className="border-border bg-bg/40 type-small inline-flex items-center gap-1 rounded border px-1.5 py-0.5 tracking-wider"
       title="PSTATE.DAIF — 1 = masked, 0 = enabled"
     >
       {bits.map((b) => (
@@ -1320,7 +1342,7 @@ function CoreChip({ core }: { core: CoreState }) {
         : 'bg-neutral-500/20 text-neutral-300 border-neutral-500/40'
   return (
     <span
-      className={`inline-flex items-center gap-1.5 rounded border px-2 py-0.5 font-mono text-[10px] tracking-wider ${elClass}`}
+      className={`type-small inline-flex items-center gap-1.5 rounded border px-2 py-0.5 tracking-wider ${elClass}`}
       title={`MPIDR ${fmtHex64(core.mpidr)}`}
     >
       <span className="font-semibold">core{core.id}</span>
@@ -1340,13 +1362,13 @@ function CoreColumn({ core, onStep }: { core: CoreState; onStep: () => void }) {
           {(() => {
             const label = inferTaskLabel(core.pc)
             return label ? (
-              <span className="border-border bg-bg/40 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] tracking-wider">
+              <span className="border-border bg-bg/40 type-small inline-flex items-center rounded border px-1.5 py-0.5 tracking-wider">
                 {label}
               </span>
             ) : null
           })()}
           {core.wfi_halted && (
-            <span className="inline-flex items-center rounded border border-sky-500/40 bg-sky-500/15 px-1.5 py-0.5 font-mono text-[10px] tracking-wider text-sky-300">
+            <span className="type-small inline-flex items-center rounded border border-sky-500/40 bg-sky-500/15 px-1.5 py-0.5 tracking-wider text-sky-300">
               WFI · sleeping
             </span>
           )}
@@ -1357,14 +1379,14 @@ function CoreColumn({ core, onStep }: { core: CoreState; onStep: () => void }) {
           )}
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-fg-muted font-mono text-[10px]">steps {core.steps.toString()}</span>
+          <span className="text-fg-muted type-small">steps {core.steps.toString()}</span>
           <GlassButton onClick={onStep} size="sm">
             Step
           </GlassButton>
         </div>
       </div>
       {core.last_trap && (
-        <div className="border-danger/40 bg-danger/10 text-danger rounded border px-2 py-1 font-mono text-[11px]">
+        <div className="border-danger/40 bg-danger/10 text-danger type-small rounded border px-2 py-1">
           {core.last_trap}
         </div>
       )}
@@ -1378,19 +1400,18 @@ function RegistersCard({ core }: { core: CoreState }) {
   return (
     <GlassCard>
       <div className="p-3">
-        <div className="text-fg-muted mb-2 text-[10px] font-semibold tracking-wider uppercase">
+        <div className="text-fg-muted type-small mb-2 font-semibold tracking-wider uppercase">
           Registers
         </div>
-        <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 font-mono text-[11px]">
+        <div className="type-small grid grid-cols-2 gap-x-4 gap-y-0.5">
           {REG_LABELS.map((label, i) => (
             <RegRow key={label} label={label} value={core.x[i]} />
           ))}
           <RegRow label="SP" value={core.sp} />
           <RegRow highlight label="PC" value={core.pc} />
         </div>
-        <div className="text-fg-muted mt-2 text-[11px]">
-          NZCV: <span className="font-mono">{fmtHex32(core.nzcv)}</span> · MPIDR_EL1:{' '}
-          <span className="font-mono">{fmtHex64(core.mpidr)}</span>
+        <div className="text-fg-muted type-small mt-2">
+          NZCV: <span>{fmtHex32(core.nzcv)}</span> · MPIDR_EL1: <span>{fmtHex64(core.mpidr)}</span>
         </div>
       </div>
     </GlassCard>
@@ -1405,18 +1426,16 @@ function ExceptionCard({ core }: { core: CoreState }) {
   return (
     <GlassCard>
       <div className="space-y-2 p-3">
-        <div className="text-fg-muted text-[10px] font-semibold tracking-wider uppercase">
+        <div className="text-fg-muted type-small font-semibold tracking-wider uppercase">
           Exception state
         </div>
-        <div className="grid gap-x-4 gap-y-0.5 font-mono text-[11px] sm:grid-cols-2">
-          <div className="text-fg-muted col-span-full text-[10px] tracking-wider uppercase">
-            EL2
-          </div>
+        <div className="type-small grid gap-x-4 gap-y-0.5 sm:grid-cols-2">
+          <div className="text-fg-muted type-small col-span-full tracking-wider uppercase">EL2</div>
           <RegRow label="VBAR_EL2" value={core.vbar_el2} />
           <RegRow label="ELR_EL2" value={core.elr_el2} />
           <RegRow label="SPSR_EL2" value={core.spsr_el2} />
           <RegRow label="ESR_EL2" value={core.esr_el2} />
-          <div className="text-fg-muted col-span-full mt-1 text-[10px] tracking-wider uppercase">
+          <div className="text-fg-muted type-small col-span-full mt-1 tracking-wider uppercase">
             EL1
           </div>
           <RegRow label="VBAR_EL1" value={core.vbar_el1} />
@@ -1425,7 +1444,7 @@ function ExceptionCard({ core }: { core: CoreState }) {
           <RegRow label="ESR_EL1" value={core.esr_el1} />
         </div>
         {(core.esr_el1 !== 0n || inIrq) && (
-          <div className="text-fg-muted text-[11px]">
+          <div className="text-fg-muted type-small">
             {inIrq
               ? `entered via ${ecName} (vector VBAR_EL1+0x480)`
               : `ESR_EL1.EC = 0x${ec.toString(16).padStart(2, '0')} → ${ecName}`}
@@ -1457,10 +1476,10 @@ function OutputPanel({ output }: { output: string }) {
   return (
     <GlassCard>
       <div className="p-4">
-        <div className="text-fg-muted mb-3 text-[10px] font-semibold tracking-wider uppercase">
+        <div className="text-fg-muted type-small mb-3 font-semibold tracking-wider uppercase">
           UART Output (PA 0x1000) — shared
         </div>
-        <pre className="text-fg min-h-12 font-mono text-sm whitespace-pre-wrap">
+        <pre className="text-fg type-base min-h-12 whitespace-pre-wrap">
           {output || <span className="text-fg-muted">(no output yet)</span>}
         </pre>
       </div>
@@ -1477,14 +1496,14 @@ function MemoryPanel({ base, bytes, pcs }: { base: number; bytes: Uint8Array; pc
     <GlassCard>
       <div className="p-4">
         <div className="text-fg-muted mb-3 flex items-center justify-between">
-          <span className="text-[10px] font-semibold tracking-wider uppercase">
+          <span className="type-small font-semibold tracking-wider uppercase">
             Memory (around core 0 PC) — shared
           </span>
-          <span className="font-mono text-[10px]">
+          <span className="type-small">
             base {fmtHex32(base)} · pc {pcs.map((pc, i) => `c${i}=${fmtHex32(pc)}`).join(' · ')}
           </span>
         </div>
-        <div className="overflow-x-auto font-mono text-xs">
+        <div className="type-small overflow-x-auto">
           {rows.map((r) => (
             <MemoryRow key={r.addr} addr={r.addr} bytes={r.bytes} pcs={pcs} />
           ))}
@@ -1550,7 +1569,7 @@ function MmuPanel({
     <GlassCard>
       <div className="space-y-4 p-4">
         <div className="text-fg-muted flex items-center justify-between">
-          <span className="text-[10px] font-semibold tracking-wider uppercase">
+          <span className="type-small font-semibold tracking-wider uppercase">
             MMU · Stage-1 Translation
           </span>
           <Badge color={mmuOn ? 'success' : undefined}>
@@ -1558,11 +1577,11 @@ function MmuPanel({
           </Badge>
         </div>
 
-        <div className="flex items-center gap-2 text-xs">
+        <div className="type-small flex items-center gap-2">
           <span className="text-fg-muted">walk using</span>
           {cores.map((c) => (
             <button
-              className={`rounded border px-2 py-0.5 font-mono text-[11px] ${
+              className={`type-small rounded border px-2 py-0.5 ${
                 c.id === selectedCoreIdx
                   ? 'border-accent bg-accent/10 text-accent'
                   : 'border-border text-fg-muted hover:bg-bg-tertiary'
@@ -1576,18 +1595,18 @@ function MmuPanel({
           ))}
         </div>
 
-        <div className="grid gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-3">
+        <div className="type-small grid gap-x-6 gap-y-1 sm:grid-cols-3">
           <RegRow label="TTBR0_EL1" value={sel.ttbr0_el1} />
           <RegRow label="TCR_EL1" value={sel.tcr_el1} />
           <RegRow label="SCTLR_EL1" value={sel.sctlr_el1} />
         </div>
-        <div className="text-fg-muted text-xs">
+        <div className="text-fg-muted type-small">
           T0SZ={t0sz} · VA={vaBits} bits · 4 KiB granule · start level{' '}
           {trace && trace.steps.length > 0 ? trace.steps[0].level : '?'}
         </div>
 
         <div
-          className={`rounded border px-3 py-1.5 text-xs ${
+          className={`type-small rounded border px-3 py-1.5 ${
             mmuOn ? 'border-success/40 bg-success/10 text-success' : 'border-border text-fg-muted'
           }`}
         >
@@ -1597,18 +1616,20 @@ function MmuPanel({
         </div>
 
         <div className="flex items-center gap-2">
-          <label className="text-fg-muted font-mono text-xs" htmlFor="va-input">
+          <label className="text-fg-muted type-small" htmlFor="va-input">
             translate VA
           </label>
           <input
-            className="border-border bg-bg/40 text-fg focus:border-accent w-40 rounded border px-2 py-1 font-mono text-xs outline-none"
+            className="border-border bg-bg/40 text-fg focus:border-accent type-small w-40 rounded border px-2 py-1 outline-none"
             id="va-input"
             onChange={(e) => onVaChange(e.target.value)}
             placeholder="0x4000"
             spellCheck={false}
             value={vaText}
           />
-          <span className="text-fg-muted text-xs">try 0x4000, 0x1000, 0x4800, 0x4C00, 0x2000</span>
+          <span className="text-fg-muted type-small">
+            try 0x4000, 0x1000, 0x4800, 0x4C00, 0x2000
+          </span>
         </div>
 
         {trace && <WalkDisplay trace={trace} />}
@@ -1620,13 +1641,13 @@ function MmuPanel({
 function WalkDisplay({ trace }: { trace: TranslationResult }) {
   if (trace.steps.length === 0 && trace.fault) {
     return (
-      <div className="border-danger/40 bg-danger/10 text-danger rounded border px-3 py-2 font-mono text-xs">
+      <div className="border-danger/40 bg-danger/10 text-danger type-small rounded border px-3 py-2">
         {trace.fault}
       </div>
     )
   }
   return (
-    <div className="space-y-2 font-mono text-xs">
+    <div className="type-small space-y-2">
       {trace.steps.map((s, i) => (
         <WalkStepRow key={i} step={s} />
       ))}
@@ -1656,7 +1677,7 @@ function WalkStepRow({ step }: { step: WalkStep }) {
           entry@{fmtHex64(step.entry_addr)} = {fmtHex64(step.descriptor)}
         </span>
       </div>
-      <div className="text-fg-muted mt-1 text-[11px]">
+      <div className="text-fg-muted type-small mt-1">
         <OutcomeText outcome={step.outcome} />
       </div>
     </div>
