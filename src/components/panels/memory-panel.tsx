@@ -1,20 +1,14 @@
-// Hex / ASCII view of a memory window centred on core 0's PC. Each
-// 4-byte instruction window currently being executed by a core is
-// highlighted (cyan for core 0, violet for core 1) so the reader can see
-// at a glance which instruction each core is about to fetch.
-
 import { Card } from '@goliapkg/gds'
 
 import { fmtHex32 } from '../../sim/format'
 
-interface MemoryPanelProps {
+interface Props {
   base: number
   bytes: Uint8Array
-  /** PC of every core; used to highlight 4-byte windows in the dump. */
   pcs: number[]
 }
 
-export function MemoryPanel({ base, bytes, pcs }: MemoryPanelProps) {
+export function MemoryPanel({ base, bytes, pcs }: Props) {
   const rows: { addr: number; bytes: Uint8Array }[] = []
   for (let off = 0; off < bytes.length; off += 16) {
     rows.push({ addr: base + off, bytes: bytes.slice(off, off + 16) })

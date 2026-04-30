@@ -1,6 +1,4 @@
-// Domain types mirroring what the Rust simulator (`crates/aarch64-sim`)
-// exposes through wasm-bindgen. Keeping them in one file makes the React
-// side easier to refactor without chasing definitions around.
+// React-side mirrors of the wasm-bindgen interfaces exported by aarch64-sim.
 
 export interface CoreState {
   id: number
@@ -65,7 +63,6 @@ export interface SystemInfo {
   timerTicks: bigint
 }
 
-// Logical "nodes" on the SoC schematic — what a SimEvent can travel between.
 export type NodeId = 'core0' | 'core1' | 'aic' | 'uart' | 'block' | 'ram'
 
 export type SimEventKind = 'store' | 'timer' | 'disk_read' | 'irq_taken' | 'svc' | 'eret'
@@ -78,7 +75,6 @@ export interface SimEvent {
   ts: number
 }
 
-// Snapshot we keep between refreshes to derive SimEvents from state diffs.
 export interface PrevSnapshot {
   cores: { pc: bigint; current_el: number; wfi_halted: boolean }[]
   outputLen: number
@@ -86,7 +82,6 @@ export interface PrevSnapshot {
   totalReads: bigint
 }
 
-// MMU translation walk types — mirror the Rust enum the simulator exposes.
 export interface PageAttrs {
   af: boolean
   ap: number

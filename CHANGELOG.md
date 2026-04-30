@@ -1,91 +1,85 @@
 # Changelog
 
-All notable changes are recorded here. The shape of each release is "one
-architectural concept on top of the previous one, observable in the browser."
+Each entry is one architectural concept added on top of the previous one.
 
-## v0.16.0 (current)
+## v0.16
 
-- Rebrand: project renamed from `osstudy-web` to `aarch64-study`,
-  open-sourced under the MIT license.
-- UI overhaul:
-  - dense pin-out SoC schematic with two cores, a 4-lane bus
-    (DATA / ADDR / IRQ / CTRL), AIC / UART / BLK chips with labelled pins,
-    and a 4×3 RAM region grid;
-  - 12-stat header strip (system steps, retired, timer period, next IRQ,
-    timer ticks, AIC acks, AIC pending, UART bytes, BLK reads, per-core PC,
-    per-core EL);
-  - all data columns rendered in Roboto Mono so hex letters align across
-    rows; UI text stays Roboto Flex with tabular numerals;
-  - GDS theme tokens everywhere (`bg-surface`, `bg-bg-secondary`,
-    `bg-bg-tertiary`, `border-border`, `text-fg / text-fg-muted`,
-    `palette-X`) so light and dark themes both render cleanly.
-- Simulator:
-  - task A becomes a silent WFI sleeper; task B prints the disk image
-    once and parks itself in WFI (the previous loop was confusing and
-    interleaved badly with task A's output);
-  - scheduler reduced to "ack the AIC and ERET to the same task" — tasks
-    are pinned per core, so the UART output stays monotonic and the
-    auto-run loop stops once both cores park;
-  - default disk content reads `AArch64 disk image - sector 0\n`;
-  - 15 / 15 simulator tests pass.
+UI overhaul + project rebrand.
 
-## v0.15.0
+- Renamed from `osstudy-web` to `aarch64-study`, public on GitHub under MIT.
+- Dense pin-out SoC schematic: two cores with REGS / PC / MMU / EXC / DAIF
+  sub-blocks, a 4-lane parallel bus (DATA / ADDR / IRQ / CTRL), AIC / UART /
+  BLK chips with labelled top-edge pins, 4×3 RAM region grid.
+- 12-stat header strip: system steps, retired, timer period, next IRQ,
+  timer ticks, AIC acks / pending, UART bytes, BLK reads, per-core PC, EL.
+- Roboto Mono on every numeric / hex / register column; Roboto Flex on UI
+  text with `tabular-nums`.
+- Theme tokens everywhere (`bg-surface`, `bg-bg-secondary`, `bg-bg-tertiary`,
+  `border-border`, `text-fg`, `palette-X`); light + dark both render
+  cleanly.
+- Task A becomes a silent WFI sleeper, task B prints the disk image once
+  and parks itself in WFI. Scheduler reduced to "ack + ERET to the same
+  task" — output stays monotonic, auto-run pauses once both cores park.
+- Default disk content `AArch64 disk image - sector 0\n`.
+- 15 / 15 simulator tests pass.
 
-- Disassembler covers the entire instruction set the simulator decodes.
-- Per-core monitors with editable disk text.
+## v0.15
 
-## v0.14.0
+Disassembler covers the whole instruction set the simulator decodes; per-core
+monitors with editable disk text.
 
-- AP-bit enforcement: kernel pages (AIC, Block) reject EL0 accesses.
+## v0.14
 
-## v0.13.0
+AP-bit enforcement: kernel pages (AIC, Block) reject EL0 accesses.
 
-- WFI: idle cores stop spinning, wake on IRQ.
+## v0.13
 
-## v0.12.0
+WFI: idle cores stop spinning, wake on IRQ.
 
-- Per-core scheduler — cores 0/1 run tasks A/B concurrently via MPIDR.
+## v0.12
 
-## v0.11.0
+Per-core scheduler — cores 0/1 run tasks A/B concurrently via MPIDR.
 
-- LDRB / CBZ / CBNZ / SUB-imm; task B walks the disk buffer and prints it.
+## v0.11
 
-## v0.10.0
+LDRB / CBZ / CBNZ / SUB-imm; task B walks the disk buffer and prints it.
 
-- virtio-blk-shaped block device; kernel reads sector 0 at boot.
+## v0.10
 
-## v0.9.0
+virtio-blk-shaped block device; kernel reads sector 0 at boot.
 
-- LDP/STP + real context switch (X0–X3 persist across switches).
+## v0.9
 
-## v0.8.0
+LDP/STP + real context switch (X0–X3 persist across switches).
 
-- AIC abstraction; scheduler swaps tasks A/B on every timer tick.
+## v0.8
 
-## v0.7.0
+AIC abstraction; scheduler swaps tasks A/B every timer tick.
 
-- DAIF + AIC timer IRQ + IRQ vector at `VBAR + 0x480`.
+## v0.7
 
-## v0.6.0
+DAIF + AIC timer IRQ + IRQ vector at `VBAR + 0x480`.
 
-- Two cores (P-core / E-core) sharing memory, distinguished by `MPIDR_EL1`.
+## v0.6
 
-## v0.5.0
+Two cores (P-core / E-core) sharing memory, distinguished by `MPIDR_EL1`.
 
-- SVC raises EL0 → EL1 + ERET returns (full syscall round-trip).
+## v0.5
 
-## v0.4.0
+SVC raises EL0 → EL1 + ERET returns (full syscall round-trip).
 
-- EL2 boot + ERET drops to EL1.
+## v0.4
 
-## v0.3.0
+EL2 boot + ERET drops to EL1.
 
-- MSR/MRS + `SCTLR_EL1.M` honoured for fetch/load/store.
+## v0.3
 
-## v0.2.0
+MSR/MRS + `SCTLR_EL1.M` honoured for fetch / load / store.
 
-- MMU stage-1 page-table walk (4 KiB granule).
+## v0.2
 
-## v0.1.0
+MMU stage-1 page-table walk (4 KiB granule).
 
-- Registers + 5 instructions (MOVZ ADD LDR STR B) + MMIO UART.
+## v0.1
+
+Registers + 5 instructions (MOVZ ADD LDR STR B) + MMIO UART.

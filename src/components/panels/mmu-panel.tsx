@@ -1,16 +1,10 @@
-// Stage-1 MMU view. Shows the selected core's TTBR0_EL1 / TCR_EL1 /
-// SCTLR_EL1, the resolved T0SZ / VA-bits / start-level, and a step-by-
-// step walk for a user-selectable virtual address. The walk works as a
-// query in any state — only fetches/loads/stores actually go through
-// translation when SCTLR_EL1.M=1.
-
 import { Badge, Card } from '@goliapkg/gds'
 
 import { fmtHex64 } from '../../sim/format'
 import type { CoreState, TranslationResult, WalkOutcome, WalkStep } from '../../sim/types'
 import { RegRow } from '../reg-row'
 
-interface MmuPanelProps {
+interface Props {
   cores: CoreState[]
   onCoreChange: (idx: number) => void
   onVaChange: (v: string) => void
@@ -26,7 +20,7 @@ export function MmuPanel({
   selectedCoreIdx,
   trace,
   vaText,
-}: MmuPanelProps) {
+}: Props) {
   const sel = cores[selectedCoreIdx]
   const t0sz = Number(sel.tcr_el1 & 0x3fn)
   const vaBits = t0sz > 0 ? 64 - t0sz : 0
@@ -105,8 +99,7 @@ export function MmuPanel({
 
 function WalkDisplay({ trace }: { trace: TranslationResult }) {
   if (trace.steps.length === 0 && trace.fault) {
-    // "MMU not configured" before the kernel has set up TTBR/TCR is the
-    // expected boot state — render as a muted note, not a red error.
+    // "MMU not configured" before kernel boots is expected, not a failure.
     const isPreInit = trace.fault.startsWith('MMU not configured')
     return (
       <div
@@ -165,8 +158,7 @@ function OutcomeText({ outcome }: { outcome: WalkOutcome }) {
     case 'Page':
       return (
         <>
-          → page PA {fmtHex64(outcome.pa)} · AF={outcome.attrs.af ? 1 : 0} · AP=
-          {outcome.attrs.ap}
+          → page PA {fmtHex64(outcome.pa)} · AF={outcome.attrs.af ? 1 : 0} · AP={outcome.attrs.ap}
         </>
       )
     case 'Block':

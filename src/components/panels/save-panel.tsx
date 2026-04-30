@@ -1,14 +1,9 @@
-// Per-core scheduler slot view. Each slot lives at 0x4F00 / 0x5000 and
-// carries the current task entry pointer, the active save-area pointer,
-// and two 32-byte save areas (X0..X3 each). The active save area gets
-// the accent treatment.
-
 import { Card } from '@goliapkg/gds'
 
 import type { CoreSlot, TaskSave } from '../../sim/types'
 import { RegRow, SaveRegRow } from '../reg-row'
 
-const CORE_SLOT_BASE = [0x4f00, 0x5000] as const
+const SLOT_BASE = [0x4f00, 0x5000] as const
 
 export function SavePanel({ slots }: { slots: CoreSlot[] }) {
   return (
@@ -19,7 +14,7 @@ export function SavePanel({ slots }: { slots: CoreSlot[] }) {
         </div>
         <div className="grid gap-3">
           {slots.map((slot, i) => (
-            <CoreSlotCard base={CORE_SLOT_BASE[i] ?? 0} coreId={i} key={i} slot={slot} />
+            <SlotCard base={SLOT_BASE[i] ?? 0} coreId={i} key={i} slot={slot} />
           ))}
         </div>
         <div className="text-fg-muted type-small">
@@ -33,7 +28,7 @@ export function SavePanel({ slots }: { slots: CoreSlot[] }) {
   )
 }
 
-function CoreSlotCard({ base, coreId, slot }: { base: number; coreId: number; slot: CoreSlot }) {
+function SlotCard({ base, coreId, slot }: { base: number; coreId: number; slot: CoreSlot }) {
   const taskLabel = slot.entry === 0x4d00n ? 'task A' : slot.entry === 0x4e00n ? 'task B' : '?'
   const activeIdx =
     slot.savePtr === BigInt(base + 0x10) ? 0 : slot.savePtr === BigInt(base + 0x30) ? 1 : null

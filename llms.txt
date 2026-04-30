@@ -1,78 +1,55 @@
 # aarch64-study
 
-> A web-first AArch64 SoC simulator for teaching operating-system internals.
-> The simulator core is written in Rust, compiled to WebAssembly, and
-> rendered in a React UI; every fetch / page-table walk / exception is
-> observable in the browser. Each released version (`v0.1` … `v0.16`) adds
-> exactly one architectural concept on top of the previous one, so reading
-> the diff is the lesson.
+> AArch64 SoC simulator that runs in the browser. Rust → WebAssembly core,
+> React UI. Each released version adds exactly one architectural concept.
+> Reading the diff between two tags is the lesson.
 
 Live demo: <https://labs.golia.jp/aarch64/>
 License: MIT
 
-## Documentation
+## Docs
 
-- [README.md](README.md): trilingual project README (EN / 中文 / 日本語)
-  with feature list, quick-start, roadmap, and repo layout.
-- [CHANGELOG.md](CHANGELOG.md): version-by-version history of every
-  architectural concept introduced.
-- [CONTRIBUTING.md](CONTRIBUTING.md): dev model (git-flow on `develop`),
-  local setup, style guide.
-- [LICENSE](LICENSE): MIT license text.
+- [README.md](README.md) — entry point (English)
+- [README.zh.md](README.zh.md) — 简体中文
+- [README.ja.md](README.ja.md) — 日本語
+- [CHANGELOG.md](CHANGELOG.md) — version-by-version concept history
 
 ## Source layout
 
-- `crates/aarch64-sim/` — Rust simulator. `src/lib.rs` contains the entire
-  CPU, MMU, AIC, Block device, demo program, and tests. `pkg/` is the
-  wasm-pack output that the web side imports.
-- `src/views/cpu.tsx` — main interactive view. Composes panels and owns
-  the `<Cpu>` instance, refresh loop, and event derivation.
-- `src/views/about.tsx` — roadmap + repo layout + commands.
-- `src/components/system-diagram.tsx` — the SoC pin-out SVG schematic
-  (two cores, 4-lane bus, peripherals, RAM grid).
-- `src/sim/types.ts` — every domain interface (CoreState, AicState, …)
-  shared by the React side; mirrors the Rust types exposed via
-  wasm-bindgen.
-- `src/sim/format.ts` — formatting + parsing helpers (fmtHex32/64,
-  parseHex, parseCoreSlot, inferTaskLabel) and constants
-  (REG_LABELS, MEMORY_VIEW_BYTES, RUN_BURST, TASK_*_ENTRY, IRQ_NAMES).
-- `src/index.css` — global styles. Roboto Flex for UI text, Roboto Mono
-  for numeric / hex / register columns. GDS theme tokens drive colour.
-- `src/main.tsx` / `src/app.tsx` — router + layout shell.
-
-## How a release is shaped
-
-Each release introduces exactly one architectural concept that the user
-can see in the browser. The shape is enforced by the changelog: if the
-diff doesn't fit a one-liner, the concept needs to be split.
+- `crates/aarch64-sim/src/lib.rs` — entire CPU + MMU + AIC + Block + demo
+  program + tests in one Rust file. Exposed to JS via wasm-bindgen.
+- `src/views/cpu.tsx` — top-level page. Boots the simulator, runs the
+  refresh loop, drives auto-run, composes panels.
+- `src/components/system-diagram.tsx` — SoC pin-out SVG schematic.
+- `src/components/panels/*` — one file per panel (AIC, Block, Memory,
+  MMU, Output, Save, Disassembly, CoreMonitor).
+- `src/components/{badges,control-bar,reg-row}.tsx` — shared UI.
+- `src/sim/types.ts` — wasm-bindgen mirror types.
+- `src/sim/format.ts` — formatters, parsers, demo constants.
+- `src/sim/events.ts` — pure SimEvent derivation from snapshot diff.
 
 ## Build & test
 
-- `bun install` — install web deps + the local `aarch64-sim` crate.
-- `bun run build:sim` — wasm-pack the Rust simulator. After this, run
-  `rm -rf node_modules/aarch64-sim && bun install` so the new WASM is
-  picked up by Vite (see `feedback_wasm_pkg_reinstall.md` in the user's
-  notes).
-- `bun run dev` — Vite dev server on `http://127.0.0.1:32030`.
-- `bun run test:sim` — `cargo test` the Rust simulator (15 tests).
-- `bun run test` — Vitest for the React side.
-- `bun run check` — `tsc --noEmit && eslint src/ && prettier --check src/`.
-- `bun run build` — production bundle into `./dist`.
-- `bun run deploy` — build then `rsync` `dist/` to
-  `t01:/apps/labs/aarch64/` (the production target behind
-  <https://labs.golia.jp/aarch64/>).
+```
+bun install            # also: rm -rf node_modules/aarch64-sim if WASM was rebuilt
+bun run build:sim      # wasm-pack the Rust simulator
+bun run dev            # vite dev server on :32030
+bun run test:sim       # cargo test (15 tests)
+bun run check          # tsc + eslint + prettier
+bun run build          # production bundle into ./dist
+bun run deploy         # build + rsync dist/ to the production target
+```
 
-## Conventions worth knowing
+After `build:sim`, run `rm -rf node_modules/aarch64-sim && bun install`
+before `bun run build` so Vite picks up the regenerated WASM.
 
-- The repo uses GDS (`@goliapkg/gds`) — the design system supplies `Card`,
-  `Badge`, `Button`, theme tokens (`bg-surface`, `bg-bg-secondary`,
-  `bg-bg-tertiary`, `text-fg`, `palette-X`, …), and Tailwind 4 wiring.
-  Avoid hand-picking colour shades; use the tokens so light and dark
-  themes both render cleanly.
-- Numeric / hex / register columns are monospace (Roboto Mono via the
-  `mono-data` helper). Plain UI text uses Roboto Flex with `tabular-nums`
-  on.
-- Animations must depict real simulator events. No ambient sci-fi.
-- Tasks are pinned per core: core 0 runs task A (silent WFI sleeper),
-  core 1 runs task B (the disk printer). Auto-run pauses the moment all
-  cores are halted or WFI'd; pressing Run again auto-resets.
+## Conventions
+
+- GDS theme tokens only (`bg-surface`, `text-fg`, `palette-X`, …); avoid
+  hand-picked colour shades so light + dark both render cleanly.
+- Roboto Mono for any numeric / hex / register column (via `mono-data`);
+  Roboto Flex for plain UI text with `tabular-nums`.
+- Animations depict real simulator events. No ambient sci-fi.
+- Tasks pinned per core: core 0 = task A (silent WFI sleeper), core 1 =
+  task B (disk printer). Auto-run pauses once every core is halted or
+  parked in WFI; pressing Run again auto-resets.

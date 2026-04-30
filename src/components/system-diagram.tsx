@@ -1,21 +1,9 @@
-// Dense SoC pin-out schematic. Two cores at the top (each with REGS / PC /
-// MMU / EXC / DAIF sub-blocks and labelled bottom-edge pins), a four-lane
-// parallel bus (DATA / ADDR / IRQ / CTRL) running across the middle,
-// peripheral chips (AIC / UART / BLK) hanging off the bus with top-edge
-// pins, and a 4×3 RAM region grid pinned to the bottom.
-//
-// All colours come from theme tokens (var(--color-…)) so the schematic
-// reads cleanly in both light and dark mode. Per-chip accent colours are
-// the only intentional hard-coded hues — they're a visual signature of the
-// component and shouldn't change with theme.
-
 import { Card } from '@goliapkg/gds'
 import { useMemo } from 'react'
 
 import { fmtHex32 } from '../sim/format'
-import type { AicState, BlockState, CoreSlot, CoreState, NodeId, SimEvent } from '../sim/types'
+import type { AicState, BlockState, CoreSlot, CoreState, SimEvent } from '../sim/types'
 
-// ── Geometry ──────────────────────────────────────────────────────────────
 const SVG_W = 480
 const SVG_H = 680
 
@@ -44,9 +32,6 @@ const RAM_Y = 458
 const RAM_W = SVG_W - 40
 const RAM_H = 210
 
-// Pin positions per chip — used both for drawing stubs and for routing
-// any future event packets. `x` is the absolute SVG x; the y is on the
-// chip's edge.
 const corePins = (coreX: number) => ({
   data: coreX + 32,
   addr: coreX + 92,
@@ -57,31 +42,29 @@ const aicPins = { irq: AIC_X + 32, ack: AIC_X + 78, mask: AIC_X + 110 }
 const uartPins = { data: UART_X + 36, csel: UART_X + 92 }
 const blkPins = { data: BLK_X + 30, csel: BLK_X + 70, irq: BLK_X + 110 }
 
-// Lane / accent colours. Hard-coded because they're the chip's identity.
-const LANE_LABEL = 'var(--color-fg-muted)'
+const FG = 'var(--color-fg)'
+const FG_SECONDARY = 'var(--color-fg-secondary)'
+const FG_MUTED = 'var(--color-fg-muted)'
+const BG_SECONDARY = 'var(--color-bg-secondary)'
+const BG_TERTIARY = 'var(--color-bg-tertiary)'
+const BORDER = 'var(--color-border)'
+const FONT = "'Roboto Flex', system-ui, sans-serif"
+
 const LANE_DATA_COL = '#60a5fa'
 const LANE_ADDR_COL = '#94a3b8'
 const LANE_IRQ_COL = '#fbbf24'
 const LANE_CTRL_COL = '#a78bfa'
-const ACCENT_AIC = LANE_IRQ_COL
 const ACCENT_UART = '#34d399'
 const ACCENT_BLK = '#fb7185'
 
-const FONT = "'Roboto Flex', system-ui, sans-serif"
+const PIN_COL = {
+  data: LANE_DATA_COL,
+  addr: LANE_ADDR_COL,
+  irq: LANE_IRQ_COL,
+  ctrl: LANE_CTRL_COL,
+} as const
 
-// Centre x for each chip, kept around in case we ever wire up event
-// packets that need a chip-level anchor.
-const NODE_POS: Record<NodeId, { x: number; y: number }> = {
-  core0: { x: CORE0_X + CORE_W / 2, y: CORE_Y + CORE_H / 2 },
-  core1: { x: CORE1_X + CORE_W / 2, y: CORE_Y + CORE_H / 2 },
-  aic: { x: AIC_X + PERIPH_W / 2, y: PERIPH_Y + PERIPH_H / 2 },
-  uart: { x: UART_X + PERIPH_W / 2, y: PERIPH_Y + PERIPH_H / 2 },
-  block: { x: BLK_X + PERIPH_W / 2, y: PERIPH_Y + PERIPH_H / 2 },
-  ram: { x: RAM_X + RAM_W / 2, y: RAM_Y + RAM_H / 2 },
-}
-
-// ── Public component ──────────────────────────────────────────────────────
-export interface SystemDiagramProps {
+interface Props {
   aic: AicState
   block: BlockState
   cores: CoreState[]
@@ -90,7 +73,7 @@ export interface SystemDiagramProps {
   slots: CoreSlot[]
 }
 
-export function SystemDiagram({ aic, block, cores, events, output, slots }: SystemDiagramProps) {
+export function SystemDiagram({ aic, block, cores, events, output, slots }: Props) {
   const ramRegions = useMemo(
     () =>
       [
@@ -109,6 +92,7 @@ export function SystemDiagram({ aic, block, cores, events, output, slots }: Syst
       ] as const,
     []
   )
+  const ramMidX = RAM_X + RAM_W / 2
   return (
     <Card padding="none">
       <div className="relative p-3">
@@ -125,12 +109,11 @@ export function SystemDiagram({ aic, block, cores, events, output, slots }: Syst
           viewBox={`0 0 ${SVG_W} ${SVG_H}`}
           xmlns="http://www.w3.org/2000/svg"
         >
-          {/* Solder-mask backing for the whole SoC strip */}
           <rect
-            fill="var(--color-bg-secondary)"
+            fill={BG_SECONDARY}
             height={SVG_H - 4}
             rx="6"
-            stroke="var(--color-border)"
+            stroke={BORDER}
             strokeWidth="0.5"
             width={SVG_W - 4}
             x={2}
@@ -142,23 +125,22 @@ export function SystemDiagram({ aic, block, cores, events, output, slots }: Syst
           <CorePinStubs coreX={CORE1_X} />
           <PeripheralStubs />
 
-          {/* RAM connection ribbon (CTRL lane → RAM top edge) */}
           <line
             stroke="rgb(168 85 247 / 0.35)"
             strokeDasharray="2 2"
             strokeWidth="0.8"
-            x1={NODE_POS.ram.x}
-            x2={NODE_POS.ram.x}
+            x1={ramMidX}
+            x2={ramMidX}
             y1={LANE_CTRL_Y}
             y2={RAM_Y}
           />
 
-          <CoreChipSvg core={cores[0]} coreX={CORE0_X} slot={slots[0]} />
-          <CoreChipSvg core={cores[1]} coreX={CORE1_X} slot={slots[1]} />
+          <CoreSvg core={cores[0]} coreX={CORE0_X} slot={slots[0]} />
+          <CoreSvg core={cores[1]} coreX={CORE1_X} slot={slots[1]} />
 
-          <AicChip aic={aic} />
-          <UartChip output={output} />
-          <BlockChip block={block} />
+          <AicSvg aic={aic} />
+          <UartSvg output={output} />
+          <BlockSvg block={block} />
 
           <RamGrid regions={ramRegions} />
         </svg>
@@ -167,16 +149,14 @@ export function SystemDiagram({ aic, block, cores, events, output, slots }: Syst
   )
 }
 
-// ── Bus + stub primitives ─────────────────────────────────────────────────
 function BusLanes() {
-  const lanes: { y: number; col: string; name: string }[] = [
+  const lanes = [
     { y: LANE_DATA_Y, col: LANE_DATA_COL, name: 'DATA' },
     { y: LANE_ADDR_Y, col: LANE_ADDR_COL, name: 'ADDR' },
     { y: LANE_IRQ_Y, col: LANE_IRQ_COL, name: 'IRQ' },
     { y: LANE_CTRL_Y, col: LANE_CTRL_COL, name: 'CTRL' },
   ]
-  // Labels live in the gap between the two cores (centre of the SoC) so
-  // they never overlap with chip pins on either side.
+  // Centre the labels in the gap between the two cores.
   const labelX = SVG_W / 2
   return (
     <g>
@@ -191,9 +171,8 @@ function BusLanes() {
             y1={l.y}
             y2={l.y}
           />
-          {/* Pill behind the label so the bus line reads cleanly */}
           <rect
-            fill="var(--color-bg-tertiary)"
+            fill={BG_TERTIARY}
             height="11"
             rx="2"
             stroke={l.col}
@@ -223,60 +202,56 @@ function BusLanes() {
 
 function CorePinStubs({ coreX }: { coreX: number }) {
   const p = corePins(coreX)
-  const stub = (x: number, lane: number, col: string) => (
-    <line
-      key={x}
-      stroke={col}
-      strokeOpacity="0.6"
-      strokeWidth="0.8"
-      x1={x}
-      x2={x}
-      y1={CORE_Y + CORE_H}
-      y2={lane}
-    />
-  )
   return (
     <g>
-      {stub(p.data, LANE_DATA_Y, LANE_DATA_COL)}
-      {stub(p.addr, LANE_ADDR_Y, LANE_ADDR_COL)}
-      {stub(p.irq, LANE_IRQ_Y, LANE_IRQ_COL)}
-      {stub(p.ctrl, LANE_CTRL_Y, LANE_CTRL_COL)}
+      <Stub from={p.data} laneY={LANE_DATA_Y} top={CORE_Y + CORE_H} col={LANE_DATA_COL} />
+      <Stub from={p.addr} laneY={LANE_ADDR_Y} top={CORE_Y + CORE_H} col={LANE_ADDR_COL} />
+      <Stub from={p.irq} laneY={LANE_IRQ_Y} top={CORE_Y + CORE_H} col={LANE_IRQ_COL} />
+      <Stub from={p.ctrl} laneY={LANE_CTRL_Y} top={CORE_Y + CORE_H} col={LANE_CTRL_COL} />
     </g>
   )
 }
 
 function PeripheralStubs() {
-  const stub = (x: number, lane: number, col: string) => (
-    <line
-      key={`${x}-${lane}`}
-      stroke={col}
-      strokeOpacity="0.55"
-      strokeWidth="0.8"
-      x1={x}
-      x2={x}
-      y1={lane}
-      y2={PERIPH_Y}
-    />
-  )
   return (
     <g>
-      {/* AIC: ack→DATA, mask→ADDR, irq_out→IRQ */}
-      {stub(aicPins.ack, LANE_DATA_Y, LANE_DATA_COL)}
-      {stub(aicPins.mask, LANE_ADDR_Y, LANE_ADDR_COL)}
-      {stub(aicPins.irq, LANE_IRQ_Y, LANE_IRQ_COL)}
-      {/* UART: data→DATA, csel→ADDR */}
-      {stub(uartPins.data, LANE_DATA_Y, LANE_DATA_COL)}
-      {stub(uartPins.csel, LANE_ADDR_Y, LANE_ADDR_COL)}
-      {/* BLK: data→DATA, csel→ADDR, irq→IRQ */}
-      {stub(blkPins.data, LANE_DATA_Y, LANE_DATA_COL)}
-      {stub(blkPins.csel, LANE_ADDR_Y, LANE_ADDR_COL)}
-      {stub(blkPins.irq, LANE_IRQ_Y, LANE_IRQ_COL)}
+      <Stub from={aicPins.ack} laneY={LANE_DATA_Y} top={PERIPH_Y} col={LANE_DATA_COL} />
+      <Stub from={aicPins.mask} laneY={LANE_ADDR_Y} top={PERIPH_Y} col={LANE_ADDR_COL} />
+      <Stub from={aicPins.irq} laneY={LANE_IRQ_Y} top={PERIPH_Y} col={LANE_IRQ_COL} />
+      <Stub from={uartPins.data} laneY={LANE_DATA_Y} top={PERIPH_Y} col={LANE_DATA_COL} />
+      <Stub from={uartPins.csel} laneY={LANE_ADDR_Y} top={PERIPH_Y} col={LANE_ADDR_COL} />
+      <Stub from={blkPins.data} laneY={LANE_DATA_Y} top={PERIPH_Y} col={LANE_DATA_COL} />
+      <Stub from={blkPins.csel} laneY={LANE_ADDR_Y} top={PERIPH_Y} col={LANE_ADDR_COL} />
+      <Stub from={blkPins.irq} laneY={LANE_IRQ_Y} top={PERIPH_Y} col={LANE_IRQ_COL} />
     </g>
   )
 }
 
-// ── Core chip ─────────────────────────────────────────────────────────────
-function CoreChipSvg({ core, coreX, slot }: { core: CoreState; coreX: number; slot: CoreSlot }) {
+function Stub({
+  col,
+  from,
+  laneY,
+  top,
+}: {
+  col: string
+  from: number
+  laneY: number
+  top: number
+}) {
+  return (
+    <line
+      stroke={col}
+      strokeOpacity="0.6"
+      strokeWidth="0.8"
+      x1={from}
+      x2={from}
+      y1={Math.min(top, laneY)}
+      y2={Math.max(top, laneY)}
+    />
+  )
+}
+
+function CoreSvg({ core, coreX, slot }: { core: CoreState; coreX: number; slot: CoreSlot }) {
   const accent = core.id === 0 ? '#22d3ee' : '#a78bfa'
   const taskLabel = slot.entry === 0x4d00n ? 'task A' : slot.entry === 0x4e00n ? 'task B' : '—'
   const stateLine = core.last_trap ? 'TRAP' : core.halted ? 'HALT' : core.wfi_halted ? 'WFI' : 'RUN'
@@ -286,12 +261,11 @@ function CoreChipSvg({ core, coreX, slot }: { core: CoreState; coreX: number; sl
   const innerT = y + 24
   const regsW = 96
   const rightX = innerL + regsW + 8
-  const rightW = CORE_W - 8 - regsW - 8 - 8
+  const rightW = CORE_W - regsW - 24
   return (
     <g>
-      {/* Chip body */}
       <rect
-        fill="var(--color-bg-tertiary)"
+        fill={BG_TERTIARY}
         height={CORE_H}
         rx="4"
         stroke={accent}
@@ -301,7 +275,6 @@ function CoreChipSvg({ core, coreX, slot }: { core: CoreState; coreX: number; sl
         x={x}
         y={y}
       />
-      {/* Header band */}
       <rect
         fill={`color-mix(in oklab, ${accent} 9%, transparent)`}
         height="18"
@@ -318,133 +291,88 @@ function CoreChipSvg({ core, coreX, slot }: { core: CoreState; coreX: number; sl
         fillOpacity="0.85"
         fontFamily={FONT}
         fontSize="9"
+        textAnchor="end"
         x={x + CORE_W - 8}
         y={y + 13}
-        textAnchor="end"
       >
         EL{core.current_el} · {stateLine}
       </text>
 
-      {/* REGS sub-block (left column, fills available height) */}
-      <SubBlock x={innerL} y={innerT} w={regsW} h={CORE_H - 32} title="REGS">
+      <SubBlock h={CORE_H - 32} title="REGS" w={regsW} x={innerL} y={innerT}>
         <RegsList accent={accent} core={core} x={innerL + 4} y={innerT + 22} />
       </SubBlock>
 
-      {/* Right column: PC, MMU, EXC, DAIF stacked with breathing room */}
-      <SubBlock x={rightX} y={innerT} w={rightW} h={32} title="PC / IR">
-        <text fill="var(--color-fg)" fontFamily={FONT} fontSize="11" x={rightX + 6} y={innerT + 26}>
+      <SubBlock h={32} title="PC / IR" w={rightW} x={rightX} y={innerT}>
+        <text fill={FG} fontFamily={FONT} fontSize="11" x={rightX + 6} y={innerT + 26}>
           {fmtHex32(Number(core.pc))}
         </text>
       </SubBlock>
-      <SubBlock x={rightX} y={innerT + 36} w={rightW} h={38} title="MMU">
-        <text
-          fill="var(--color-fg-secondary)"
-          fontFamily={FONT}
-          fontSize="9"
-          x={rightX + 6}
-          y={innerT + 36 + 22}
-        >
+      <SubBlock h={38} title="MMU" w={rightW} x={rightX} y={innerT + 36}>
+        <text fill={FG_SECONDARY} fontFamily={FONT} fontSize="9" x={rightX + 6} y={innerT + 58}>
           ttbr {fmtHex32(Number(core.ttbr0_el1))}
         </text>
-        <text
-          fill="var(--color-fg-muted)"
-          fontFamily={FONT}
-          fontSize="9"
-          x={rightX + 6}
-          y={innerT + 36 + 33}
-        >
+        <text fill={FG_MUTED} fontFamily={FONT} fontSize="9" x={rightX + 6} y={innerT + 69}>
           tcr {fmtHex32(Number(core.tcr_el1))}
         </text>
       </SubBlock>
-      <SubBlock x={rightX} y={innerT + 78} w={rightW} h={42} title="EXC">
-        <text
-          fill="var(--color-fg-secondary)"
-          fontFamily={FONT}
-          fontSize="9"
-          x={rightX + 6}
-          y={innerT + 78 + 22}
-        >
+      <SubBlock h={42} title="EXC" w={rightW} x={rightX} y={innerT + 78}>
+        <text fill={FG_SECONDARY} fontFamily={FONT} fontSize="9" x={rightX + 6} y={innerT + 100}>
           esr {fmtHex32(Number(core.esr_el1))}
         </text>
-        <text
-          fill="var(--color-fg-muted)"
-          fontFamily={FONT}
-          fontSize="9"
-          x={rightX + 6}
-          y={innerT + 78 + 35}
-        >
+        <text fill={FG_MUTED} fontFamily={FONT} fontSize="9" x={rightX + 6} y={innerT + 113}>
           elr {fmtHex32(Number(core.elr_el1))}
         </text>
       </SubBlock>
-      <SubBlock x={rightX} y={innerT + 124} w={rightW} h={32} title="DAIF">
-        <text
-          fill="var(--color-fg)"
-          fontFamily={FONT}
-          fontSize="9"
-          x={rightX + 6}
-          y={innerT + 124 + 24}
-        >
+      <SubBlock h={32} title="DAIF" w={rightW} x={rightX} y={innerT + 124}>
+        <text fill={FG} fontFamily={FONT} fontSize="9" x={rightX + 6} y={innerT + 148}>
           {core.daif.toString(2).padStart(4, '0')} · {taskLabel}
         </text>
       </SubBlock>
 
-      {/* Bottom-edge pin markers — small coloured studs only, the bus-lane
-          colour identifies what each pin carries so no per-pin text is needed. */}
-      {(['data', 'addr', 'irq', 'ctrl'] as const).map((k) => {
-        const px = corePins(coreX)[k]
-        const col =
-          k === 'data'
-            ? LANE_DATA_COL
-            : k === 'addr'
-              ? LANE_ADDR_COL
-              : k === 'irq'
-                ? LANE_IRQ_COL
-                : LANE_CTRL_COL
-        return (
-          <rect
-            key={k}
-            fill={col}
-            fillOpacity="0.85"
-            height="4"
-            width="8"
-            x={px - 4}
-            y={y + CORE_H - 2}
-          />
-        )
-      })}
+      {(['data', 'addr', 'irq', 'ctrl'] as const).map((k) => (
+        <rect
+          fill={PIN_COL[k]}
+          fillOpacity="0.85"
+          height="4"
+          key={k}
+          width="8"
+          x={corePins(coreX)[k] - 4}
+          y={y + CORE_H - 2}
+        />
+      ))}
     </g>
   )
 }
 
 function SubBlock({
-  x,
-  y,
-  w,
+  children,
   h,
   title,
-  children,
+  w,
+  x,
+  y,
 }: {
-  x: number
-  y: number
-  w: number
+  children?: React.ReactNode
   h: number
   title: string
-  children?: React.ReactNode
+  w: number
+  x: number
+  y: number
 }) {
   return (
     <g>
       <rect
-        fill="var(--color-bg-secondary)"
+        fill={BG_SECONDARY}
         height={h}
         rx="2"
-        stroke="var(--color-border)"
+        stroke={BORDER}
         strokeWidth="0.5"
         width={w}
         x={x}
         y={y}
       />
       <text
-        fill="var(--color-fg-muted)"
+        fill={FG_MUTED}
         fontFamily={FONT}
         fontSize="9"
         fontWeight="600"
@@ -470,8 +398,7 @@ function RegsList({
   x: number
   y: number
 }) {
-  // A useful slice — X0..X3 for arg passing, X9..X10 used by the kernel,
-  // SP and X30 (LR). 8 lines at 9px each with a 13px row pitch.
+  // X0..X3 (arg passing), X9..X10 (kernel), SP, X30 (LR).
   const labels: { label: string; v: bigint }[] = [
     { label: 'x0', v: core.x[0] ?? 0n },
     { label: 'x1', v: core.x[1] ?? 0n },
@@ -486,13 +413,7 @@ function RegsList({
     <g>
       {labels.map((r, i) => (
         <g key={r.label}>
-          <text
-            fill="var(--color-fg-muted)"
-            fontFamily={FONT}
-            fontSize="9"
-            x={x}
-            y={y + i * 13 + 8}
-          >
+          <text fill={FG_MUTED} fontFamily={FONT} fontSize="9" x={x} y={y + i * 13 + 8}>
             {r.label}
           </text>
           <text
@@ -511,26 +432,20 @@ function RegsList({
   )
 }
 
-// ── Peripherals ────────────────────────────────────────────────────────────
-function PeripheralChip({
-  accent,
-  pinLabels,
-  pinXs,
-  bodyLines,
-  title,
-  topX,
-}: {
+interface PeripheralProps {
   accent: string
+  bodyLines: string[]
   pinLabels: string[]
   pinXs: number[]
-  bodyLines: string[]
   title: string
   topX: number
-}) {
+}
+
+function PeripheralChip({ accent, bodyLines, pinLabels, pinXs, title, topX }: PeripheralProps) {
   return (
     <g>
       <rect
-        fill="var(--color-bg-tertiary)"
+        fill={BG_TERTIARY}
         height={PERIPH_H}
         rx="4"
         stroke={accent}
@@ -560,10 +475,10 @@ function PeripheralChip({
       </text>
       {bodyLines.map((ln, i) => (
         <text
-          key={i}
-          fill="var(--color-fg-secondary)"
+          fill={FG_SECONDARY}
           fontFamily={FONT}
           fontSize="9"
+          key={i}
           x={topX + 8}
           y={PERIPH_Y + 32 + i * 12}
         >
@@ -574,7 +489,7 @@ function PeripheralChip({
         <g key={i}>
           <rect fill={accent} fillOpacity="0.7" height="3" width="6" x={px - 3} y={PERIPH_Y - 2} />
           <text
-            fill={LANE_LABEL}
+            fill={FG_MUTED}
             fontFamily={FONT}
             fontSize="9"
             textAnchor="middle"
@@ -589,11 +504,11 @@ function PeripheralChip({
   )
 }
 
-function AicChip({ aic }: { aic: AicState }) {
+function AicSvg({ aic }: { aic: AicState }) {
   const pendingMask = aic.pending.reduce((acc, p) => acc | p, 0)
   return (
     <PeripheralChip
-      accent={ACCENT_AIC}
+      accent={LANE_IRQ_COL}
       bodyLines={[
         `pnd ${pendingMask.toString(16).padStart(2, '0')}`,
         `ack ${aic.total_acks}`,
@@ -607,8 +522,8 @@ function AicChip({ aic }: { aic: AicState }) {
   )
 }
 
-function UartChip({ output }: { output: string }) {
-  // Strip newlines and cap to 8 chars so the line fits inside a 130px chip.
+function UartSvg({ output }: { output: string }) {
+  // Cap to 8 chars so the line fits inside a 130px chip.
   const tail = output.replace(/\n/g, ' ').trimEnd().slice(-8)
   return (
     <PeripheralChip
@@ -622,7 +537,7 @@ function UartChip({ output }: { output: string }) {
   )
 }
 
-function BlockChip({ block }: { block: BlockState }) {
+function BlockSvg({ block }: { block: BlockState }) {
   return (
     <PeripheralChip
       accent={ACCENT_BLK}
@@ -639,7 +554,6 @@ function BlockChip({ block }: { block: BlockState }) {
   )
 }
 
-// ── RAM as 4×3 region grid ────────────────────────────────────────────────
 function RamGrid({ regions }: { regions: readonly { addr: number; label: string }[] }) {
   const cols = 4
   const cellW = (RAM_W - 8) / cols
@@ -647,7 +561,7 @@ function RamGrid({ regions }: { regions: readonly { addr: number; label: string 
   return (
     <g>
       <rect
-        fill="var(--color-bg-tertiary)"
+        fill={BG_TERTIARY}
         height={RAM_H}
         rx="4"
         stroke={LANE_DATA_COL}
@@ -676,12 +590,12 @@ function RamGrid({ regions }: { regions: readonly { addr: number; label: string 
         RAM · 64 KiB · 16-bank grid
       </text>
       <text
-        fill={LANE_LABEL}
+        fill={FG_MUTED}
         fontFamily={FONT}
         fontSize="9"
+        textAnchor="end"
         x={RAM_X + RAM_W - 8}
         y={RAM_Y + 13}
-        textAnchor="end"
       >
         {regions.length} regions
       </text>
@@ -703,7 +617,7 @@ function RamGrid({ regions }: { regions: readonly { addr: number; label: string 
               y={cy}
             />
             <text
-              fill="#60a5fa"
+              fill={LANE_DATA_COL}
               fillOpacity="0.95"
               fontFamily={FONT}
               fontSize="9"
@@ -713,13 +627,7 @@ function RamGrid({ regions }: { regions: readonly { addr: number; label: string 
             >
               0x{r.addr.toString(16).padStart(4, '0').toUpperCase()}
             </text>
-            <text
-              fill="var(--color-fg-secondary)"
-              fontFamily={FONT}
-              fontSize="9"
-              x={cx + 6}
-              y={cy + 28}
-            >
+            <text fill={FG_SECONDARY} fontFamily={FONT} fontSize="9" x={cx + 6} y={cy + 28}>
               {r.label}
             </text>
           </g>

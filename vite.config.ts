@@ -1,28 +1,13 @@
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
-
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
-const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, 'package.json'), 'utf-8'))
-
-const deps = { ...pkg.dependencies, ...pkg.devDependencies }
-
 export default defineConfig(({ command }) => ({
-  // Production builds are served from labs.golia.jp/aarch64; dev runs at the
-  // host root.
+  // Production is served from labs.golia.jp/aarch64; dev runs at the host root.
   base: command === 'build' ? '/aarch64/' : '/',
   plugins: [tailwindcss(), react()],
-  define: {
-    __APP_VERSION__: JSON.stringify(pkg.version),
-    __DEP_VERSIONS__: JSON.stringify(deps),
-  },
-  resolve: {
-    alias: { '@': resolve(import.meta.dirname, 'src') },
-  },
-  // wasm-pack output ships its own .wasm via `new URL(..., import.meta.url)`;
-  // keep it out of the dep optimizer so Vite resolves the URL itself.
+  // wasm-pack ships its own .wasm via `new URL(..., import.meta.url)`; keep
+  // it out of Vite's dep optimiser so Vite resolves the URL itself.
   optimizeDeps: {
     exclude: ['aarch64-sim'],
   },

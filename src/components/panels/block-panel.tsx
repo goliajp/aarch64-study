@@ -1,8 +1,3 @@
-// Block (virtio-blk-shaped) device view. Shows the live MMIO register
-// snapshot — SECTOR / BUF_ADDR / CMD / STATUS — and a 16-byte-per-row
-// hex dump of every sector so the reader can see exactly what the kernel
-// (and task B) reads.
-
 import { Card } from '@goliapkg/gds'
 
 import type { BlockState } from '../../sim/types'
@@ -12,7 +7,6 @@ const SECTOR_SIZE = 64
 
 export function BlockPanel({ block }: { block: BlockState }) {
   const numSectors = Math.floor(block.disk.length / SECTOR_SIZE)
-  const statusLabel = describeStatus(block.status)
   return (
     <Card padding="none">
       <div className="space-y-3 p-4">
@@ -30,7 +24,7 @@ export function BlockPanel({ block }: { block: BlockState }) {
           <RegRow label="CMD" value={block.last_command} />
           <div className="flex justify-between gap-2">
             <span className="text-fg-muted">STATUS</span>
-            <span className="text-fg">{statusLabel}</span>
+            <span className="text-fg">{describeStatus(block.status)}</span>
           </div>
         </div>
         <div className="space-y-2">

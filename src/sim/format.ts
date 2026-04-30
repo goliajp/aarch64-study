@@ -1,20 +1,10 @@
-// Formatting + parsing helpers shared across all panels. Keep them tiny and
-// pure so they're cheap to call from render code.
-
 import type { CoreSlot } from './types'
 
 export const REG_LABELS = Array.from({ length: 31 }, (_, i) => `X${i}`)
-
-/** How many bytes the memory panel keeps in a window. */
 export const MEMORY_VIEW_BYTES = 512
-
-/** How many `cpu.step()` calls a single rAF tick performs in auto-run. */
 export const RUN_BURST = 2
-
-/** AArch64 task entries laid out by the demo kernel. */
 export const TASK_A_ENTRY = 0x4d00
 export const TASK_B_ENTRY = 0x4e00
-
 export const IRQ_NAMES = ['TIMER', 'IPI']
 
 export function fmtHex64(v: bigint): string {
@@ -25,25 +15,18 @@ export function fmtHex32(v: number): string {
   return '0x' + (v >>> 0).toString(16).padStart(8, '0')
 }
 
-/** Parse `0x4000`, `0X4000`, or bare `4000` as a u64. Returns null on
- * empty / malformed input — callers fall back to a safe default. */
+/** Returns null on empty / malformed input so callers can fall back. */
 export function parseHex(text: string): bigint | null {
-  const trimmed = text.trim()
-  if (trimmed === '') return null
+  const t = text.trim()
+  if (t === '') return null
   try {
-    return BigInt(trimmed.startsWith('0x') || trimmed.startsWith('0X') ? trimmed : '0x' + trimmed)
+    return BigInt(t.startsWith('0x') || t.startsWith('0X') ? t : '0x' + t)
   } catch {
     return null
   }
 }
 
-/** Decode the per-core scheduler slot from a 0x100-byte memory window:
- *
- *   +0x00  current task entry (u64)
- *   +0x08  current save-area pointer (u64)
- *   +0x10  save area 0 (X0..X3)
- *   +0x30  save area 1 (X0..X3)
- */
+/** Layout: +0x00 entry · +0x08 save_ptr · +0x10 save 0 (X0..X3) · +0x30 save 1. */
 export function parseCoreSlot(bytes: Uint8Array): CoreSlot {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const u64 = (off: number) => view.getBigUint64(off, true)
@@ -55,7 +38,6 @@ export function parseCoreSlot(bytes: Uint8Array): CoreSlot {
   }
 }
 
-/** Best-effort label for a PC — the task it most likely belongs to. */
 export function inferTaskLabel(pc: bigint): string | null {
   const p = Number(pc)
   if (p >= TASK_A_ENTRY && p < TASK_A_ENTRY + 0x20) return 'task A'

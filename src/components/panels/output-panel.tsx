@@ -1,7 +1,3 @@
-// UART output viewer. Auto-scrolls to the bottom on every refresh so the
-// user always sees the most-recent emit even when the window is one line
-// tall, and grows up to 20em before forcing a scroll bar.
-
 import { Card } from '@goliapkg/gds'
 import { useEffect, useRef } from 'react'
 

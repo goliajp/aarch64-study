@@ -5,9 +5,7 @@
 
 @source '../node_modules/@goliapkg/gds/dist/**/*.js';
 
-/* Wire the Tailwind `dark:` variant to the GDS theme switch — the theme
- * system sets `data-theme="dark"` on <html>; without this, dark: utilities
- * never fire and light-mode users see white-on-white text. */
+/* Wire the Tailwind dark: variant to the GDS data-theme switch. */
 @custom-variant dark ([data-theme='dark'] &);
 
 html,
@@ -17,7 +15,18 @@ body,
   margin: 0;
 }
 
-/* Roboto Flex for general UI text (labels, buttons, prose). */
+#root {
+  position: relative;
+}
+
+body {
+  color: var(--color-fg);
+  background-color: var(--color-bg);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
 body,
 button,
 input,
@@ -35,29 +44,16 @@ textarea {
   font-variant-numeric: tabular-nums;
 }
 
-/* Roboto Mono for any hex / register / disassembly column that needs
- * column-aligned letters (a-f) on top of digits. Apply with `font-mono`
- * (Tailwind) or the `.mono-data` helper. */
+/* Monospace for hex / register / disassembly columns. */
 pre,
 code,
 .mono-data,
 .font-mono {
-  font-family: 'Roboto Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-family: 'Roboto Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-variant-numeric: tabular-nums;
 }
 
-body {
-  color: var(--color-fg);
-  background-color: var(--color-bg);
-  font-size: 13px;
-  line-height: 1.45;
-  -webkit-font-smoothing: antialiased;
-}
-
-/* App-wide type scale: only two sizes are allowed.
- *   .type-base — 13px, used for body / table / data rows
- *   .type-small — 11px, used for labels / metadata / inline annotations
- * Combined with Roboto Flex's tabular-nums, hex columns still align. */
+/* Two type sizes: 13 (data rows) and 11 (metadata). */
 .type-base {
   font-size: 13px;
   line-height: 1.45;
@@ -68,55 +64,8 @@ body {
   letter-spacing: 0.01em;
 }
 
-#root {
-  position: relative;
-}
-
-.glow-card {
-  transition: box-shadow 0.2s;
-}
-.glow-card:hover {
-  box-shadow:
-    0 0 20px rgb(59 130 246 / 0.15),
-    0 0 40px rgb(59 130 246 / 0.05);
-}
-
-/* Event-driven flow animation: a packet travels along its path within
- * its assigned animation duration, then fades out. The component sets
- * --packet-from-x/y / --packet-to-x/y as CSS variables.
- */
-@keyframes packet-fly {
-  0% {
-    transform: translate(var(--packet-from-x, 0), var(--packet-from-y, 0));
-    opacity: 0;
-  }
-  15% {
-    opacity: 1;
-  }
-  85% {
-    opacity: 1;
-  }
-  100% {
-    transform: translate(var(--packet-to-x, 0), var(--packet-to-y, 0));
-    opacity: 0;
-  }
-}
-
-@keyframes packet-flash {
-  0%,
-  100% {
-    opacity: 0;
-  }
-  20%,
-  60% {
-    opacity: 1;
-  }
-}
-
-/* Liveness signal — used on the RUNNING badge dot and on the PC marker in
- * the disassembly. Slow gentle breath; only applied while the simulator is
- * actually running, so it depicts real state.
- */
+/* Slow breath — the only animation, used for "alive" signals (RUNNING dot,
+ * active PC marker). Tied to real state, never decorative. */
 @keyframes gentle-pulse {
   0%,
   100% {
@@ -128,21 +77,4 @@ body {
 }
 .live-pulse {
   animation: gentle-pulse 1.6s ease-in-out infinite;
-}
-
-/* Chip-flash — soft, low-opacity white wash over a chip body that fades out
- * over ~800ms. Applied to source/target chips of a SimEvent so the eye
- * follows traffic across the SoC without the harsh "flying dot" look.
- */
-@keyframes chip-flash {
-  0% {
-    background-color: rgb(255 255 255 / 0.14);
-  }
-  100% {
-    background-color: rgb(255 255 255 / 0);
-  }
-}
-.chip-flash {
-  animation: chip-flash 800ms ease-out forwards;
-  border-radius: 6px;
 }

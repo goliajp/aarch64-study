@@ -1,26 +1,21 @@
-// Live disassembly window around core 0's PC. The current PC of each
-// core is highlighted with a coloured row + a `►0` / `►1` marker (with a
-// gentle pulse so motion catches the eye); other rows render in muted
-// colour. Snapped to a 32-byte boundary so the listing doesn't jitter
-// instruction-by-instruction.
-
 import { Card } from '@goliapkg/gds'
 import { type Cpu, disassemble } from 'aarch64-sim'
 
 import { fmtHex32 } from '../../sim/format'
 import type { CoreState } from '../../sim/types'
 
-interface DisassemblyPanelProps {
+const WINDOW_INSTS = 36
+const PRE_INSTS = 16
+
+interface Props {
   cpu: Cpu
   cores: CoreState[]
 }
 
-const WINDOW_INSTS = 36
-const PRE_INSTS = 16
-
-export function DisassemblyPanel({ cpu, cores }: DisassemblyPanelProps) {
+export function DisassemblyPanel({ cpu, cores }: Props) {
   const pc0 = Number(cores[0].pc)
   const pc1 = Number(cores[1].pc)
+  // Snap the window to a 32-byte boundary so the listing doesn't jitter line-by-line.
   const center = pc0 & ~0x1f
   const start = Math.max(0x4000, center - PRE_INSTS * 4)
   const end = Math.min(0x10000, start + WINDOW_INSTS * 4)

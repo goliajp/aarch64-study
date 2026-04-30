@@ -1,9 +1,3 @@
-// Top-of-page control row. Three primary buttons (Step both / Run /
-// Reset) sit on the first line; below them, a Card hosts the editable
-// disk-sector textarea on the left and a 12-tile system-info grid on
-// the right (system steps, retired, timer period, next IRQ, timer
-// ticks, AIC acks / pending, UART bytes, BLK reads, per-core PC, EL).
-
 import { Button, Card } from '@goliapkg/gds'
 import { type Cpu } from 'aarch64-sim'
 import { useMemo } from 'react'
@@ -11,7 +5,7 @@ import { useMemo } from 'react'
 import { fmtHex32 } from '../sim/format'
 import type { AicState, BlockState, CoreState, SystemInfo } from '../sim/types'
 
-interface ControlBarProps {
+interface Props {
   aic: AicState
   block: BlockState
   cores: CoreState[]
@@ -39,7 +33,7 @@ export function ControlBar({
   sysInfo,
   totalCoreSteps,
   uartBytes,
-}: ControlBarProps) {
+}: Props) {
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
@@ -55,8 +49,8 @@ export function ControlBar({
       </div>
       <Card padding="none">
         <div className="grid grid-cols-1 gap-3 p-3 lg:grid-cols-2">
-          <ControlBarDisk block={block} cpu={cpu} onRefresh={onRefresh} />
-          <SystemInfoStrip
+          <DiskEditor block={block} cpu={cpu} onRefresh={onRefresh} />
+          <Stats
             aic={aic}
             block={block}
             cores={cores}
@@ -70,7 +64,7 @@ export function ControlBar({
   )
 }
 
-interface SystemInfoStripProps {
+interface StatsProps {
   aic: AicState
   block: BlockState
   cores: CoreState[]
@@ -79,14 +73,7 @@ interface SystemInfoStripProps {
   uartBytes: number
 }
 
-function SystemInfoStrip({
-  aic,
-  block,
-  cores,
-  info,
-  totalCoreSteps,
-  uartBytes,
-}: SystemInfoStripProps) {
+function Stats({ aic, block, cores, info, totalCoreSteps, uartBytes }: StatsProps) {
   const aicPending = aic.pending.reduce((a, b) => a | b, 0)
   const stats: { label: string; value: string; emphasize?: boolean }[] = [
     { label: 'system steps', value: info.systemSteps.toString() },
@@ -129,7 +116,7 @@ function Stat({ emphasize, label, value }: { emphasize?: boolean; label: string;
   )
 }
 
-function ControlBarDisk({
+function DiskEditor({
   block,
   cpu,
   onRefresh,

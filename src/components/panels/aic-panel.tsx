@@ -1,7 +1,3 @@
-// Apple-style interrupt controller — shows the pending mask for each
-// core. Each IRQ name (TIMER / IPI) lights up amber when its bit is set,
-// and `0x00000000` is rendered as a hex word for completeness.
-
 import { Card } from '@goliapkg/gds'
 
 import { IRQ_NAMES } from '../../sim/format'

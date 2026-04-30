@@ -1,9 +1,3 @@
-// Per-core monitor: header badges (CoreChip / DaifChip / current task /
-// WFI / TRAP / HALTED), then a Registers grid (X0..X30 + SP + PC), then
-// an Exception state grid (VBAR / ELR / SPSR / ESR for both EL1 and
-// EL2). The whole column is wrapped in a single Card so it reads as one
-// unit; sub-sections use a softer secondary background to show nesting.
-
 import { Badge, Card, GlassButton } from '@goliapkg/gds'
 
 import { REG_LABELS, fmtHex32, fmtHex64, inferTaskLabel } from '../../sim/format'
@@ -11,12 +5,12 @@ import type { CoreState } from '../../sim/types'
 import { CoreChip, DaifChip } from '../badges'
 import { RegRow } from '../reg-row'
 
-interface CoreColumnProps {
+interface Props {
   core: CoreState
   onStep: () => void
 }
 
-export function CoreColumn({ core, onStep }: CoreColumnProps) {
+export function CoreMonitor({ core, onStep }: Props) {
   const taskLabel = inferTaskLabel(core.pc)
   return (
     <Card padding="none">
