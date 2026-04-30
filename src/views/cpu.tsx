@@ -266,7 +266,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.13</Badge>
+          <Badge color="info">v0.14</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -277,10 +277,11 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          Task A now uses <code>WFI</code> after each print: print 'A' once, then sleep until the
-          next IRQ. The core running A is mostly asleep (look for the "WFI · sleeping" badge); the
-          core running task B (disk printer) stays busy. Each timer tick swaps both cores — the busy
-          one parks itself, the parked one starts streaming.
+          AP-bit enforcement now active. Page descriptors mark AIC, Block, and the page-table pages
+          themselves as <strong>kernel-only</strong> (AP=00); UART, program code, and the disk
+          buffer are user-accessible (AP=01). At EL0 a translation that lands on a kernel-only page
+          faults instead of returning a PA. Use the MMU panel below to query 0x2000 vs 0x1000 from
+          each core (cores running tasks are at EL0).
         </p>
       </header>
 

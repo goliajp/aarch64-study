@@ -518,7 +518,26 @@ impl Core {
             return Ok(va);
         }
         let r = self.do_translate(mem, va);
-        r.pa.ok_or_else(|| r.fault.unwrap_or_else(|| "MMU fault".into()))
+        let pa = r.pa.ok_or_else(|| r.fault.clone().unwrap_or_else(|| "MMU fault".into()))?;
+
+        // AP-bit enforcement: at EL0, the leaf descriptor's AP[0] must be set
+        // (user-accessible). AP=00 / AP=10 are kernel-only and fault for EL0.
+        // Higher ELs are unrestricted in this toy.
+        if self.current_el == 0 {
+            let ap = match r.steps.last().map(|s| &s.outcome) {
+                Some(WalkOutcome::Page { attrs, .. }) | Some(WalkOutcome::Block { attrs, .. }) => {
+                    attrs.ap
+                }
+                _ => return Ok(pa),
+            };
+            if ap & 1 == 0 {
+                return Err(format!(
+                    "permission fault at VA {:#x} (AP={:#04b}, EL0)",
+                    va, ap
+                ));
+            }
+        }
+        Ok(pa)
     }
 
     fn fetch_u32(&self, mem: &[u8], va: u64) -> Result<u32, String> {
@@ -561,7 +580,29 @@ impl Core {
         write_pa_u64(mem, pa, val)
     }
 
+    /// Public translation entry: walk + AP-bit enforcement based on this core's
+    /// current_el. translate_for_access (instruction path) and the JS-callable
+    /// translate() both go through here.
     fn do_translate(&self, mem: &[u8], va: u64) -> TranslationResult {
+        let mut r = self.do_translate_walk(mem, va);
+        if r.pa.is_some() && self.current_el == 0 {
+            let ap = match r.steps.last().map(|s| &s.outcome) {
+                Some(WalkOutcome::Page { attrs, .. })
+                | Some(WalkOutcome::Block { attrs, .. }) => attrs.ap,
+                _ => return r,
+            };
+            if ap & 1 == 0 {
+                r.fault = Some(format!(
+                    "permission fault at VA {:#x} (AP={:#04b}, EL0)",
+                    va, ap
+                ));
+                r.pa = None;
+            }
+        }
+        r
+    }
+
+    fn do_translate_walk(&self, mem: &[u8], va: u64) -> TranslationResult {
         let mmu_enabled = self.sctlr_el1 & 1 != 0;
         let t0sz = self.tcr_el1 & 0x3F;
         if t0sz == 0 || self.ttbr0_el1 == 0 {
@@ -1469,23 +1510,22 @@ fn load_demo(mem: &mut [u8]) {
 fn setup_demo_pgtable(mem: &mut [u8]) {
     write_u64(mem, L1_TABLE_PA, L2_TABLE_PA | 0b11);
     write_u64(mem, L2_TABLE_PA, L3_TABLE_PA | 0b11);
-    let page_attr = (1u64 << 10) | 0b11;
-    // VA 0x1000 → PA 0x1000 (UART)
-    write_u64(mem, L3_TABLE_PA + 8, 0x1000 | page_attr);
-    // VA 0x2000 → PA 0x2000 (AIC MMIO)
-    write_u64(mem, L3_TABLE_PA + 2 * 8, 0x2000 | page_attr);
-    // VA 0x3000 → PA 0x3000 (block-device MMIO)
-    write_u64(mem, L3_TABLE_PA + 3 * 8, 0x3000 | page_attr);
-    // VA 0x4000 → PA 0x4000 (program page)
-    write_u64(mem, L3_TABLE_PA + 4 * 8, 0x4000 | page_attr);
-    // VA 0x5000 → PA 0x5000 (core 1's per-core scheduler slot region)
-    write_u64(mem, L3_TABLE_PA + 5 * 8, 0x5000 | page_attr);
-    // VA 0x6000 → PA 0x6000 (disk buffer page)
-    write_u64(mem, L3_TABLE_PA + 6 * 8, 0x6000 | page_attr);
-    // page tables themselves
-    write_u64(mem, L3_TABLE_PA + 8 * 8, 0x8000 | page_attr);
-    write_u64(mem, L3_TABLE_PA + 9 * 8, 0x9000 | page_attr);
-    write_u64(mem, L3_TABLE_PA + 0xA * 8, 0xA000 | page_attr);
+    // AF=1, valid+page (b11). AP at bits [7:6]:
+    //   AP=00 → kernel R/W, EL0 no access.
+    //   AP=01 → kernel R/W, EL0 R/W.
+    let kern = (1u64 << 10) | 0b11; // AP=00, kernel-only
+    let user = (1u64 << 10) | (0b01 << 6) | 0b11; // AP=01, user-accessible
+    // User-accessible pages — tasks fetch / load / store from these.
+    write_u64(mem, L3_TABLE_PA + 8, 0x1000 | user); // UART
+    write_u64(mem, L3_TABLE_PA + 4 * 8, 0x4000 | user); // program/code
+    write_u64(mem, L3_TABLE_PA + 6 * 8, 0x6000 | user); // disk buffer (task B)
+    // Kernel-only pages — only EL1 (kernel handlers) can touch these.
+    write_u64(mem, L3_TABLE_PA + 2 * 8, 0x2000 | kern); // AIC MMIO
+    write_u64(mem, L3_TABLE_PA + 3 * 8, 0x3000 | kern); // Block MMIO
+    write_u64(mem, L3_TABLE_PA + 5 * 8, 0x5000 | kern); // core 1 slot region
+    write_u64(mem, L3_TABLE_PA + 8 * 8, 0x8000 | kern); // L1 table page
+    write_u64(mem, L3_TABLE_PA + 9 * 8, 0x9000 | kern); // L2 table page
+    write_u64(mem, L3_TABLE_PA + 0xA * 8, 0xA000 | kern); // L3 table page
 }
 
 // === Instruction encoders =====================================================
@@ -1728,6 +1768,32 @@ mod tests {
         cpu.run(30);
         assert_eq!(cpu.cores[0].current_el, 0);
         assert_eq!(cpu.cores[0].daif, 0);
+    }
+
+    #[test]
+    fn ap_bits_block_user_access_to_kernel_pages() {
+        let mut cpu = Cpu::new();
+        // Boot through kernel so MMU is active and at EL0/EL1 for both cores.
+        cpu.run(40);
+        // Core 0 is at EL0 (running task A). Translation of UART (user) should
+        // succeed.
+        let r_user = cpu.cores[0].do_translate(&cpu.mem, 0x1000);
+        assert_eq!(r_user.pa, Some(0x1000));
+        // Translation of AIC at EL0 should fail with permission fault when
+        // checked through translate_for_access.
+        let res = cpu.cores[0].translate_for_access(&cpu.mem, 0x2000);
+        assert!(res.is_err(), "EL0 access to AIC should fault: {:?}", res);
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("permission fault"),
+            "expected permission fault, got: {}",
+            err
+        );
+
+        // Force core 0 into EL1 — kernel can access AIC freely.
+        cpu.cores[0].current_el = 1;
+        let res = cpu.cores[0].translate_for_access(&cpu.mem, 0x2000);
+        assert_eq!(res, Ok(0x2000));
     }
 
     #[test]
