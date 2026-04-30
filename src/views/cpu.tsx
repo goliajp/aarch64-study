@@ -3,151 +3,31 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import init, { Cpu, disassemble } from 'aarch64-sim'
 
-interface CoreState {
-  id: number
-  kind: string
-  mpidr: bigint
-  x: bigint[]
-  sp: bigint
-  pc: bigint
-  nzcv: number
-  halted: boolean
-  last_trap: string | null
-  steps: bigint
-  current_el: number
-  daif: number
-  wfi_halted: boolean
-  ttbr0_el1: bigint
-  tcr_el1: bigint
-  sctlr_el1: bigint
-  vbar_el1: bigint
-  elr_el1: bigint
-  spsr_el1: bigint
-  esr_el1: bigint
-  vbar_el2: bigint
-  elr_el2: bigint
-  spsr_el2: bigint
-  esr_el2: bigint
-}
-
-interface AicState {
-  pending: number[]
-  total_acks: bigint
-}
-
-type SimEventKind = 'store' | 'timer' | 'disk_read' | 'irq_taken' | 'svc' | 'eret'
-
-interface SimEvent {
-  id: number
-  kind: SimEventKind
-  source: NodeId
-  target: NodeId
-  ts: number
-}
-
-type NodeId = 'core0' | 'core1' | 'aic' | 'uart' | 'block' | 'ram'
-
-interface PrevSnapshot {
-  cores: { pc: bigint; current_el: number; wfi_halted: boolean }[]
-  outputLen: number
-  ticks: bigint
-  totalReads: bigint
-}
-
-interface BlockState {
-  sector: bigint
-  buf_addr: bigint
-  last_command: bigint
-  status: bigint
-  total_reads: bigint
-  total_writes: bigint
-  disk: number[]
-}
-
-interface TaskSave {
-  x0: bigint
-  x1: bigint
-  x2: bigint
-  x3: bigint
-}
-
-interface SystemInfo {
-  systemSteps: bigint
-  timerPeriod: bigint
-  timerRemaining: bigint
-  timerTicks: bigint
-}
-
-interface PageAttrs {
-  af: boolean
-  ap: number
-  attr_idx: number
-  sh: number
-}
-
-type WalkOutcome =
-  | { kind: 'Table'; next_table: bigint }
-  | { kind: 'Page'; pa: bigint; attrs: PageAttrs }
-  | { kind: 'Block'; pa: bigint; attrs: PageAttrs; span: bigint }
-  | { kind: 'Invalid' }
-  | { kind: 'Fault'; reason: string }
-
-interface WalkStep {
-  level: number
-  table_addr: bigint
-  index: number
-  entry_addr: bigint
-  descriptor: bigint
-  outcome: WalkOutcome
-}
-
-interface TranslationResult {
-  va: bigint
-  steps: WalkStep[]
-  pa: bigint | null
-  fault: string | null
-  mmu_enabled: boolean
-}
-
-const REG_LABELS = Array.from({ length: 31 }, (_, i) => `X${i}`)
-const MEMORY_VIEW_BYTES = 512
-const RUN_BURST = 2
-
-function fmtHex64(v: bigint): string {
-  return '0x' + v.toString(16).padStart(16, '0')
-}
-
-function fmtHex32(v: number): string {
-  return '0x' + (v >>> 0).toString(16).padStart(8, '0')
-}
-
-interface CoreSlot {
-  entry: bigint
-  savePtr: bigint
-  save0: TaskSave
-  save1: TaskSave
-}
-
-function parseCoreSlot(bytes: Uint8Array): CoreSlot {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  const u64 = (off: number) => view.getBigUint64(off, true)
-  return {
-    entry: u64(0),
-    savePtr: u64(8),
-    save0: { x0: u64(0x10), x1: u64(0x18), x2: u64(0x20), x3: u64(0x28) },
-    save1: { x0: u64(0x30), x1: u64(0x38), x2: u64(0x40), x3: u64(0x48) },
-  }
-}
-
-function parseHex(text: string): bigint | null {
-  const trimmed = text.trim()
-  if (trimmed === '') return null
-  try {
-    return BigInt(trimmed.startsWith('0x') || trimmed.startsWith('0X') ? trimmed : '0x' + trimmed)
-  } catch {
-    return null
-  }
-}
+import {
+  IRQ_NAMES,
+  MEMORY_VIEW_BYTES,
+  REG_LABELS,
+  RUN_BURST,
+  fmtHex32,
+  fmtHex64,
+  inferTaskLabel,
+  parseCoreSlot,
+  parseHex,
+} from '../sim/format'
+import type {
+  AicState,
+  BlockState,
+  CoreSlot,
+  CoreState,
+  NodeId,
+  PrevSnapshot,
+  SimEvent,
+  SystemInfo,
+  TaskSave,
+  TranslationResult,
+  WalkOutcome,
+  WalkStep,
+} from '../sim/types'
 
 export function CpuView() {
   const [cpu, setCpu] = useState<Cpu | null>(null)
@@ -504,20 +384,6 @@ export function CpuView() {
       </div>
     </div>
   )
-}
-
-const IRQ_NAMES = ['TIMER', 'IPI']
-const TASK_A_ENTRY = 0x4d00
-const TASK_B_ENTRY = 0x4e00
-
-function inferTaskLabel(pc: bigint): string | null {
-  const p = Number(pc)
-  if (p >= TASK_A_ENTRY && p < TASK_A_ENTRY + 0x20) return 'task A'
-  if (p >= TASK_B_ENTRY && p < TASK_B_ENTRY + 0x20) return 'task B'
-  if (p >= 0x4880 && p < 0x4900) return 'IRQ handler (sched)'
-  if (p >= 0x4800 && p < 0x4880) return 'sync handler'
-  if (p >= 0x4000 && p < 0x4400) return 'kernel boot'
-  return null
 }
 
 const SECTOR_SIZE = 64
