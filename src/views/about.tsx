@@ -17,7 +17,8 @@ v0.14  + AP-bit enforcement — kernel pages reject EL0 access
 v0.15  + disassembler, core monitors, editable disk text
 v0.16  + UI overhaul: pin-out SoC schematic, theme tokens, scheduler pinning
 v0.17  + atomic LDXR / STXR / CLREX + cross-core exclusive monitor
-v0.18  + IPI between cores via AIC software-IRQ + SVC-mediated dispatch  ← here
+v0.18  + IPI between cores via AIC software-IRQ + SVC-mediated dispatch
+v0.19  + crate is publishable: pure-Rust API + CLI + WASM behind features  ← here
 v1.0   + bare-metal port via m1n1 (same Rust crate runs on real Apple Silicon)`
 
 const LAYOUT = `aarch64-study/

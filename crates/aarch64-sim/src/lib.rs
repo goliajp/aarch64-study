@@ -9,15 +9,12 @@
 //!        Per-core register file, EL state, and sysregs (incl. MPIDR_EL1).
 
 use serde::Serialize;
-use serde_wasm_bindgen::Serializer;
-use wasm_bindgen::prelude::*;
 
-/// Build a JsValue from any serde value, keeping u64/i64/u128/i128 as JS BigInt
-/// rather than the lossy Number default serde-wasm-bindgen ships.
-fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
-    let serializer = Serializer::new().serialize_large_number_types_as_bigints(true);
-    value.serialize(&serializer).map_err(|e| JsValue::from_str(&e.to_string()))
-}
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::wasm_bindgen;
+
+#[cfg(feature = "wasm")]
+mod wasm;
 
 const MEM_SIZE: usize = 0x10000;
 const UART_OUT: u64 = 0x1000;
@@ -1151,7 +1148,7 @@ impl Core {
 
 // === Cpu: the system shell — N cores + shared memory + UART buffer ============
 
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Cpu {
     cores: Vec<Core>,
     mem: Vec<u8>,
@@ -1166,9 +1163,7 @@ pub struct Cpu {
     timer_ticks: u64,
 }
 
-#[wasm_bindgen]
 impl Cpu {
-    #[wasm_bindgen(constructor)]
     pub fn new() -> Cpu {
         let cores = (0..NUM_CORES as u8)
             .map(|i| Core::new(i, MPIDR_VALUES[i as usize]))
@@ -1311,12 +1306,12 @@ impl Cpu {
         self.timer_ticks
     }
 
-    pub fn aic_state(&self) -> Result<JsValue, JsValue> {
-        to_js(&self.aic.snapshot())
+    pub fn aic_state(&self) -> AicState {
+        self.aic.snapshot()
     }
 
-    pub fn block_state(&self) -> Result<JsValue, JsValue> {
-        to_js(&self.block.snapshot())
+    pub fn block_state(&self) -> BlockState {
+        self.block.snapshot()
     }
 
     /// Replace disk sector 0 with the given UTF-8 text (padded with zeros to
@@ -1343,10 +1338,9 @@ impl Cpu {
         String::from_utf8_lossy(&self.block.disk[..end]).into_owned()
     }
 
-    /// Returns an array of CoreState (one per core) as a JS Array.
-    pub fn state(&self) -> Result<JsValue, JsValue> {
-        let states: Vec<CoreState> = self.cores.iter().map(|c| c.snapshot()).collect();
-        to_js(&states)
+    /// Returns one CoreState per core.
+    pub fn state(&self) -> Vec<CoreState> {
+        self.cores.iter().map(|c| c.snapshot()).collect()
     }
 
     pub fn mem_slice(&self, start: u32, len: u32) -> Vec<u8> {
@@ -1360,12 +1354,11 @@ impl Cpu {
     }
 
     /// Walk page tables for `va` using the sysregs of `core_idx`.
-    pub fn translate(&self, va: u64, core_idx: u32) -> Result<JsValue, JsValue> {
-        let core = self
-            .cores
+    /// Returns `None` if `core_idx` is out of range.
+    pub fn translate(&self, va: u64, core_idx: u32) -> Option<TranslationResult> {
+        self.cores
             .get(core_idx as usize)
-            .ok_or_else(|| JsValue::from_str("invalid core index"))?;
-        to_js(&core.do_translate(&self.mem, va))
+            .map(|c| c.do_translate(&self.mem, va))
     }
 
     pub fn entry_pc(&self) -> u64 {
@@ -1468,7 +1461,6 @@ fn unsupported_sysreg(op: &str, sr: (u32, u32, u32, u32, u32), pc: u64) -> Strin
 // Mirrors the decoder in Core::execute, producing ARM-style mnemonics. Used
 // by the JS UI to render a Disassembly panel; not used by execution itself.
 
-#[wasm_bindgen]
 pub fn disassemble(insn: u32, pc: u64) -> String {
     // MOVZ Xd, #imm16 {, LSL #hw*16}
     if insn & 0xFF80_0000 == 0xD280_0000 {

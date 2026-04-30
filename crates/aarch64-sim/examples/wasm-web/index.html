@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>aarch64-sim · minimal WASM demo</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 720px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        color: #1a1a1a;
+      }
+      pre {
+        background: #f5f5f5;
+        padding: 1rem;
+        border-radius: 4px;
+        overflow-x: auto;
+        white-space: pre-wrap;
+      }
+      button {
+        font-size: 0.95rem;
+        padding: 0.4rem 0.9rem;
+        margin-right: 0.5rem;
+      }
+      .row {
+        display: flex;
+        gap: 0.5rem;
+        margin: 0.5rem 0 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>aarch64-sim · minimal WASM demo</h1>
+    <p>
+      Boots the simulator in this page, runs <code>N</code> steps, and prints a
+      snapshot. Same Rust crate the larger
+      <a href="https://labs.golia.jp/aarch64/">aarch64-study</a> UI uses, just
+      without React. Open the browser console to see the raw <code>state()</code>
+      array.
+    </p>
+
+    <div class="row">
+      <button id="step1">Step ×1</button>
+      <button id="step100">Step ×100</button>
+      <button id="run4000">Run 4000</button>
+      <button id="reset">Reset</button>
+    </div>
+
+    <pre id="snap">loading WASM…</pre>
+
+    <h2>How to serve</h2>
+    <p>
+      The page imports <code>../../pkg/aarch64_sim.js</code> directly, so you
+      need to build the WASM first and serve the crate root over HTTP:
+    </p>
+    <pre>
+# from crates/aarch64-sim/
+wasm-pack build --target web --out-dir pkg --release -- --features wasm
+python3 -m http.server 8080
+# then open http://localhost:8080/examples/wasm-web/</pre>
+
+    <script type="module">
+      // Adjust this path if you moved pkg/ elsewhere.
+      import init, { Cpu } from '../../pkg/aarch64_sim.js'
+
+      const snap = document.getElementById('snap')
+
+      async function boot() {
+        await init()
+        const cpu = new Cpu()
+        return cpu
+      }
+
+      function render(cpu) {
+        const cores = cpu.state()
+        const aic = cpu.aic_state()
+        const block = cpu.block_state()
+        const out = cpu.output()
+        const lines = [
+          `system steps:  ${cpu.system_steps()}`,
+          `timer ticks:   ${cpu.timer_ticks()}`,
+          `atomic ctr:    ${cpu.atomic_counter()}`,
+          `AIC acks:      ${aic.total_acks}`,
+          `IPIs sent:     ${aic.total_ipis}`,
+          `block reads:   ${block.total_reads}`,
+          `UART output:   ${JSON.stringify(out)}`,
+          ``,
+          ...cores.map(
+            (c) =>
+              `core ${c.id} ${c.kind}  pc=0x${c.pc.toString(16).padStart(8, '0')}  el=${c.current_el}  halted=${c.halted}  wfi=${c.wfi_halted}`,
+          ),
+        ]
+        snap.textContent = lines.join('\n')
+        console.log('cores:', cores)
+      }
+
+      const cpuPromise = boot()
+      cpuPromise.then(render)
+
+      document.getElementById('step1').onclick = async () => {
+        const cpu = await cpuPromise
+        cpu.step()
+        render(cpu)
+      }
+      document.getElementById('step100').onclick = async () => {
+        const cpu = await cpuPromise
+        for (let i = 0; i < 100; i++) cpu.step()
+        render(cpu)
+      }
+      document.getElementById('run4000').onclick = async () => {
+        const cpu = await cpuPromise
+        cpu.run(4000)
+        render(cpu)
+      }
+      document.getElementById('reset').onclick = async () => {
+        const cpu = await cpuPromise
+        cpu.reset()
+        render(cpu)
+      }
+    </script>
+  </body>
+</html>

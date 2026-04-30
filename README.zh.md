@@ -59,6 +59,7 @@ bun run dev            # vite dev server，端口 32030
 | v0.16 | UI 大改：pin-out SoC 图、主题 token、scheduler 固定每核任务                   |
 | v0.17 | LDXR / STXR / CLREX + 跨核排他监视器（真正的并发原语）                       |
 | v0.18 | 跨核 IPI——SVC 触发，AIC 软件 IRQ 派发                                        |
+| v0.19 | crate 准备好可发布：纯 Rust API + `cli` 和 `wasm` 两个 feature              |
 | v1.0  | 通过 m1n1 跑到真机——同一份 Rust crate 在 Apple Silicon 上裸跑                 |
 
 ## 项目结构

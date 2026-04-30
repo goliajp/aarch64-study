@@ -5,10 +5,6 @@ export class Cpu {
     free(): void;
     [Symbol.dispose](): void;
     aic_state(): any;
-    /**
-     * Reads the shared u64 atomic counter at PA 0x6FF8 — task A's LDXR/STXR
-     * loop bumps it once per scheduling round.
-     */
     atomic_counter(): bigint;
     block_state(): any;
     disk_text(): string;
@@ -20,41 +16,22 @@ export class Cpu {
     output(): string;
     reset(): void;
     run(max: number): number;
-    /**
-     * Replace disk sector 0 with the given UTF-8 text (padded with zeros to
-     * SECTOR_SIZE bytes). Also patches the live disk-buffer page at PA 0x6000
-     * so task B's printer reflects the change without a reset.
-     */
     set_disk_text(text: string): void;
-    /**
-     * Returns an array of CoreState (one per core) as a JS Array.
-     */
     state(): any;
-    /**
-     * Step every core once. On the way in: bump system_steps; if the timer
-     * is due, broadcast IRQ_TIMER to all cores via AIC. Each core then either
-     * takes a pending IRQ (when DAIF.I is clear) or executes one instruction.
-     */
     step(): boolean;
-    /**
-     * Step a single core. Honours pending IRQs on that core (set either by
-     * the system timer in `step()` or by another core via IPI MMIO).
-     */
     step_core(idx: number): boolean;
     system_steps(): bigint;
     timer_period(): bigint;
-    /**
-     * System steps until the next timer IRQ fires (0 if it's due now).
-     */
     timer_remaining(): bigint;
     timer_ticks(): bigint;
-    /**
-     * Walk page tables for `va` using the sysregs of `core_idx`.
-     */
     translate(va: bigint, core_idx: number): any;
     uart_addr(): bigint;
 }
 
+/**
+ * Disassemble a single 32-bit AArch64 instruction. Mirrors the in-crate
+ * decoder; useful for the UI's instruction listing.
+ */
 export function disassemble(insn: number, pc: bigint): string;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -67,7 +44,7 @@ export interface InitOutput {
     readonly cpu_block_state: (a: number) => [number, number, number];
     readonly cpu_disk_text: (a: number) => [number, number];
     readonly cpu_mem_slice: (a: number, b: number, c: number) => [number, number];
-    readonly cpu_new: () => number;
+    readonly cpu_new_wasm: () => number;
     readonly cpu_num_cores: (a: number) => number;
     readonly cpu_output: (a: number) => [number, number];
     readonly cpu_reset: (a: number) => void;

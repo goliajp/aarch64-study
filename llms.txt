@@ -17,7 +17,14 @@ License: MIT
 ## Source layout
 
 - `crates/aarch64-sim/src/lib.rs` — entire CPU + MMU + AIC + Block + demo
-  program + tests in one Rust file. Exposed to JS via wasm-bindgen.
+  program + tests in one Rust file. Pure-Rust API.
+- `crates/aarch64-sim/src/wasm.rs` — `#[wasm_bindgen]` wrappers, gated by
+  `feature = "wasm"`; the JS surface (`cpu.step()`, `cpu.state()`, …) lives
+  here.
+- `crates/aarch64-sim/src/bin/cli.rs` — `aarch64-sim` CLI (clap derive),
+  gated by `feature = "cli"`. Subcommands: `run`, `disasm`, `mem`.
+- `crates/aarch64-sim/examples/` — pure-Rust embed (`run.rs`,
+  `disassemble.rs`) and a single-page WASM demo (`wasm-web/`).
 - `src/views/cpu.tsx` — top-level page. Boots the simulator, runs the
   refresh loop, drives auto-run, composes panels.
 - `src/components/system-diagram.tsx` — SoC pin-out SVG schematic.
@@ -38,10 +45,17 @@ bun run test:sim       # cargo test (24 tests)
 bun run check          # tsc + eslint + prettier
 bun run build          # production bundle into ./dist
 bun run deploy         # build + rsync dist/ to the production target
+
+# crate-side
+cargo build -p aarch64-sim                   # pure-Rust lib
+cargo build -p aarch64-sim --features cli    # build the aarch64-sim CLI
+cargo run -p aarch64-sim --example run       # pure-Rust embed example
+cargo publish -p aarch64-sim --dry-run       # verify before releasing
 ```
 
-After `build:sim`, run `rm -rf node_modules/aarch64-sim && bun install`
-before `bun run build` so Vite picks up the regenerated WASM.
+`bun run build:sim` invokes wasm-pack with `-- --features wasm`. After
+`build:sim`, run `rm -rf node_modules/aarch64-sim && bun install` before
+`bun run build` so Vite picks up the regenerated WASM.
 
 ## Conventions
 

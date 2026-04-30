@@ -22,8 +22,6 @@ export class Cpu {
         return takeFromExternrefTable0(ret[0]);
     }
     /**
-     * Reads the shared u64 atomic counter at PA 0x6FF8 — task A's LDXR/STXR
-     * loop bumps it once per scheduling round.
      * @returns {bigint}
      */
     atomic_counter() {
@@ -81,7 +79,7 @@ export class Cpu {
         return v1;
     }
     constructor() {
-        const ret = wasm.cpu_new();
+        const ret = wasm.cpu_new_wasm();
         this.__wbg_ptr = ret;
         CpuFinalization.register(this, this.__wbg_ptr, this);
         return this;
@@ -120,9 +118,6 @@ export class Cpu {
         return ret >>> 0;
     }
     /**
-     * Replace disk sector 0 with the given UTF-8 text (padded with zeros to
-     * SECTOR_SIZE bytes). Also patches the live disk-buffer page at PA 0x6000
-     * so task B's printer reflects the change without a reset.
      * @param {string} text
      */
     set_disk_text(text) {
@@ -131,7 +126,6 @@ export class Cpu {
         wasm.cpu_set_disk_text(this.__wbg_ptr, ptr0, len0);
     }
     /**
-     * Returns an array of CoreState (one per core) as a JS Array.
      * @returns {any}
      */
     state() {
@@ -142,9 +136,6 @@ export class Cpu {
         return takeFromExternrefTable0(ret[0]);
     }
     /**
-     * Step every core once. On the way in: bump system_steps; if the timer
-     * is due, broadcast IRQ_TIMER to all cores via AIC. Each core then either
-     * takes a pending IRQ (when DAIF.I is clear) or executes one instruction.
      * @returns {boolean}
      */
     step() {
@@ -152,8 +143,6 @@ export class Cpu {
         return ret !== 0;
     }
     /**
-     * Step a single core. Honours pending IRQs on that core (set either by
-     * the system timer in `step()` or by another core via IPI MMIO).
      * @param {number} idx
      * @returns {boolean}
      */
@@ -176,7 +165,6 @@ export class Cpu {
         return BigInt.asUintN(64, ret);
     }
     /**
-     * System steps until the next timer IRQ fires (0 if it's due now).
      * @returns {bigint}
      */
     timer_remaining() {
@@ -191,7 +179,6 @@ export class Cpu {
         return BigInt.asUintN(64, ret);
     }
     /**
-     * Walk page tables for `va` using the sysregs of `core_idx`.
      * @param {bigint} va
      * @param {number} core_idx
      * @returns {any}
@@ -214,6 +201,8 @@ export class Cpu {
 if (Symbol.dispose) Cpu.prototype[Symbol.dispose] = Cpu.prototype.free;
 
 /**
+ * Disassemble a single 32-bit AArch64 instruction. Mirrors the in-crate
+ * decoder; useful for the UI's instruction listing.
  * @param {number} insn
  * @param {bigint} pc
  * @returns {string}

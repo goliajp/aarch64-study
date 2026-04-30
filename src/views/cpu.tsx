@@ -208,7 +208,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge variant="info">v0.18</Badge>
+          <Badge variant="info">v0.19</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}

@@ -2,6 +2,35 @@
 
 Each entry is one architectural concept added on top of the previous one.
 
+## v0.19
+
+The simulator becomes a publishable, three-deployment-target crate.
+
+- **Pure-Rust API.** `Cpu` methods now return native types (`Vec<CoreState>`,
+  `AicState`, `BlockState`, `Option<TranslationResult>`, …) instead of
+  `Result<JsValue, JsValue>`. The crate has no unconditional dependency on
+  `wasm-bindgen` or `serde-wasm-bindgen` anymore; embed it from any Rust
+  program with just `serde`.
+- **`wasm` feature.** `wasm-bindgen` and `serde-wasm-bindgen` move behind
+  `--features wasm`. A new `src/wasm.rs` module provides thin wrappers
+  (`#[wasm_bindgen(js_name = "step")] pub fn step_wasm(...)`) so the JS
+  surface (`cpu.step()`, `cpu.state()`, `cpu.atomic_counter()`, …) stays
+  byte-for-byte identical. The web app's `bun run build:sim` now passes
+  `-- --features wasm` to wasm-pack.
+- **`cli` feature + binary.** New `aarch64-sim` binary (clap derive),
+  three subcommands:
+  - `run [--steps N] [--disk-text TEXT] [--trace] [--json]`
+  - `disasm <hex>...`
+  - `mem <pa> [--len N] [--steps N]`
+- **Examples.** `examples/run.rs` (pure-Rust embed),
+  `examples/disassemble.rs`, and `examples/wasm-web/` — a single-page,
+  bundlerless HTML demo that loads the WASM directly.
+- **Crate hygiene.** crate-local `LICENSE` + focused `README.md`,
+  `keywords` / `categories` / `homepage` / `documentation` /
+  `readme = "README.md"`, anchored `include = ["/src/...", ...]` so
+  `cargo package` ships exactly 13 files (no `pkg/` leak).
+  `cargo publish --dry-run` is clean.
+
 ## v0.18
 
 Inter-processor interrupts (IPIs) — SVC-mediated, AIC-routed.

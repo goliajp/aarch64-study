@@ -1,7 +1,7 @@
 {
   "name": "aarch64-study",
   "private": true,
-  "version": "0.18.0",
+  "version": "0.19.0",
   "type": "module",
   "description": "AArch64 SoC simulator in the browser — teach OS internals one architectural concept per version (Rust → WASM)",
   "license": "MIT",
@@ -30,7 +30,7 @@
     "fix": "eslint --fix src/ && prettier --write src/",
     "test": "vitest run",
     "test:watch": "vitest",
-    "build:sim": "wasm-pack build crates/aarch64-sim --target web --out-dir pkg --release && rm -f crates/aarch64-sim/pkg/.gitignore",
+    "build:sim": "wasm-pack build crates/aarch64-sim --target web --out-dir pkg --release -- --features wasm && rm -f crates/aarch64-sim/pkg/.gitignore",
     "test:sim": "cargo test -p aarch64-sim"
   },
   "dependencies": {
