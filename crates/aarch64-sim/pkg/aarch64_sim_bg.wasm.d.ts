@@ -1,0 +1,29 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_cpu_free: (a: number, b: number) => void;
+export const cpu_aic_state: (a: number) => [number, number, number];
+export const cpu_block_state: (a: number) => [number, number, number];
+export const cpu_mem_slice: (a: number, b: number, c: number) => [number, number];
+export const cpu_new: () => number;
+export const cpu_num_cores: (a: number) => number;
+export const cpu_output: (a: number) => [number, number];
+export const cpu_reset: (a: number) => void;
+export const cpu_run: (a: number, b: number) => number;
+export const cpu_state: (a: number) => [number, number, number];
+export const cpu_step: (a: number) => number;
+export const cpu_step_core: (a: number, b: number) => number;
+export const cpu_translate: (a: number, b: bigint, c: number) => [number, number, number];
+export const cpu_entry_pc: (a: number) => bigint;
+export const cpu_l1_table_pa: (a: number) => bigint;
+export const cpu_timer_period: (a: number) => bigint;
+export const cpu_uart_addr: (a: number) => bigint;
+export const cpu_timer_remaining: (a: number) => bigint;
+export const cpu_system_steps: (a: number) => bigint;
+export const cpu_timer_ticks: (a: number) => bigint;
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __externref_table_dealloc: (a: number) => void;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
+export const __wbindgen_start: () => void;

@@ -32,3 +32,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Cargo
+target/
+**/*.rs.bk
+
+# pkg/ is committed (it's a file: dep referenced from package.json).
+# `bun run build:sim` strips the auto-generated pkg/.gitignore wasm-pack creates.

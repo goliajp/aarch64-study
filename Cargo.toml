@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/aarch64-sim"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
