@@ -6,6 +6,7 @@ export class Cpu {
     [Symbol.dispose](): void;
     aic_state(): any;
     block_state(): any;
+    disk_text(): string;
     entry_pc(): bigint;
     l1_table_pa(): bigint;
     mem_slice(start: number, len: number): Uint8Array;
@@ -14,6 +15,12 @@ export class Cpu {
     output(): string;
     reset(): void;
     run(max: number): number;
+    /**
+     * Replace disk sector 0 with the given UTF-8 text (padded with zeros to
+     * SECTOR_SIZE bytes). Also patches the live disk-buffer page at PA 0x6000
+     * so task B's printer reflects the change without a reset.
+     */
+    set_disk_text(text: string): void;
     /**
      * Returns an array of CoreState (one per core) as a JS Array.
      */
@@ -43,6 +50,8 @@ export class Cpu {
     uart_addr(): bigint;
 }
 
+export function disassemble(insn: number, pc: bigint): string;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -50,16 +59,19 @@ export interface InitOutput {
     readonly __wbg_cpu_free: (a: number, b: number) => void;
     readonly cpu_aic_state: (a: number) => [number, number, number];
     readonly cpu_block_state: (a: number) => [number, number, number];
+    readonly cpu_disk_text: (a: number) => [number, number];
     readonly cpu_mem_slice: (a: number, b: number, c: number) => [number, number];
     readonly cpu_new: () => number;
     readonly cpu_num_cores: (a: number) => number;
     readonly cpu_output: (a: number) => [number, number];
     readonly cpu_reset: (a: number) => void;
     readonly cpu_run: (a: number, b: number) => number;
+    readonly cpu_set_disk_text: (a: number, b: number, c: number) => void;
     readonly cpu_state: (a: number) => [number, number, number];
     readonly cpu_step: (a: number) => number;
     readonly cpu_step_core: (a: number, b: number) => number;
     readonly cpu_translate: (a: number, b: bigint, c: number) => [number, number, number];
+    readonly disassemble: (a: number, b: bigint) => [number, number];
     readonly cpu_entry_pc: (a: number) => bigint;
     readonly cpu_l1_table_pa: (a: number) => bigint;
     readonly cpu_timer_period: (a: number) => bigint;

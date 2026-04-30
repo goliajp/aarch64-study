@@ -1,7 +1,7 @@
 import { Badge, GlassButton, GlassCard } from '@goliapkg/gds'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import init, { Cpu } from 'aarch64-sim'
+import init, { Cpu, disassemble } from 'aarch64-sim'
 
 interface CoreState {
   id: number
@@ -42,7 +42,7 @@ interface BlockState {
   status: bigint
   total_reads: bigint
   total_writes: bigint
-  disk: Uint8Array
+  disk: number[]
 }
 
 interface TaskSave {
@@ -266,7 +266,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.14</Badge>
+          <Badge color="info">v0.15</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -277,21 +277,15 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          AP-bit enforcement now active. Page descriptors mark AIC, Block, and the page-table pages
-          themselves as <strong>kernel-only</strong> (AP=00); UART, program code, and the disk
-          buffer are user-accessible (AP=01). At EL0 a translation that lands on a kernel-only page
-          faults instead of returning a PA. Use the MMU panel below to query 0x2000 vs 0x1000 from
-          each core (cores running tasks are at EL0).
+          UI overhaul: live <strong>SCI-FI core monitors</strong> on the right rail (registers, EL,
+          peripheral links, activity blip), a <strong>disassembly panel</strong> centered on PC (we
+          built a small ARM disassembler in the WASM crate), and an{' '}
+          <strong>editable disk sector 0</strong> at the bottom — type whatever you want and task B
+          will print it.
         </p>
       </header>
 
       <SystemInfoBar info={sysInfo} totalCoreSteps={cores.reduce((a, c) => a + c.steps, 0n)} />
-
-      <AicPanel aic={aic} />
-
-      <SavePanel slots={coreSlots} />
-
-      <BlockPanel block={block} />
 
       <div className="flex flex-wrap items-center gap-2">
         <GlassButton onClick={onStep} size="sm" variant="accent">
@@ -311,24 +305,37 @@ export function CpuView() {
         </div>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        {cores.map((c) => (
-          <CoreColumn core={c} key={c.id} onStep={() => onStepCore(c.id)} />
-        ))}
-      </div>
-
       <OutputPanel output={output} />
 
-      <MemoryPanel base={memBaseAddr} bytes={memory} pcs={corePcs} />
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_440px]">
+        <div className="min-w-0 space-y-4">
+          <DisassemblyPanel cpu={cpu} cores={cores} />
+          <MemoryPanel base={memBaseAddr} bytes={memory} pcs={corePcs} />
+          <MmuPanel
+            cores={cores}
+            onCoreChange={setTranslateCoreIdx}
+            onVaChange={setVaText}
+            selectedCoreIdx={translateCoreIdx}
+            trace={trace}
+            vaText={vaText}
+          />
+          <AicPanel aic={aic} />
+          <BlockPanel block={block} />
+          <SavePanel slots={coreSlots} />
+          <div className="grid gap-4 lg:grid-cols-2">
+            {cores.map((c) => (
+              <CoreColumn core={c} key={c.id} onStep={() => onStepCore(c.id)} />
+            ))}
+          </div>
+        </div>
 
-      <MmuPanel
-        cores={cores}
-        onCoreChange={setTranslateCoreIdx}
-        onVaChange={setVaText}
-        selectedCoreIdx={translateCoreIdx}
-        trace={trace}
-        vaText={vaText}
-      />
+        <div className="space-y-4 xl:sticky xl:top-4 xl:self-start">
+          {cores.map((c) => (
+            <SciFiCoreCard core={c} key={c.id} slot={coreSlots[c.id]} />
+          ))}
+          <EditableDisk cpu={cpu} block={block} onChange={refresh} />
+        </div>
+      </div>
     </div>
   )
 }
@@ -352,7 +359,7 @@ const SECTOR_SIZE = 64
 function BlockPanel({ block }: { block: BlockState }) {
   const [sector, setSector] = useState(0)
   const numSectors = Math.floor(block.disk.length / SECTOR_SIZE)
-  const slice = block.disk.slice(sector * SECTOR_SIZE, (sector + 1) * SECTOR_SIZE)
+  const slice = new Uint8Array(block.disk.slice(sector * SECTOR_SIZE, (sector + 1) * SECTOR_SIZE))
   const statusLabel =
     block.status === 0n
       ? 'IDLE'
@@ -557,6 +564,339 @@ function AicPanel({ aic }: { aic: AicState }) {
         </div>
       </div>
     </GlassCard>
+  )
+}
+
+function SciFiCoreCard({ core, slot }: { core: CoreState; slot: CoreSlot }) {
+  // Map a sci-fi accent per core: cyan for P-core, violet for E-core.
+  const accent = core.id === 0 ? 'cyan' : 'violet'
+  const taskLabel =
+    slot.entry === 0x4d00n ? 'TASK A' : slot.entry === 0x4e00n ? 'TASK B' : '— idle —'
+  const elColor =
+    core.current_el === 2
+      ? 'text-cyan-300'
+      : core.current_el === 1
+        ? 'text-violet-300'
+        : 'text-emerald-300'
+  const stateLine = core.last_trap
+    ? 'TRAP'
+    : core.halted
+      ? 'HALTED'
+      : core.wfi_halted
+        ? 'WFI · idle'
+        : 'EXECUTING'
+  const stateColor = core.last_trap
+    ? 'text-rose-300'
+    : core.wfi_halted
+      ? 'text-sky-300'
+      : 'text-emerald-300'
+  return (
+    <div
+      className={`scifi-card relative rounded-xl border p-4 ${
+        accent === 'cyan'
+          ? 'border-cyan-400/30 bg-gradient-to-br from-cyan-950/40 via-slate-950/60 to-violet-950/30'
+          : 'border-violet-400/30 bg-gradient-to-br from-violet-950/40 via-slate-950/60 to-cyan-950/30'
+      }`}
+    >
+      {/* scan line */}
+      <div
+        className={`scifi-scan pointer-events-none absolute inset-x-0 h-px ${
+          accent === 'cyan' ? 'bg-cyan-400' : 'bg-violet-400'
+        }`}
+      />
+      <div className="relative flex items-center justify-between">
+        <div className="flex items-baseline gap-2 font-mono">
+          <span
+            className={`text-lg font-bold tracking-[0.2em] ${
+              accent === 'cyan' ? 'text-cyan-200' : 'text-violet-200'
+            }`}
+          >
+            CORE_{core.id}
+          </span>
+          <span className="text-fg-muted text-[10px] tracking-widest uppercase">{core.kind}</span>
+        </div>
+        <span
+          className={`rounded-full border border-current/40 px-2 py-0.5 font-mono text-[10px] tracking-widest uppercase ${elColor}`}
+        >
+          EL{core.current_el}
+        </span>
+      </div>
+
+      <svg
+        className="my-3 w-full"
+        height="86"
+        viewBox="0 0 400 86"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <defs>
+          <linearGradient id={`grad-${core.id}`} x1="0" x2="1" y1="0" y2="1">
+            <stop
+              offset="0%"
+              stopColor={accent === 'cyan' ? '#22d3ee' : '#a78bfa'}
+              stopOpacity="0.8"
+            />
+            <stop
+              offset="100%"
+              stopColor={accent === 'cyan' ? '#0e7490' : '#6d28d9'}
+              stopOpacity="0.4"
+            />
+          </linearGradient>
+        </defs>
+        {/* CPU "die" */}
+        <rect
+          fill={`url(#grad-${core.id})`}
+          height="56"
+          rx="6"
+          stroke={accent === 'cyan' ? '#22d3ee' : '#a78bfa'}
+          strokeOpacity="0.6"
+          strokeWidth="1"
+          width="80"
+          x="160"
+          y="14"
+        />
+        <text
+          fill={accent === 'cyan' ? '#cffafe' : '#ede9fe'}
+          fontFamily="monospace"
+          fontSize="10"
+          x="200"
+          y="34"
+          textAnchor="middle"
+        >
+          PC
+        </text>
+        <text
+          fill={accent === 'cyan' ? '#cffafe' : '#ede9fe'}
+          fontFamily="monospace"
+          fontSize="11"
+          fontWeight="bold"
+          x="200"
+          y="50"
+          textAnchor="middle"
+        >
+          {fmtHex32(Number(core.pc))}
+        </text>
+
+        {/* Connection lines: UART, AIC, RAM */}
+        <PeripheralLink
+          accent={accent}
+          active={!core.wfi_halted && !core.halted}
+          label="UART"
+          orientation="left"
+        />
+        <g transform="translate(0,28)">
+          <PeripheralLink accent={accent} active={core.daif === 0} label="AIC" orientation="left" />
+        </g>
+        <PeripheralLink
+          accent={accent}
+          active={(core.sctlr_el1 & 1n) !== 0n}
+          label="MMU"
+          orientation="right"
+        />
+        <g transform="translate(0,28)">
+          <PeripheralLink
+            accent={accent}
+            active={core.id === 1 || taskLabel === 'TASK B'}
+            label="DISK"
+            orientation="right"
+          />
+        </g>
+
+        {/* Activity blip — tied to non-WFI/halted state */}
+        {!core.wfi_halted && !core.halted && (
+          <circle
+            className="scifi-blip"
+            cx="200"
+            cy="78"
+            fill={accent === 'cyan' ? '#22d3ee' : '#a78bfa'}
+            r="3"
+          />
+        )}
+      </svg>
+
+      <div className="grid gap-x-3 gap-y-1 font-mono text-[11px]">
+        <div className="flex items-center justify-between">
+          <span className="text-fg-muted text-[10px] tracking-wider uppercase">running</span>
+          <span
+            className={`font-mono font-semibold ${
+              taskLabel === '— idle —'
+                ? 'text-fg-muted'
+                : accent === 'cyan'
+                  ? 'text-cyan-200'
+                  : 'text-violet-200'
+            }`}
+          >
+            {taskLabel}
+          </span>
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-fg-muted text-[10px] tracking-wider uppercase">state</span>
+          <span className={`font-semibold ${stateColor}`}>{stateLine}</span>
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-fg-muted text-[10px] tracking-wider uppercase">DAIF</span>
+          <DaifChip daif={core.daif} />
+        </div>
+      </div>
+
+      <div className="border-border/40 mt-3 grid grid-cols-2 gap-x-3 gap-y-0.5 border-t pt-2 font-mono text-[10px]">
+        <RegRow label="X0" value={core.x[0]} />
+        <RegRow label="X1" value={core.x[1]} />
+        <RegRow label="X2" value={core.x[2]} />
+        <RegRow label="X3" value={core.x[3]} />
+        <RegRow label="MPIDR" value={core.mpidr} />
+        <RegRow label="steps" value={core.steps} />
+      </div>
+    </div>
+  )
+}
+
+function PeripheralLink({
+  accent,
+  active,
+  label,
+  orientation,
+}: {
+  accent: 'cyan' | 'violet'
+  active: boolean
+  label: string
+  orientation: 'left' | 'right'
+}) {
+  const stroke = accent === 'cyan' ? '#22d3ee' : '#a78bfa'
+  const opacity = active ? 0.9 : 0.25
+  const x1 = orientation === 'left' ? 6 : 240
+  const x2 = orientation === 'left' ? 160 : 394
+  const labelX = orientation === 'left' ? 8 : 392
+  const labelAnchor = orientation === 'left' ? 'start' : 'end'
+  return (
+    <g style={{ opacity }}>
+      <line
+        className={active ? 'scifi-stream' : ''}
+        stroke={stroke}
+        strokeWidth="1.2"
+        x1={x1}
+        x2={x2}
+        y1="22"
+        y2="22"
+      />
+      <text
+        fill={stroke}
+        fontFamily="monospace"
+        fontSize="9"
+        textAnchor={labelAnchor}
+        x={labelX}
+        y="14"
+      >
+        {label}
+      </text>
+    </g>
+  )
+}
+
+function DisassemblyPanel({ cpu, cores }: { cpu: Cpu; cores: CoreState[] }) {
+  const pc0 = Number(cores[0].pc)
+  const pc1 = Number(cores[1].pc)
+  // Show 32 instructions centered on core 0's PC, snapped to a 32-byte
+  // boundary so the listing doesn't jitter line-by-line.
+  const center = pc0 & ~0x1f
+  const start = Math.max(0x4000, center - 16 * 4)
+  const end = Math.min(0x10000, start + 36 * 4)
+  const bytes = cpu.mem_slice(start, end - start)
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const rows: { pa: number; word: number; mnem: string }[] = []
+  for (let i = 0; i + 4 <= bytes.length; i += 4) {
+    const word = view.getUint32(i, true)
+    const pa = start + i
+    rows.push({ pa, word, mnem: disassemble(word, BigInt(pa)) })
+  }
+  return (
+    <GlassCard>
+      <div className="space-y-2 p-4">
+        <div className="text-fg-muted flex items-center justify-between">
+          <span className="text-[10px] font-semibold tracking-wider uppercase">
+            Disassembly · around core 0 PC
+          </span>
+          <span className="font-mono text-[10px]">
+            range {fmtHex32(start)}–{fmtHex32(end - 1)}
+          </span>
+        </div>
+        <div className="overflow-x-auto font-mono text-[11px]">
+          {rows.map((r) => {
+            const isCore0 = r.pa === pc0
+            const isCore1 = r.pa === pc1
+            const cls = isCore0
+              ? 'bg-cyan-500/10 text-cyan-200'
+              : isCore1
+                ? 'bg-violet-500/10 text-violet-200'
+                : ''
+            return (
+              <div className={`flex gap-3 leading-6 ${cls}`} key={r.pa}>
+                <span className="text-fg-muted w-12 shrink-0">
+                  {isCore0 ? '►0' : isCore1 ? '►1' : '  '}
+                </span>
+                <span className="text-fg-muted w-16 shrink-0">{fmtHex32(r.pa)}</span>
+                <span className="text-fg-muted w-20 shrink-0">
+                  {r.word.toString(16).padStart(8, '0')}
+                </span>
+                <span className="flex-1">{r.mnem}</span>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </GlassCard>
+  )
+}
+
+function EditableDisk({
+  block,
+  cpu,
+  onChange,
+}: {
+  block: BlockState
+  cpu: Cpu
+  onChange: (cpu: Cpu) => void
+}) {
+  // Decode sector 0 up to the first NUL byte for editing. We use the decoded
+  // value as a React key on the textarea, so when the user clicks Reset and
+  // the disk reverts, the textarea remounts with the fresh default; otherwise
+  // it stays as the user's edits (uncontrolled defaultValue).
+  const initial = useMemo(() => {
+    let end = 64
+    for (let i = 0; i < 64; i++) {
+      if (block.disk[i] === 0) {
+        end = i
+        break
+      }
+    }
+    const u8 = new Uint8Array(block.disk.slice(0, end))
+    return new TextDecoder('utf-8', { fatal: false }).decode(u8)
+  }, [block.disk])
+  const apply = (next: string) => {
+    cpu.set_disk_text(next)
+    onChange(cpu)
+  }
+  return (
+    <div className="border-border bg-bg/60 rounded-xl border p-4">
+      <div className="text-fg-muted mb-2 flex items-center justify-between">
+        <span className="text-[10px] font-semibold tracking-wider uppercase">
+          Disk sector 0 · editable
+        </span>
+        <span className="font-mono text-[10px]">{initial.length}/64 bytes</span>
+      </div>
+      <textarea
+        className="border-border bg-bg/40 text-fg focus:border-accent w-full resize-none rounded border px-2 py-1.5 font-mono text-xs outline-none"
+        defaultValue={initial}
+        key={initial}
+        maxLength={64}
+        onChange={(e) => apply(e.target.value)}
+        rows={3}
+        spellCheck={false}
+      />
+      <p className="text-fg-muted mt-2 text-[11px]">
+        Bytes are written to <code>disk[0..64]</code> AND mirrored to PA <code>0x6000</code>, so
+        task B starts emitting your text on the next iteration.
+      </p>
+    </div>
   )
 }
 

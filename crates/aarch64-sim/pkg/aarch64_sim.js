@@ -32,6 +32,21 @@ export class Cpu {
         return takeFromExternrefTable0(ret[0]);
     }
     /**
+     * @returns {string}
+     */
+    disk_text() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.cpu_disk_text(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * @returns {bigint}
      */
     entry_pc() {
@@ -94,6 +109,17 @@ export class Cpu {
     run(max) {
         const ret = wasm.cpu_run(this.__wbg_ptr, max);
         return ret >>> 0;
+    }
+    /**
+     * Replace disk sector 0 with the given UTF-8 text (padded with zeros to
+     * SECTOR_SIZE bytes). Also patches the live disk-buffer page at PA 0x6000
+     * so task B's printer reflects the change without a reset.
+     * @param {string} text
+     */
+    set_disk_text(text) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.cpu_set_disk_text(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * Returns an array of CoreState (one per core) as a JS Array.
@@ -177,6 +203,24 @@ export class Cpu {
     }
 }
 if (Symbol.dispose) Cpu.prototype[Symbol.dispose] = Cpu.prototype.free;
+
+/**
+ * @param {number} insn
+ * @param {bigint} pc
+ * @returns {string}
+ */
+export function disassemble(insn, pc) {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const ret = wasm.disassemble(insn, pc);
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,

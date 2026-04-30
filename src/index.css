@@ -53,3 +53,115 @@ body::before {
     0 0 20px rgb(59 130 246 / 0.15),
     0 0 40px rgb(59 130 246 / 0.05);
 }
+
+/* Sci-fi core card animations */
+@keyframes scifi-scan {
+  0%,
+  100% {
+    transform: translateY(-4px);
+    opacity: 0;
+  }
+  50% {
+    transform: translateY(calc(100% + 4px));
+    opacity: 0.55;
+  }
+}
+
+@keyframes scifi-glow {
+  0%,
+  100% {
+    box-shadow:
+      0 0 20px rgba(56, 189, 248, 0.18),
+      0 0 60px rgba(168, 85, 247, 0.08),
+      inset 0 0 30px rgba(56, 189, 248, 0.05);
+  }
+  50% {
+    box-shadow:
+      0 0 35px rgba(56, 189, 248, 0.32),
+      0 0 80px rgba(168, 85, 247, 0.18),
+      inset 0 0 40px rgba(56, 189, 248, 0.08);
+  }
+}
+
+@keyframes scifi-orbit {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes scifi-flow {
+  0% {
+    offset-distance: 0%;
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  90% {
+    opacity: 1;
+  }
+  100% {
+    offset-distance: 100%;
+    opacity: 0;
+  }
+}
+
+@keyframes scifi-blip {
+  0%,
+  100% {
+    opacity: 0.5;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.4);
+  }
+}
+
+@keyframes scifi-stream {
+  0% {
+    stroke-dashoffset: 0;
+  }
+  100% {
+    stroke-dashoffset: -16;
+  }
+}
+
+.scifi-card {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+  animation: scifi-glow 4s ease-in-out infinite;
+}
+
+.scifi-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: conic-gradient(
+    from 0deg,
+    rgb(56 189 248 / 0.3),
+    rgb(168 85 247 / 0.4),
+    rgb(56 189 248 / 0.3)
+  );
+  animation: scifi-orbit 8s linear infinite;
+  filter: blur(10px);
+  opacity: 0.45;
+}
+
+.scifi-scan {
+  animation: scifi-scan 3s ease-in-out infinite;
+}
+
+.scifi-blip {
+  animation: scifi-blip 1.4s ease-in-out infinite;
+}
+
+.scifi-stream {
+  stroke-dasharray: 2 6;
+  animation: scifi-stream 0.6s linear infinite;
+}

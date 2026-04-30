@@ -35,7 +35,8 @@ v0.10 + Block device (virtio-blk-shaped) — kernel reads sector 0 at boot
 v0.11 + LDRB/CBZ/CBNZ/SUB-imm; task B walks disk buffer and prints it
 v0.12 + per-core scheduler — cores 0/1 run A/B concurrently via MPIDR
 v0.13 + WFI — task A sleeps until next IRQ, idle cores stop spinning
-v0.14 + AP-bit enforcement — kernel pages (AIC/Block) reject EL0 access  ← here
+v0.14 + AP-bit enforcement — kernel pages (AIC/Block) reject EL0 access
+v0.15 + disassembler, sci-fi core monitors, editable disk text  ← here
 v1.0  + bare-metal port via m1n1 (same Rust crate runs on real Apple Silicon)`}
           </pre>
         </Card>

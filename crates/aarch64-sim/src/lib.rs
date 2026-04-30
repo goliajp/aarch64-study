@@ -1225,6 +1225,30 @@ impl Cpu {
         to_js(&self.block.snapshot())
     }
 
+    /// Replace disk sector 0 with the given UTF-8 text (padded with zeros to
+    /// SECTOR_SIZE bytes). Also patches the live disk-buffer page at PA 0x6000
+    /// so task B's printer reflects the change without a reset.
+    pub fn set_disk_text(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let n = bytes.len().min(SECTOR_SIZE as usize);
+        for i in 0..(SECTOR_SIZE as usize) {
+            let b = if i < n { bytes[i] } else { 0 };
+            self.block.disk[i] = b;
+            self.mem[0x6000 + i] = b;
+        }
+    }
+
+    pub fn disk_text(&self) -> String {
+        let mut end = SECTOR_SIZE as usize;
+        for i in 0..(SECTOR_SIZE as usize) {
+            if self.block.disk[i] == 0 {
+                end = i;
+                break;
+            }
+        }
+        String::from_utf8_lossy(&self.block.disk[..end]).into_owned()
+    }
+
     /// Returns an array of CoreState (one per core) as a JS Array.
     pub fn state(&self) -> Result<JsValue, JsValue> {
         let states: Vec<CoreState> = self.cores.iter().map(|c| c.snapshot()).collect();
@@ -1336,6 +1360,214 @@ fn unsupported_sysreg(op: &str, sr: (u32, u32, u32, u32, u32), pc: u64) -> Strin
         "{op} of unsupported sysreg S{}_{}_C{}_C{}_{} at pc={:#x}",
         sr.0, sr.1, sr.2, sr.3, sr.4, pc
     )
+}
+
+// === Disassembler ============================================================
+// Mirrors the decoder in Core::execute, producing ARM-style mnemonics. Used
+// by the JS UI to render a Disassembly panel; not used by execution itself.
+
+#[wasm_bindgen]
+pub fn disassemble(insn: u32, pc: u64) -> String {
+    // MOVZ Xd, #imm16 {, LSL #hw*16}
+    if insn & 0xFF80_0000 == 0xD280_0000 {
+        let rd = insn & 0x1F;
+        let hw = (insn >> 21) & 0x3;
+        let imm = (insn >> 5) & 0xFFFF;
+        return if hw == 0 {
+            format!("movz x{rd}, #{imm:#x}")
+        } else {
+            format!("movz x{rd}, #{imm:#x}, lsl #{}", hw * 16)
+        };
+    }
+    // ADD Xd, Xn, #imm12 {, LSL #12}
+    if insn & 0xFF80_0000 == 0x9100_0000 {
+        let rd = insn & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        let imm = (insn >> 10) & 0xFFF;
+        let sh = (insn >> 22) & 1;
+        return if sh == 1 {
+            format!("add x{rd}, x{rn}, #{imm:#x}, lsl #12")
+        } else {
+            format!("add x{rd}, x{rn}, #{imm:#x}")
+        };
+    }
+    // SUB Xd, Xn, #imm12
+    if insn & 0xFF80_0000 == 0xD100_0000 {
+        let rd = insn & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        let imm = (insn >> 10) & 0xFFF;
+        return format!("sub x{rd}, x{rn}, #{imm:#x}");
+    }
+    // ADD Xd, Xn, Xm
+    if insn & 0xFF20_FC00 == 0x8B00_0000 {
+        let rd = insn & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        let rm = (insn >> 16) & 0x1F;
+        return format!("add x{rd}, x{rn}, x{rm}");
+    }
+    // SUB Xd, Xn, Xm
+    if insn & 0xFF20_FC00 == 0xCB00_0000 {
+        let rd = insn & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        let rm = (insn >> 16) & 0x1F;
+        return format!("sub x{rd}, x{rn}, x{rm}");
+    }
+    // STR Xt, [Xn, #imm12*8]
+    if insn & 0xFFC0_0000 == 0xF900_0000 {
+        let rt = insn & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        let imm = (insn >> 10) & 0xFFF;
+        let off = imm * 8;
+        return if off == 0 {
+            format!("str x{rt}, [x{rn}]")
+        } else {
+            format!("str x{rt}, [x{rn}, #{off}]")
+        };
+    }
+    // LDR Xt, [Xn, #imm12*8]
+    if insn & 0xFFC0_0000 == 0xF940_0000 {
+        let rt = insn & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        let imm = (insn >> 10) & 0xFFF;
+        let off = imm * 8;
+        return if off == 0 {
+            format!("ldr x{rt}, [x{rn}]")
+        } else {
+            format!("ldr x{rt}, [x{rn}, #{off}]")
+        };
+    }
+    // LDRB Wt, [Xn, #imm12]
+    if insn & 0xFFC0_0000 == 0x3940_0000 {
+        let rt = insn & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        let imm = (insn >> 10) & 0xFFF;
+        return if imm == 0 {
+            format!("ldrb w{rt}, [x{rn}]")
+        } else {
+            format!("ldrb w{rt}, [x{rn}, #{imm}]")
+        };
+    }
+    // LDP/STP signed offset
+    if insn & 0xFFC0_0000 == 0xA900_0000 || insn & 0xFFC0_0000 == 0xA940_0000 {
+        let l = (insn >> 22) & 1;
+        let imm7_raw = (insn >> 15) & 0x7F;
+        let imm7 = ((imm7_raw as i32) << 25) >> 25;
+        let off = imm7 * 8;
+        let rt2 = (insn >> 10) & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        let rt1 = insn & 0x1F;
+        let mnem = if l == 0 { "stp" } else { "ldp" };
+        return if off == 0 {
+            format!("{mnem} x{rt1}, x{rt2}, [x{rn}]")
+        } else {
+            format!("{mnem} x{rt1}, x{rt2}, [x{rn}, #{off}]")
+        };
+    }
+    // SVC #imm16
+    if insn & 0xFFE0_001F == 0xD400_0001 {
+        let imm = (insn >> 5) & 0xFFFF;
+        return format!("svc #{imm:#x}");
+    }
+    // ERET
+    if insn == 0xD69F_03E0 {
+        return "eret".into();
+    }
+    // WFI
+    if insn == 0xD503_207F {
+        return "wfi".into();
+    }
+    // Hint class
+    if insn & 0xFFFF_F01F == 0xD503_201F {
+        let hint = (insn >> 5) & 0x7F;
+        return match hint {
+            0 => "nop".into(),
+            1 => "yield".into(),
+            2 => "wfe".into(),
+            3 => "wfi".into(),
+            n => format!("hint #{n}"),
+        };
+    }
+    // Barrier class
+    if insn & 0xFFFF_F01F == 0xD503_301F {
+        let crm = (insn >> 8) & 0xF;
+        let op2 = (insn >> 5) & 0x7;
+        let mnem = match op2 {
+            4 => Some("dsb"),
+            5 => Some("dmb"),
+            6 => Some("isb"),
+            _ => None,
+        };
+        let domain = match crm {
+            0xF => Some("sy"),
+            0xE => Some("st"),
+            0xD => Some("ld"),
+            0xB => Some("ish"),
+            _ => None,
+        };
+        if let (Some(m), Some(d)) = (mnem, domain) {
+            return format!("{m} {d}");
+        }
+    }
+    // MSR / MRS sysreg or DAIFSet/Clr
+    if insn & 0xFFC0_0000 == 0xD500_0000 {
+        let l = (insn >> 21) & 1;
+        let op0 = (insn >> 19) & 0x3;
+        let op1 = (insn >> 16) & 0x7;
+        let crn = (insn >> 12) & 0xF;
+        let crm = (insn >> 8) & 0xF;
+        let op2 = (insn >> 5) & 0x7;
+        let rt = insn & 0x1F;
+        if op0 == 0 && op1 == 3 && crn == 4 && (op2 == 6 || op2 == 7) {
+            let pf = if op2 == 6 { "DAIFSet" } else { "DAIFClr" };
+            return format!("msr {pf}, #{crm:#x}");
+        }
+        if op0 >= 2 {
+            let sr = sysreg_name(op0, op1, crn, crm, op2);
+            return if l == 0 {
+                format!("msr {sr}, x{rt}")
+            } else {
+                format!("mrs x{rt}, {sr}")
+            };
+        }
+    }
+    // CBZ / CBNZ Xt, label
+    if insn & 0xFE00_0000 == 0xB400_0000 {
+        let op = (insn >> 24) & 1;
+        let imm19_raw = (insn >> 5) & 0x7_FFFF;
+        let imm19 = ((imm19_raw as i32) << 13) >> 13;
+        let target = (pc as i64).wrapping_add((imm19 as i64) * 4) as u64;
+        let rt = insn & 0x1F;
+        let mnem = if op == 0 { "cbz" } else { "cbnz" };
+        return format!("{mnem} x{rt}, {target:#x}");
+    }
+    // B label
+    if insn & 0xFC00_0000 == 0x1400_0000 {
+        let imm26_raw = (insn & 0x03FF_FFFF) as i32;
+        let imm26 = (imm26_raw << 6) >> 6;
+        let target = (pc as i64).wrapping_add((imm26 as i64) * 4) as u64;
+        return format!("b {target:#x}");
+    }
+    // Unknown
+    format!(".word {insn:#010x}")
+}
+
+fn sysreg_name(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> String {
+    match (op0, op1, crn, crm, op2) {
+        (3, 0, 0, 0, 5) => "mpidr_el1".into(),
+        (3, 0, 1, 0, 0) => "sctlr_el1".into(),
+        (3, 0, 2, 0, 0) => "ttbr0_el1".into(),
+        (3, 0, 2, 0, 2) => "tcr_el1".into(),
+        (3, 0, 4, 0, 0) => "spsr_el1".into(),
+        (3, 0, 4, 0, 1) => "elr_el1".into(),
+        (3, 0, 4, 2, 2) => "currentel".into(),
+        (3, 0, 5, 2, 0) => "esr_el1".into(),
+        (3, 0, 12, 0, 0) => "vbar_el1".into(),
+        (3, 4, 4, 0, 0) => "spsr_el2".into(),
+        (3, 4, 4, 0, 1) => "elr_el2".into(),
+        (3, 4, 5, 2, 0) => "esr_el2".into(),
+        (3, 4, 12, 0, 0) => "vbar_el2".into(),
+        _ => format!("s{op0}_{op1}_c{crn}_c{crm}_{op2}"),
+    }
 }
 
 // === Demo program =============================================================
@@ -1662,6 +1894,35 @@ const fn svc_imm(imm16: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disassemble_covers_supported_instructions() {
+        assert_eq!(disassemble(movz(9, 0x4014, 0), 0x4000), "movz x9, #0x4014");
+        assert_eq!(
+            disassemble(movz(9, 0x8000, 1), 0x4000),
+            "movz x9, #0x8000, lsl #16"
+        );
+        assert_eq!(disassemble(add_imm(0, 0, 0x1), 0x4000), "add x0, x0, #0x1");
+        assert_eq!(disassemble(sub_imm(3, 3, 1), 0x4000), "sub x3, x3, #0x1");
+        assert_eq!(disassemble(add_reg(14, 9, 14), 0x4000), "add x14, x9, x14");
+        assert_eq!(disassemble(sub_reg(13, 13, 11), 0x4000), "sub x13, x13, x11");
+        assert_eq!(disassemble(str_imm(0, 1, 0), 0x4000), "str x0, [x1]");
+        assert_eq!(disassemble(str_imm(0, 1, 1), 0x4000), "str x0, [x1, #8]");
+        assert_eq!(disassemble(ldr_imm(11, 14, 0), 0x4000), "ldr x11, [x14]");
+        assert_eq!(disassemble(ldrb_imm(0, 4, 0), 0x4000), "ldrb w0, [x4]");
+        assert_eq!(disassemble(stp_imm(0, 1, 12, 0), 0x4000), "stp x0, x1, [x12]");
+        assert_eq!(disassemble(svc_imm(0), 0x4000), "svc #0x0");
+        assert_eq!(disassemble(eret(), 0x4000), "eret");
+        assert_eq!(disassemble(wfi(), 0x4000), "wfi");
+        assert_eq!(disassemble(isb(), 0x4000), "isb sy");
+        assert_eq!(disassemble(msr_ttbr0(9), 0x4000), "msr ttbr0_el1, x9");
+        assert_eq!(disassemble(mrs_mpidr(14), 0x4000), "mrs x14, mpidr_el1");
+        assert_eq!(disassemble(0xD503_42FFu32, 0x4000), "msr DAIFClr, #0x2");
+        // Branch with PC-relative target.
+        assert_eq!(disassemble(b_offset(-1), 0x4020), "b 0x401c");
+        // Unknown instruction.
+        assert_eq!(disassemble(0xDEAD_BEEF, 0), ".word 0xdeadbeef");
+    }
 
     #[test]
     fn boots_two_cores_at_el2() {
