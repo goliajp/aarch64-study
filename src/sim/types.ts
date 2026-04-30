@@ -26,6 +26,23 @@ export interface CoreState {
   elr_el2: bigint
   spsr_el2: bigint
   esr_el2: bigint
+  tlb: TlbState
+}
+
+export interface TlbEntry {
+  valid: boolean
+  va_page: bigint
+  asid: number
+  pa_page: bigint
+  ap: number
+}
+
+export interface TlbState {
+  entries: TlbEntry[]
+  hits: bigint
+  misses: bigint
+  fills: bigint
+  flushes: bigint
 }
 
 export interface AicState {

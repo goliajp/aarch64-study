@@ -2,6 +2,34 @@
 
 Each entry is one architectural concept added on top of the previous one.
 
+## v0.21
+
+Per-core TLB + ASID-tagged entries + `TLBI` invalidation.
+
+- New `Tlb` struct: 8-entry, fully-associative, round-robin victim. Each
+  entry stores `(va_page, asid, pa_page, ap, valid)`. Per-core stats
+  (`hits`, `misses`, `fills`, `flushes`).
+- `translate_for_access` now consults the TLB before walking the page
+  tables. On miss it walks via `do_translate` (unchanged — UI's MMU
+  walker still shows the full chain) and fills. AP-bit enforcement
+  still runs on every access, fed from the cached AP on hits.
+- ASID is read from `TTBR0_EL1[63:48]` and used as the second key for
+  TLB lookups; entries with mismatched ASID don't hit, even if the VA
+  matches.
+- New SYS-class instruction decoder (op0=01) for TLB invalidation:
+  - `TLBI VMALLE1`     (`0xD508_871F`) — wipe everything on the calling core
+  - `TLBI VAE1, Xt`    (`0xD508_8720 | Rt`) — by-VA in current ASID
+  - `TLBI ASIDE1, Xt`  (`0xD508_8740 | Rt`) — by-ASID (`Xt[63:48]`)
+- The previous `op0 < 2` gate for PSTATE/hint/barrier was tightened to
+  `op0 == 0`, so SYS-class instructions cleanly fall through to the
+  TLBI dispatch.
+- UI: new `TlbPanel` showing each core's 8 entries (VA / ASID / PA /
+  AP / valid); header strip gains a system-wide `tlb hit %` stat.
+- Six new tests: TLB caches walks during demo boot, VMALLE1 wipes all,
+  VAE1 wipes only the matching VA + ASID, ASIDE1 wipes by ASID,
+  ASID mismatch is a miss, and TLBI VMALLE1 round-trips through the
+  full execute loop. Total cargo tests: 34.
+
 ## v0.20
 
 Per-EL stacks + real function calls.

@@ -99,6 +99,7 @@ pub struct CoreState {
     pub elr_el2: u64,
     pub spsr_el2: u64,
     pub esr_el2: u64,
+    pub tlb: TlbState,
 }
 
 #[derive(Serialize, Clone)]
@@ -349,6 +350,114 @@ impl Block {
     }
 }
 
+// === Tlb: per-core stage-1 translation cache ====================================
+
+const TLB_ENTRIES: usize = 8;
+
+#[derive(Serialize, Clone, Copy, Default, Debug)]
+pub struct TlbEntry {
+    pub valid: bool,
+    /// Virtual page number (VA >> 12).
+    pub va_page: u64,
+    pub asid: u16,
+    /// Physical page number (PA >> 12).
+    pub pa_page: u64,
+    /// AP bits from the leaf descriptor — needed so EL0 access checks can
+    /// run on TLB hits without re-walking.
+    pub ap: u8,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct TlbState {
+    pub entries: Vec<TlbEntry>,
+    pub hits: u64,
+    pub misses: u64,
+    pub fills: u64,
+    pub flushes: u64,
+}
+
+#[derive(Clone)]
+struct Tlb {
+    entries: [TlbEntry; TLB_ENTRIES],
+    /// Round-robin victim slot. Real hardware uses pseudo-LRU; round-robin
+    /// is good enough to demonstrate fills evicting old entries.
+    next_fill: usize,
+    hits: u64,
+    misses: u64,
+    fills: u64,
+    flushes: u64,
+}
+
+impl Tlb {
+    fn new() -> Self {
+        Tlb {
+            entries: [TlbEntry::default(); TLB_ENTRIES],
+            next_fill: 0,
+            hits: 0,
+            misses: 0,
+            fills: 0,
+            flushes: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Tlb::new();
+    }
+
+    fn lookup(&mut self, va_page: u64, asid: u16) -> Option<TlbEntry> {
+        for e in self.entries.iter() {
+            if e.valid && e.va_page == va_page && e.asid == asid {
+                self.hits = self.hits.saturating_add(1);
+                return Some(*e);
+            }
+        }
+        self.misses = self.misses.saturating_add(1);
+        None
+    }
+
+    fn fill(&mut self, va_page: u64, asid: u16, pa_page: u64, ap: u8) {
+        let slot = self.next_fill % TLB_ENTRIES;
+        self.entries[slot] = TlbEntry { valid: true, va_page, asid, pa_page, ap };
+        self.next_fill = (slot + 1) % TLB_ENTRIES;
+        self.fills = self.fills.saturating_add(1);
+    }
+
+    fn invalidate_all(&mut self) {
+        for e in self.entries.iter_mut() {
+            e.valid = false;
+        }
+        self.flushes = self.flushes.saturating_add(1);
+    }
+
+    fn invalidate_va(&mut self, va_page: u64, asid: u16) {
+        for e in self.entries.iter_mut() {
+            if e.valid && e.va_page == va_page && e.asid == asid {
+                e.valid = false;
+            }
+        }
+        self.flushes = self.flushes.saturating_add(1);
+    }
+
+    fn invalidate_asid(&mut self, asid: u16) {
+        for e in self.entries.iter_mut() {
+            if e.valid && e.asid == asid {
+                e.valid = false;
+            }
+        }
+        self.flushes = self.flushes.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> TlbState {
+        TlbState {
+            entries: self.entries.to_vec(),
+            hits: self.hits,
+            misses: self.misses,
+            fills: self.fills,
+            flushes: self.flushes,
+        }
+    }
+}
+
 // === Core: per-core register file + EL state + sysregs ===========================
 
 struct Core {
@@ -391,6 +500,9 @@ struct Core {
     elr_el2: u64,
     spsr_el2: u64,
     esr_el2: u64,
+    /// Per-core stage-1 TLB. Filled on every translate_for_access miss,
+    /// invalidated by TLBI VMALLE1 / VAE1 / ASIDE1.
+    tlb: Tlb,
 }
 
 enum StepResult {
@@ -427,6 +539,7 @@ impl Core {
             elr_el2: 0,
             spsr_el2: 0,
             esr_el2: 0,
+            tlb: Tlb::new(),
         }
     }
 
@@ -463,6 +576,7 @@ impl Core {
             elr_el2: self.elr_el2,
             spsr_el2: self.spsr_el2,
             esr_el2: self.esr_el2,
+            tlb: self.tlb.snapshot(),
         }
     }
 
@@ -585,39 +699,49 @@ impl Core {
         Ok(())
     }
 
-    fn translate_for_access(&self, mem: &[u8], va: u64) -> Result<u64, String> {
+    fn translate_for_access(&mut self, mem: &[u8], va: u64) -> Result<u64, String> {
         if self.sctlr_el1 & 1 == 0 {
             return Ok(va);
         }
-        let r = self.do_translate(mem, va);
-        let pa = r.pa.ok_or_else(|| r.fault.clone().unwrap_or_else(|| "MMU fault".into()))?;
-
-        // AP-bit enforcement: at EL0, the leaf descriptor's AP[0] must be set
-        // (user-accessible). AP=00 / AP=10 are kernel-only and fault for EL0.
-        // Higher ELs are unrestricted in this toy.
-        if self.current_el == 0 {
-            let ap = match r.steps.last().map(|s| &s.outcome) {
-                Some(WalkOutcome::Page { attrs, .. }) | Some(WalkOutcome::Block { attrs, .. }) => {
-                    attrs.ap
-                }
-                _ => return Ok(pa),
-            };
-            if ap & 1 == 0 {
+        let asid = (self.ttbr0_el1 >> 48) as u16;
+        let va_page = va >> 12;
+        let page_off = va & 0xFFF;
+        // Fast path: TLB hit.
+        if let Some(entry) = self.tlb.lookup(va_page, asid) {
+            if self.current_el == 0 && entry.ap & 1 == 0 {
                 return Err(format!(
                     "permission fault at VA {:#x} (AP={:#04b}, EL0)",
-                    va, ap
+                    va, entry.ap
                 ));
             }
+            return Ok((entry.pa_page << 12) | page_off);
         }
+        // Miss: walk + fill. AP-bit enforcement at EL0 still happens here.
+        let r = self.do_translate(mem, va);
+        let pa = r.pa.ok_or_else(|| r.fault.clone().unwrap_or_else(|| "MMU fault".into()))?;
+        let leaf_ap = match r.steps.last().map(|s| &s.outcome) {
+            Some(WalkOutcome::Page { attrs, .. }) | Some(WalkOutcome::Block { attrs, .. }) => {
+                attrs.ap
+            }
+            _ => 0b11,
+        };
+        if self.current_el == 0 && leaf_ap & 1 == 0 {
+            return Err(format!(
+                "permission fault at VA {:#x} (AP={:#04b}, EL0)",
+                va, leaf_ap
+            ));
+        }
+        // Cache the translation for next time.
+        self.tlb.fill(va_page, asid, pa >> 12, leaf_ap);
         Ok(pa)
     }
 
-    fn fetch_u32(&self, mem: &[u8], va: u64) -> Result<u32, String> {
+    fn fetch_u32(&mut self, mem: &[u8], va: u64) -> Result<u32, String> {
         let pa = self.translate_for_access(mem, va)?;
         read_pa_u32(mem, pa)
     }
 
-    fn load64(&self, mem: &[u8], aic: &mut Aic, block: &Block, va: u64) -> Result<u64, String> {
+    fn load64(&mut self, mem: &[u8], aic: &mut Aic, block: &Block, va: u64) -> Result<u64, String> {
         let pa = self.translate_for_access(mem, va)?;
         if (AIC_BASE..AIC_END).contains(&pa) {
             return Ok(aic.mmio_read(self.id as usize, pa - AIC_BASE));
@@ -1100,7 +1224,9 @@ impl Core {
             let op2 = (insn >> 5) & 0x7;
             let rt = (insn & 0x1F) as usize;
 
-            if op0 < 2 {
+            // op0 = 0 covers PSTATE / hint / barrier / WFI; op0 = 1 is the
+            // SYS class (TLBI lives there); op0 = 2/3 are MSR/MRS sysreg.
+            if op0 == 0 {
                 // WFI :: 0xD503_207F — set wfi_halted, advance PC.
                 if insn == 0xD503_207F {
                     self.wfi_halted = true;
@@ -1132,6 +1258,38 @@ impl Core {
                     "unsupported system instruction {:#010x} at pc={:#x}",
                     insn, self.pc
                 ));
+            }
+
+            // SYS instruction class (op0 = 01) — TLBI is the only variant we
+            // model. ARM ARM "TLB invalidate operations":
+            //   TLBI VMALLE1   :: SYS #0, c8, c7, #0     (CRm=7, op2=0)
+            //   TLBI VAE1, Xt  :: SYS #0, c8, c7, #1     (CRm=7, op2=1)
+            //   TLBI ASIDE1,Xt :: SYS #0, c8, c7, #2     (CRm=7, op2=2)
+            if op0 == 1 && l == 0 && op1 == 0 && crn == 8 {
+                match (crm, op2) {
+                    (7, 0) => self.tlb.invalidate_all(),
+                    (7, 1) => {
+                        // VAE1, Xt — Xt[55:12] is the VA. We use the page
+                        // number directly.
+                        let xt = self.read_x(rt);
+                        let va_page = (xt & 0x00FF_FFFF_FFFF_F000) >> 12;
+                        let asid = (self.ttbr0_el1 >> 48) as u16;
+                        self.tlb.invalidate_va(va_page, asid);
+                    }
+                    (7, 2) => {
+                        // ASIDE1, Xt — Xt[63:48] = ASID.
+                        let asid = (self.read_x(rt) >> 48) as u16;
+                        self.tlb.invalidate_asid(asid);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unsupported TLBI variant CRm={crm} op2={op2} at pc={:#x}",
+                            self.pc
+                        ))
+                    }
+                }
+                self.pc = self.pc.wrapping_add(4);
+                return Ok(StepResult::Continue);
             }
 
             let sr = (op0, op1, crn, crm, op2);
@@ -1724,6 +1882,15 @@ pub fn disassemble(insn: u32, pc: u64) -> String {
             let pf = if op2 == 6 { "DAIFSet" } else { "DAIFClr" };
             return format!("msr {pf}, #{crm:#x}");
         }
+        // TLBI (SYS class, op0=01).
+        if op0 == 1 && l == 0 && op1 == 0 && crn == 8 && crm == 7 {
+            return match op2 {
+                0 => "tlbi vmalle1".into(),
+                1 => format!("tlbi vae1, x{rt}"),
+                2 => format!("tlbi aside1, x{rt}"),
+                _ => format!(".word {insn:#010x}"),
+            };
+        }
         if op0 >= 2 {
             let sr = sysreg_name(op0, op1, crn, crm, op2);
             return if l == 0 {
@@ -2165,6 +2332,24 @@ const fn clrex() -> u32 {
     0xD503_3F5F
 }
 
+/// TLBI VMALLE1 — invalidate all stage-1 TLB entries on this core.
+#[allow(dead_code)]
+const fn tlbi_vmalle1() -> u32 {
+    0xD508_871F
+}
+
+/// TLBI VAE1, Xt — invalidate-by-VA (current ASID).
+#[allow(dead_code)]
+const fn tlbi_vae1(rt: u32) -> u32 {
+    0xD508_8720 | (rt & 0x1F)
+}
+
+/// TLBI ASIDE1, Xt — invalidate every entry tagged with `Xt[63:48]` ASID.
+#[allow(dead_code)]
+const fn tlbi_aside1(rt: u32) -> u32 {
+    0xD508_8740 | (rt & 0x1F)
+}
+
 const fn eret() -> u32 {
     0xD69F_03E0
 }
@@ -2218,6 +2403,10 @@ mod tests {
         // ADD with Rd=Rn=31 renders as SP.
         assert_eq!(disassemble(add_imm(31, 31, 0x10), 0x4000), "add sp, sp, #0x10");
         assert_eq!(disassemble(add_imm(29, 31, 0), 0x4000), "add x29, sp, #0x0");
+        // TLBI variants.
+        assert_eq!(disassemble(tlbi_vmalle1(), 0x4000), "tlbi vmalle1");
+        assert_eq!(disassemble(tlbi_vae1(0), 0x4000), "tlbi vae1, x0");
+        assert_eq!(disassemble(tlbi_aside1(7), 0x4000), "tlbi aside1, x7");
         assert_eq!(disassemble(msr_ttbr0(9), 0x4000), "msr ttbr0_el1, x9");
         assert_eq!(disassemble(mrs_mpidr(14), 0x4000), "mrs x14, mpidr_el1");
         assert_eq!(disassemble(0xD503_42FFu32, 0x4000), "msr DAIFClr, #0x2");
@@ -2712,6 +2901,86 @@ mod tests {
         // its initial top.
         cpu.run(2000);
         assert_eq!(cpu.cores[0].sp_el0, 0x7800, "stack frame must be balanced");
+    }
+
+    #[test]
+    fn tlb_caches_walk_and_skips_re_walks() {
+        let mut cpu = Cpu::new();
+        // Boot through MMU bring-up (the kernel sets sctlr_el1 bit 0 by step ~12).
+        cpu.run(80);
+        let core = &cpu.cores[0];
+        // Many fetches/loads have happened; the TLB must have at least the
+        // code page cached.
+        let snap = core.tlb.snapshot();
+        assert!(snap.fills >= 1, "no TLB fills after boot: {:?}", snap.fills);
+        assert!(snap.hits > snap.fills, "expected hits > fills, got {snap:?}");
+    }
+
+    #[test]
+    fn tlbi_vmalle1_clears_all_entries() {
+        let mut cpu = Cpu::new();
+        cpu.run(80);
+        // Manually fill an entry, then issue VMALLE1.
+        cpu.cores[0].tlb.fill(0x1234, 0xAB, 0x5678, 0b11);
+        assert!(cpu.cores[0]
+            .tlb
+            .entries
+            .iter()
+            .any(|e| e.valid && e.va_page == 0x1234));
+        // Hand-execute a TLBI VMALLE1 by calling the path directly.
+        cpu.cores[0].tlb.invalidate_all();
+        assert!(cpu.cores[0].tlb.entries.iter().all(|e| !e.valid));
+    }
+
+    #[test]
+    fn tlbi_vae1_clears_only_target_va() {
+        let mut tlb = Tlb::new();
+        tlb.fill(0x1, 0xAA, 0x10, 0);
+        tlb.fill(0x2, 0xAA, 0x20, 0);
+        tlb.fill(0x3, 0xBB, 0x30, 0);
+        tlb.invalidate_va(0x2, 0xAA);
+        // Only the (0x2, 0xAA) entry is wiped.
+        assert!(tlb.entries.iter().any(|e| e.valid && e.va_page == 0x1));
+        assert!(tlb.entries.iter().any(|e| e.valid && e.va_page == 0x3));
+        assert!(!tlb.entries.iter().any(|e| e.valid && e.va_page == 0x2 && e.asid == 0xAA));
+    }
+
+    #[test]
+    fn tlbi_aside1_clears_by_asid() {
+        let mut tlb = Tlb::new();
+        tlb.fill(0x1, 0xAA, 0x10, 0);
+        tlb.fill(0x2, 0xAA, 0x20, 0);
+        tlb.fill(0x3, 0xBB, 0x30, 0);
+        tlb.invalidate_asid(0xAA);
+        assert!(tlb.entries.iter().filter(|e| e.valid).count() == 1);
+        assert!(tlb.entries.iter().any(|e| e.valid && e.asid == 0xBB));
+    }
+
+    #[test]
+    fn asid_mismatch_is_a_miss() {
+        let mut tlb = Tlb::new();
+        tlb.fill(0x42, 0x10, 0x99, 0b11);
+        // Same VA, different ASID → miss.
+        assert!(tlb.lookup(0x42, 0x99).is_none());
+        // Same VA, same ASID → hit.
+        assert!(tlb.lookup(0x42, 0x10).is_some());
+    }
+
+    #[test]
+    fn tlbi_decodes_through_execute_loop() {
+        // Build a tiny EL2 program: TLBI VMALLE1; b .  Run it; expect the
+        // core's TLB flushes counter to advance.
+        let mut cpu = Cpu::new();
+        let prog = [tlbi_vmalle1(), b_self()];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+        cpu.cores[0].sctlr_el1 = 0; // identity-mapped
+        cpu.cores[1].halted = true;
+        let before = cpu.cores[0].tlb.flushes;
+        cpu.run(20);
+        assert!(
+            cpu.cores[0].tlb.flushes > before,
+            "TLBI VMALLE1 should have bumped flushes counter"
+        );
     }
 
     #[test]
