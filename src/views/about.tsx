@@ -36,7 +36,9 @@ v0.11 + LDRB/CBZ/CBNZ/SUB-imm; task B walks disk buffer and prints it
 v0.12 + per-core scheduler — cores 0/1 run A/B concurrently via MPIDR
 v0.13 + WFI — task A sleeps until next IRQ, idle cores stop spinning
 v0.14 + AP-bit enforcement — kernel pages (AIC/Block) reject EL0 access
-v0.15 + disassembler, sci-fi core monitors, editable disk text  ← here
+v0.15 + disassembler, core monitors, editable disk text
+v0.16 + UI overhaul: pin-out SoC schematic, GDS theme tokens, monospace data,
+        12-stat header bar, scheduler pinning + once-only disk printer  ← here
 v1.0  + bare-metal port via m1n1 (same Rust crate runs on real Apple Silicon)`}
           </pre>
         </Card>
@@ -46,7 +48,7 @@ v1.0  + bare-metal port via m1n1 (same Rust crate runs on real Apple Silicon)`}
         <h2 className="text-fg type-base mb-3 font-semibold">Layout</h2>
         <Card>
           <pre className="text-fg-muted type-small overflow-x-auto p-4 leading-relaxed">
-            {`osstudy-web/
+            {`aarch64-study/
 ├── crates/
 │   └── aarch64-sim/        # Rust simulator → wasm-pack → pkg/
 │       ├── src/lib.rs

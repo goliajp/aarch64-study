@@ -37,7 +37,7 @@ export function AppLayout() {
               src="https://cdn.golia.jp/logo-icon.png"
               style={{ filter: 'drop-shadow(0 0 6px var(--gds-accent, #3b82f6))' }}
             />
-            OS Study
+            AArch64 Study
           </Link>
           <nav className="flex items-center gap-1">
             {NAV.map((item) => (
@@ -65,7 +65,7 @@ export function AppLayout() {
       </main>
 
       <footer className="border-border text-fg-muted flex h-8 shrink-0 items-center justify-center border-t bg-white/5 text-xs backdrop-blur-sm">
-        OS Study &middot; AArch64 simulator (Rust → WASM)
+        AArch64 Study &middot; simulator (Rust → WASM)
       </footer>
     </div>
   )

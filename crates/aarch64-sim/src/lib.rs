@@ -249,7 +249,7 @@ impl Block {
             let n = bytes.len().min(SECTOR_SIZE as usize);
             b[off..off + n].copy_from_slice(&bytes[..n]);
         };
-        inscribe(&mut disk, 0, "OSstudy disk image — sector 0\n");
+        inscribe(&mut disk, 0, "AArch64 disk image - sector 0\n");
         inscribe(&mut disk, 1, "Sector 1: kernels run on top of devices\n");
         inscribe(&mut disk, 2, "Sector 2: virtio is the lingua franca\n");
         inscribe(&mut disk, 3, "Sector 3: this is a 64-byte sector\n");
@@ -265,8 +265,14 @@ impl Block {
     }
 
     fn reset(&mut self) {
-        let fresh = Block::new();
-        *self = fresh;
+        // Preserve the disk image (the user's textarea edits live there) and
+        // only clear ephemeral controller state.
+        self.sector = 0;
+        self.buf_addr = 0;
+        self.last_command = 0;
+        self.status = BLK_STATUS_IDLE;
+        self.total_reads = 0;
+        self.total_writes = 0;
     }
 
     fn mmio_read(&self, offset: u64) -> u64 {
@@ -1577,7 +1583,7 @@ fn load_demo(mem: &mut [u8]) {
     //   PA 0x4000  kernel boot
     //   PA 0x4800  sync handler (stub)
     //   PA 0x4880  IRQ handler = scheduler with X0-X3 save/restore
-    //   PA 0x4D00  task A — counter that prints 'A'
+    //   PA 0x4D00  task A — silent WFI sleeper (pinned to core 0)
     //   PA 0x4E00  task B — disk printer (walks 0x6000 byte by byte)
     //   PA 0x4F00  core 0's slot region (entry + save_ptr + 2 save areas)
     //   PA 0x5000  core 1's slot region (same layout)
@@ -1666,70 +1672,39 @@ fn load_demo(mem: &mut [u8]) {
         add_imm(0, 0, 0),
         eret(),
     ];
-    // IRQ handler at VBAR+0x480 — per-core scheduler with X0..X3 save/restore.
-    // Re-derives MY slot region from MPIDR each entry, so the same code runs
-    // on both cores without per-core constants.
-    //   x14 = my slot base (0x4F00 / 0x5000)
-    //   x12 = current save-area ptr  (slot_base + 0x10 or +0x30)
-    //   x15 = "the other" save-area ptr = (2*slot_base + 0x40) - x12
-    let scheduler: [u32; 22] = [
-        // ACK AIC to clear pending
-        movz(9, AIC_BASE as u32, 0),       // 0
-        ldr_imm(10, 9, 0),                  // 1: X10 = irq id (discarded)
-        // X14 = my slot base
-        mrs_mpidr(14),                      // 2: X14 = mpidr
-        movz(9, MPIDR_BASE_HI, 1),          // 3: X9 = 0x80000000
-        sub_reg(14, 14, 9),                 // 4: X14 = mpidr_offset
-        movz(9, SLOT_BASE_BASE, 0),         // 5: X9 = 0x4F00
-        add_reg(14, 9, 14),                 // 6: X14 = slot_base
-        // Load current entry + save-area ptr from my slot
-        ldr_imm(11, 14, 0),                 // 7: X11 = current entry
-        ldr_imm(12, 14, 1),                 // 8: X12 = current save_ptr
-        // Save outgoing X0..X3 to current save area
-        stp_imm(0, 1, 12, 0),               // 9
-        stp_imm(2, 3, 12, 2),               // 10: imm7=2 → +16
-        // Compute "other" entry = TASK_SUM - X11
-        movz(13, TASK_SUM, 0),              // 11
-        sub_reg(13, 13, 11),                // 12: X13 = other entry
-        // Compute "other" save area = (2*slot_base + 0x40) - X12
-        add_reg(15, 14, 14),                // 13: X15 = 2*slot_base
-        add_imm(15, 15, 0x40),              // 14: X15 = 2*slot_base + 0x40
-        sub_reg(15, 15, 12),                // 15: X15 = other save_ptr
-        // Commit new state to my slot
-        str_imm(13, 14, 0),                 // 16
-        str_imm(15, 14, 1),                 // 17
-        // Restore incoming X0..X3 from new save area
-        ldp_imm(0, 1, 15, 0),               // 18
-        ldp_imm(2, 3, 15, 2),               // 19
-        // Switch
-        msr_elr_el1(13),                    // 20
-        eret(),                             // 21
+    // IRQ handler at VBAR+0x480 — minimal: ack the AIC and ERET back to the
+    // *same* preempted task. Tasks are pinned per core (core 0 = task A,
+    // core 1 = task B), so no context-switch is needed and the UART output
+    // stays monotonic (only one core ever writes it).
+    let scheduler: [u32; 3] = [
+        movz(9, AIC_BASE as u32, 0), // 0: X9 = AIC_BASE
+        ldr_imm(10, 9, 0),           // 1: X10 = irq id (read clears pending)
+        eret(),                      // 2: return to preempted task
     ];
-    // Task A — print one 'A' per scheduling round, then WFI (sleep until the
-    // next IRQ). X3 still accumulates across switches as a tick counter.
-    let task_a: [u32; 6] = [
-        movz(1, UART_OUT as u32, 0),
-        add_imm(3, 3, 1),                   // X3 = X3 + 1 (tick counter)
-        movz(0, b'A' as u32, 0),
-        str_imm(0, 1, 0),                   // print 'A'
-        wfi(),                              // sleep until next IRQ
-        b_offset(-4),                       // when scheduler resumes us at top, fall through
+    // Task A — pure WFI sleeper. Bumps X3 each scheduling round so the
+    // counter is observable, then sleeps until the next IRQ. Does not touch
+    // UART, so task B's output stays clean.
+    let task_a: [u32; 3] = [
+        add_imm(3, 3, 1), // X3 += 1 (tick counter)
+        wfi(),            // sleep until next IRQ
+        b_offset(-2),     // resume → loop back to add+wfi
     ];
-    // Task B — "disk printer". X3 holds the next byte offset into the disk
-    // buffer at PA 0x6000 (preserved across context switches via the save
-    // area). Each iteration: re-init X1/X4, compute X4 = base + X3, load byte;
-    // if zero → reset X3 and re-enter; else → emit, X3++, re-enter.
+    // Task B — "disk printer". Walks the 64-byte disk buffer at PA 0x6000
+    // once, emitting each byte to the UART. On hitting the null terminator
+    // it parks itself in WFI forever so the disk content is printed exactly
+    // once. The trailing `b -1` keeps us pinned at the WFI on every IRQ
+    // resume (otherwise PC advances past WFI into UDF).
     let task_b: [u32; 10] = [
-        movz(1, UART_OUT as u32, 0),    // 0: X1 = UART
-        movz(4, 0x6000, 0),             // 1: X4 = disk buffer base
-        add_reg(4, 4, 3),               // 2: X4 += X3
-        ldrb_imm(0, 4, 0),              // 3: W0 = byte at X4
-        cbz(0, 4),                      // 4: if zero, branch to inst 8 (restart)
-        str_imm(0, 1, 0),               // 5: STR X0, [X1] — emit byte to UART
-        add_imm(3, 3, 1),               // 6: X3 += 1
-        b_offset(-7),                   // 7: → inst 0 (loop)
-        movz(3, 0, 0),                  // 8: restart — X3 = 0
-        b_offset(-8),                   // 9: → inst 1 (skip MOVZ X1 since fall-through)
+        movz(1, UART_OUT as u32, 0), // 0: X1 = UART
+        movz(4, 0x6000, 0),          // 1: X4 = disk buffer base
+        add_reg(4, 4, 3),            // 2: X4 += X3
+        ldrb_imm(0, 4, 0),           // 3: W0 = byte at X4
+        cbz(0, 4),                   // 4: if zero, branch to inst 8 (wfi)
+        str_imm(0, 1, 0),            // 5: STR X0, [X1] — emit byte to UART
+        add_imm(3, 3, 1),            // 6: X3 += 1
+        b_offset(-6),                // 7: → inst 1 (re-init X4 = 0x6000 + X3)
+        wfi(),                       // 8: parked — printed once, sleep
+        b_offset(-1),                // 9: on IRQ resume, jump back to wfi
     ];
 
     write_words(mem, ENTRY_PC, &kernel);
@@ -1939,29 +1914,30 @@ mod tests {
     #[test]
     fn cores_split_to_different_tasks_before_first_tick() {
         // 35-inst kernel, timer at step 80. After 60 steps both cores have
-        // ERETed: core 0 into task A (prints 'A'), core 1 into task B
-        // (disk printer — first byte is 'O' from "OSstudy…").
+        // ERETed: core 0 into task A (silent WFI), core 1 into task B (the
+        // disk printer that walks "AArch64 disk image - sector 0\n").
         let mut cpu = Cpu::new();
         cpu.run(60);
         let out = cpu.output();
         assert!(!out.is_empty(), "no output yet: {:?}", out);
-        // We should see BOTH 'A' (from core 0) and 'O' (from core 1).
-        assert!(out.contains('A'), "no A: {:?}", out);
-        assert!(out.contains('O'), "no O (disk content): {:?}", out);
+        // Only task B prints; output begins with the disk content prefix.
+        assert!(out.starts_with('A'), "expected disk-content prefix, got: {:?}", out);
         assert!(!cpu.cores[0].halted);
         assert!(!cpu.cores[1].halted);
     }
 
     #[test]
-    fn scheduler_swaps_each_core_to_other_task() {
+    fn tasks_pinned_per_core_after_irqs() {
         let mut cpu = Cpu::new();
-        // Run long enough for ≥ 2 timer ticks. After tick 1: core 0 → B,
-        // core 1 → A. After tick 2: core 0 → A again, core 1 → B again.
+        // Run long enough for ≥ 2 timer ticks. With the minimal scheduler
+        // each core's task entry stays the same across IRQs.
         cpu.run(200);
         assert!(cpu.timer_ticks >= 2);
         let out = cpu.output();
-        assert!(out.contains('A'), "no A: {:?}", out);
-        assert!(out.contains('O'), "no disk content (O): {:?}", out);
+        // Task B (core 1) printed once and parked in WFI. Output is the disk
+        // content with no task-A interleaving, length capped at 64 bytes.
+        assert!(out.starts_with('A'), "expected disk-content prefix, got: {:?}", out);
+        assert!(out.len() <= 64, "task B should print once, got {} bytes", out.len());
     }
 
     #[test]
@@ -1971,17 +1947,13 @@ mod tests {
         let read_u64 = |mem: &[u8], pa: usize| -> u64 {
             u64::from_le_bytes(mem[pa..pa + 8].try_into().unwrap())
         };
-        // Core 0's slot is at 0x4F00, core 1's at 0x5000. Both should hold
-        // valid task entry pointers (either A_entry=0x4D00 or B_entry=0x4E00).
+        // Core 0's slot is at 0x4F00, core 1's at 0x5000. With pinned tasks
+        // they stay on their initial entries (A on core 0, B on core 1).
         let core0_entry = read_u64(&cpu.mem, 0x4F00);
         let core1_entry = read_u64(&cpu.mem, 0x5000);
-        assert!(core0_entry == 0x4D00 || core0_entry == 0x4E00, "{:#x}", core0_entry);
-        assert!(core1_entry == 0x4D00 || core1_entry == 0x4E00, "{:#x}", core1_entry);
-        // After enough ticks they should have swapped at least once, but at
-        // any sample point they should be on DIFFERENT tasks (since they
-        // started on different ones and swap in lockstep with the timer).
-        assert_ne!(core0_entry, core1_entry, "cores ended up on same task");
-        // Save-area pointers point inside their own slot region.
+        assert_eq!(core0_entry, 0x4D00, "core 0 should be on task A");
+        assert_eq!(core1_entry, 0x4E00, "core 1 should be on task B");
+        // Save-area pointers stay inside their own slot region.
         let core0_save = read_u64(&cpu.mem, 0x4F08);
         let core1_save = read_u64(&cpu.mem, 0x5008);
         assert!((0x4F00..0x5000).contains(&core0_save), "core0 save_ptr escaped: {:#x}", core0_save);
@@ -1994,7 +1966,7 @@ mod tests {
         // 35-inst kernel; run 50 to ensure both cores finished disk read.
         cpu.run(50);
         let buf = &cpu.mem[0x6000..0x6010];
-        assert_eq!(&buf[..7], b"OSstudy");
+        assert_eq!(&buf[..7], b"AArch64");
         let snap = cpu.block.snapshot();
         assert!(snap.total_reads >= 2, "total_reads = {}", snap.total_reads);
         assert_eq!(snap.status, BLK_STATUS_OK);

@@ -25,17 +25,28 @@ if (saved) {
   root.dataset.theme = mode
 }
 
-const router = createBrowserRouter([
-  {
-    children: [
-      { element: <CpuView />, index: true },
-      { element: <AboutView />, path: 'about' },
-      { element: <Navigate replace to="/" />, path: '*' },
-    ],
-    element: <AppLayout />,
-    path: '/',
-  },
-])
+// In production the app is mounted under labs.golia.jp/aarch64; vite injects
+// the base path it built with as `import.meta.env.BASE_URL`. Strip the
+// trailing slash so React Router treats it as a router basename.
+const ROUTER_BASE =
+  import.meta.env.BASE_URL && import.meta.env.BASE_URL !== '/'
+    ? import.meta.env.BASE_URL.replace(/\/$/, '')
+    : undefined
+
+const router = createBrowserRouter(
+  [
+    {
+      children: [
+        { element: <CpuView />, index: true },
+        { element: <AboutView />, path: 'about' },
+        { element: <Navigate replace to="/" />, path: '*' },
+      ],
+      element: <AppLayout />,
+      path: '/',
+    },
+  ],
+  ROUTER_BASE ? { basename: ROUTER_BASE } : undefined
+)
 
 const queryClient = new QueryClient({
   defaultOptions: {

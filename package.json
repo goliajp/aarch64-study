@@ -1,11 +1,30 @@
 {
-  "name": "@goliapkg/osstudy-web",
+  "name": "aarch64-study",
   "private": true,
-  "version": "0.10.0",
+  "version": "0.16.0",
   "type": "module",
+  "description": "AArch64 SoC simulator in the browser — teach OS internals one architectural concept per version (Rust → WASM)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/goliajp/aarch64-study.git"
+  },
+  "homepage": "https://labs.golia.jp/aarch64/",
+  "bugs": "https://github.com/goliajp/aarch64-study/issues",
+  "keywords": [
+    "aarch64",
+    "arm64",
+    "simulator",
+    "operating-system",
+    "education",
+    "rust",
+    "wasm",
+    "react"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && prettier --write src/ && vite build",
+    "deploy": "bun run build && rsync -avz --delete dist/ t01:/apps/labs/aarch64/",
     "preview": "vite preview",
     "check": "tsc --noEmit && eslint src/ && prettier --check src/",
     "fix": "eslint --fix src/ && prettier --write src/",

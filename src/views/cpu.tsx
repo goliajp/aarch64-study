@@ -1,4 +1,4 @@
-import { Badge, GlassButton, GlassCard } from '@goliapkg/gds'
+import { Badge, Button, Card, GlassButton } from '@goliapkg/gds'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import init, { Cpu, disassemble } from 'aarch64-sim'
@@ -110,7 +110,7 @@ interface TranslationResult {
 }
 
 const REG_LABELS = Array.from({ length: 31 }, (_, i) => `X${i}`)
-const MEMORY_VIEW_BYTES = 256
+const MEMORY_VIEW_BYTES = 512
 const RUN_BURST = 2
 
 function fmtHex64(v: bigint): string {
@@ -332,21 +332,37 @@ export function CpuView() {
   }, [cpu, refresh])
 
   const onRunToggle = useCallback(() => {
-    setRunning((r) => !r)
-  }, [])
+    setRunning((r) => {
+      // Resuming from auto-pause: if every core is already idle (halted or
+      // WFI), pressing Run again would just immediately re-pause. Reset
+      // first so the user gets a fresh boot run.
+      if (!r && cpu) {
+        const states = cpu.state() as CoreState[]
+        if (states.length > 0 && states.every((s) => s.halted || s.wfi_halted)) {
+          cpu.reset()
+          refresh(cpu)
+        }
+      }
+      return !r
+    })
+  }, [cpu, refresh])
 
   useEffect(() => {
     if (!running || !cpu) return
+    // The system has nothing left to observe when every core is either
+    // halted (trap / b-to-self) or parked in WFI. Auto-run pauses itself in
+    // that case — the user can press Step to keep poking, or Reset.
+    const allIdle = (states: CoreState[]) => states.every((s) => s.halted || s.wfi_halted)
     const tick = () => {
       const states = cpu.state() as CoreState[]
-      if (states.every((s) => s.halted)) {
+      if (allIdle(states)) {
         setRunning(false)
         return
       }
       cpu.run(RUN_BURST)
       refresh(cpu)
       const after = cpu.state() as CoreState[]
-      if (after.every((s) => s.halted)) {
+      if (allIdle(after)) {
         setRunning(false)
         return
       }
@@ -383,7 +399,7 @@ export function CpuView() {
   const corePcs = cores.map((c) => Number(c.pc))
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <header className="space-y-2">
         <div className="flex flex-wrap items-center gap-3">
           <h1
@@ -392,27 +408,38 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.15</Badge>
+          <Badge variant="info">v0.16</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
-          {allHalted ? (
-            <Badge color={anyTrap ? 'danger' : 'success'}>{anyTrap ? 'TRAP' : 'ALL HALTED'}</Badge>
+          {anyTrap ? (
+            <Badge variant="danger">TRAP</Badge>
+          ) : allHalted ? (
+            <Badge variant="success">ALL HALTED</Badge>
+          ) : running ? (
+            <Badge>
+              <span className="live-pulse mr-1 inline-block h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              RUNNING
+            </Badge>
+          ) : cores.every((c) => c.wfi_halted) ? (
+            <Badge variant="info">IDLE</Badge>
           ) : (
-            <Badge>RUNNING</Badge>
+            <Badge variant="info">PAUSED</Badge>
           )}
         </div>
         <p className="text-fg-muted type-small max-w-2xl">
-          UI overhaul: live <strong>SCI-FI core monitors</strong> on the right rail (registers, EL,
-          peripheral links, activity blip), a <strong>disassembly panel</strong> centered on PC (we
-          built a small ARM disassembler in the WASM crate), and an{' '}
-          <strong>editable disk sector 0</strong> at the bottom — type whatever you want and task B
-          will print it.
+          A 2-core AArch64 SoC running entirely in the browser. The right rail is a{' '}
+          <strong>pin-out schematic</strong> with a 4-lane bus and event packets that fly along the
+          matching lane (DATA / ADDR / IRQ / CTRL). The <strong>disassembly</strong> panel is
+          centered on PC; the <strong>disk sector 0</strong> at the top is editable — type whatever
+          you want and task B will print it via the UART.
         </p>
       </header>
 
       <ControlBar
+        aic={aic}
         block={block}
+        cores={cores}
         cpu={cpu}
         onRefresh={refresh}
         onReset={onReset}
@@ -421,6 +448,7 @@ export function CpuView() {
         running={running}
         sysInfo={sysInfo}
         totalCoreSteps={cores.reduce((a, c) => a + c.steps, 0n)}
+        uartBytes={output.length}
       />
 
       {anyTrap && anyTrap.last_trap && (
@@ -429,11 +457,8 @@ export function CpuView() {
         </div>
       )}
 
-      <OutputPanel output={output} />
-
-      <div className="grid min-w-0 gap-4 xl:grid-cols-3">
-        <DisassemblyPanel cpu={cpu} cores={cores} />
-        <MemoryPanel base={memBaseAddr} bytes={memory} pcs={corePcs} />
+      {/* Strict 3-col grid — every panel is exactly 1/3 width, no col-span. */}
+      <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-3">
         <SystemDiagram
           aic={aic}
           block={block}
@@ -442,27 +467,40 @@ export function CpuView() {
           output={output}
           slots={coreSlots}
         />
-      </div>
-
-      <MmuPanel
-        cores={cores}
-        onCoreChange={setTranslateCoreIdx}
-        onVaChange={setVaText}
-        selectedCoreIdx={translateCoreIdx}
-        trace={trace}
-        vaText={vaText}
-      />
-
-      <div className="grid gap-4 lg:grid-cols-3">
-        <AicPanel aic={aic} />
+        {/* MMU on top, Output below — Output's <pre> stretches to fill the
+            rest of the column's height (so it matches the tall
+            SystemDiagram on the left). */}
+        <div className="flex h-full flex-col gap-4">
+          <MmuPanel
+            cores={cores}
+            onCoreChange={setTranslateCoreIdx}
+            onVaChange={setVaText}
+            selectedCoreIdx={translateCoreIdx}
+            trace={trace}
+            vaText={vaText}
+          />
+          <div className="min-h-0 flex-1">
+            <OutputPanel output={output} />
+          </div>
+        </div>
+        <DisassemblyPanel cpu={cpu} cores={cores} />
+        {/* Memory + per-core save areas + AIC stacked vertically. Memory
+            is the dominant content and grows to fill any leftover height
+            so the column matches the taller right column. */}
+        <div className="flex h-full flex-col gap-4">
+          <div className="min-h-0 flex-1">
+            <MemoryPanel base={memBaseAddr} bytes={memory} pcs={corePcs} />
+          </div>
+          <SavePanel slots={coreSlots} />
+          <AicPanel aic={aic} />
+        </div>
+        {/* core 0 over core 1 stacked. */}
+        <div className="space-y-4">
+          {cores.map((c) => (
+            <CoreColumn core={c} key={c.id} onStep={() => onStepCore(c.id)} />
+          ))}
+        </div>
         <BlockPanel block={block} />
-        <SavePanel slots={coreSlots} />
-      </div>
-
-      <div className="grid gap-4 lg:grid-cols-2">
-        {cores.map((c) => (
-          <CoreColumn core={c} key={c.id} onStep={() => onStepCore(c.id)} />
-        ))}
       </div>
     </div>
   )
@@ -485,9 +523,7 @@ function inferTaskLabel(pc: bigint): string | null {
 const SECTOR_SIZE = 64
 
 function BlockPanel({ block }: { block: BlockState }) {
-  const [sector, setSector] = useState(0)
   const numSectors = Math.floor(block.disk.length / SECTOR_SIZE)
-  const slice = new Uint8Array(block.disk.slice(sector * SECTOR_SIZE, (sector + 1) * SECTOR_SIZE))
   const statusLabel =
     block.status === 0n
       ? 'IDLE'
@@ -497,11 +533,11 @@ function BlockPanel({ block }: { block: BlockState }) {
           ? 'FAULT'
           : `0x${block.status.toString(16)}`
   return (
-    <GlassCard>
+    <Card padding="none">
       <div className="space-y-3 p-4">
         <div className="text-fg-muted flex items-center justify-between">
           <span className="type-small font-semibold tracking-wider uppercase">
-            Block device · disk image (8 × 64-byte sectors @ MMIO 0x3000)
+            Block device · disk image ({numSectors} × 64-byte sectors @ MMIO 0x3000)
           </span>
           <span className="type-small">
             reads {block.total_reads.toString()} · writes {block.total_writes.toString()}
@@ -516,26 +552,21 @@ function BlockPanel({ block }: { block: BlockState }) {
             <span className="text-fg">{statusLabel}</span>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-1">
-          <span className="text-fg-muted type-small mr-2">view sector</span>
-          {Array.from({ length: numSectors }, (_, i) => (
-            <button
-              className={`type-small rounded border px-2 py-0.5 ${
-                i === sector
-                  ? 'border-accent bg-accent/10 text-accent'
-                  : 'border-border text-fg-muted hover:bg-bg-tertiary'
-              }`}
-              key={i}
-              onClick={() => setSector(i)}
-              type="button"
-            >
-              {i}
-            </button>
-          ))}
+        <div className="space-y-2">
+          {Array.from({ length: numSectors }, (_, i) => {
+            const slice = new Uint8Array(block.disk.slice(i * SECTOR_SIZE, (i + 1) * SECTOR_SIZE))
+            return (
+              <div className="border-border rounded border px-2 py-1.5" key={i}>
+                <div className="text-fg-muted type-small mb-1 tracking-wider uppercase">
+                  sector {i}
+                </div>
+                <DiskHexRow bytes={slice} sector={i} />
+              </div>
+            )
+          })}
         </div>
-        <DiskHexRow bytes={slice} sector={sector} />
       </div>
-    </GlassCard>
+    </Card>
   )
 }
 
@@ -546,7 +577,7 @@ function DiskHexRow({ bytes, sector }: { bytes: Uint8Array; sector: number }) {
   }
   const baseAddr = sector * SECTOR_SIZE
   return (
-    <div className="type-small overflow-x-auto">
+    <div className="mono-data type-small overflow-x-auto">
       {rows.map((row, ri) => {
         let ascii = ''
         for (let i = 0; i < row.length; i++) {
@@ -571,12 +602,12 @@ function DiskHexRow({ bytes, sector }: { bytes: Uint8Array; sector: number }) {
 
 function SavePanel({ slots }: { slots: CoreSlot[] }) {
   return (
-    <GlassCard>
+    <Card padding="none">
       <div className="space-y-2 p-4">
         <div className="text-fg-muted type-small font-semibold tracking-wider uppercase">
           Per-core scheduler slots — entry + save_ptr + 2 save areas each
         </div>
-        <div className="grid gap-3 lg:grid-cols-2">
+        <div className="grid gap-3">
           {slots.map((slot, i) => (
             <CoreSlotCard base={i === 0 ? 0x4f00 : 0x5000} coreId={i} key={i} slot={slot} />
           ))}
@@ -588,7 +619,7 @@ function SavePanel({ slots }: { slots: CoreSlot[] }) {
           into the other task. X3 is preserved across context switches.
         </div>
       </div>
-    </GlassCard>
+    </Card>
   )
 }
 
@@ -597,7 +628,7 @@ function CoreSlotCard({ base, coreId, slot }: { base: number; coreId: number; sl
   const activeIdx =
     slot.savePtr === BigInt(base + 0x10) ? 0 : slot.savePtr === BigInt(base + 0x30) ? 1 : null
   return (
-    <div className="border-border bg-bg/40 type-small space-y-2 rounded border px-3 py-2">
+    <div className="border-border bg-bg-secondary type-small space-y-2 rounded border px-3 py-2">
       <div className="text-fg-muted type-small flex items-center justify-between tracking-wider uppercase">
         <span>
           core {coreId} slot @ 0x{base.toString(16)}
@@ -609,49 +640,75 @@ function CoreSlotCard({ base, coreId, slot }: { base: number; coreId: number; sl
         <RegRow label="save_ptr" value={slot.savePtr} />
       </div>
       <div className="grid gap-2 sm:grid-cols-2">
-        <SaveAreaCard
-          active={activeIdx === 0}
-          label={`save 0 @ 0x${(base + 0x10).toString(16)}`}
-          save={slot.save0}
-        />
-        <SaveAreaCard
-          active={activeIdx === 1}
-          label={`save 1 @ 0x${(base + 0x30).toString(16)}`}
-          save={slot.save1}
-        />
+        <SaveAreaCard active={activeIdx === 0} addr={base + 0x10} index={0} save={slot.save0} />
+        <SaveAreaCard active={activeIdx === 1} addr={base + 0x30} index={1} save={slot.save1} />
       </div>
     </div>
   )
 }
 
-function SaveAreaCard({ active, label, save }: { active: boolean; label: string; save: TaskSave }) {
+function SaveAreaCard({
+  active,
+  addr,
+  index,
+  save,
+}: {
+  active: boolean
+  addr: number
+  index: number
+  save: TaskSave
+}) {
   const x0Char = Number(save.x0 & 0xffn)
   const ascii = x0Char >= 0x20 && x0Char < 0x7f ? `'${String.fromCharCode(x0Char)}'` : ''
   return (
     <div
-      className={`rounded border px-2 py-1 ${
+      className={`min-w-0 rounded border px-2 py-1 ${
         active ? 'border-accent/60 bg-accent/5' : 'border-border'
       }`}
     >
       <div
-        className={`type-small mb-1 flex items-center justify-between tracking-wider uppercase ${
+        className={`type-small mb-1 flex items-center justify-between gap-2 tracking-wider uppercase ${
           active ? 'text-accent' : 'text-fg-muted'
         }`}
       >
-        <span>{label}</span>
-        {active && <span>active</span>}
+        <span className="min-w-0 truncate">
+          save {index} · 0x{addr.toString(16)}
+        </span>
+        {active && <span className="shrink-0">active</span>}
       </div>
-      <RegRow label={`X0 ${ascii}`} value={save.x0} />
-      <RegRow label="X1" value={save.x1} />
-      <RegRow label="X2" value={save.x2} />
-      <RegRow highlight label="X3" value={save.x3} />
+      <SaveRegRow label={`X0 ${ascii}`} value={save.x0} />
+      <SaveRegRow label="X1" value={save.x1} />
+      <SaveRegRow label="X2" value={save.x2} />
+      <SaveRegRow highlight label="X3" value={save.x3} />
+    </div>
+  )
+}
+
+// Compact RegRow for the per-core save areas — these columns are too narrow
+// for a 16-hex-digit value, so we render only the lower 32 bits (the upper
+// bits are zero for ASCII saves anyway).
+function SaveRegRow({
+  highlight,
+  label,
+  value,
+}: {
+  highlight?: boolean
+  label: string
+  value: bigint
+}) {
+  return (
+    <div className={`type-small flex justify-between gap-2 ${highlight ? 'text-accent' : ''}`}>
+      <span className="text-fg-muted shrink-0">{label}</span>
+      <span className={`mono-data truncate ${value === 0n ? 'text-fg-muted' : 'text-fg'}`}>
+        0x{(Number(value & 0xffffffffn) >>> 0).toString(16).padStart(8, '0')}
+      </span>
     </div>
   )
 }
 
 function AicPanel({ aic }: { aic: AicState }) {
   return (
-    <GlassCard>
+    <Card padding="none">
       <div className="space-y-2 p-4">
         <div className="text-fg-muted flex items-center justify-between">
           <span className="type-small font-semibold tracking-wider uppercase">
@@ -663,7 +720,10 @@ function AicPanel({ aic }: { aic: AicState }) {
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           {aic.pending.map((bits, i) => (
-            <div className="border-border bg-bg/40 type-small rounded border px-3 py-2" key={i}>
+            <div
+              className="border-border bg-bg-secondary type-small rounded border px-3 py-2"
+              key={i}
+            >
               <div className="text-fg-muted type-small mb-1 tracking-wider uppercase">
                 core {i} pending
               </div>
@@ -674,7 +734,7 @@ function AicPanel({ aic }: { aic: AicState }) {
                     <span
                       className={
                         (bits & (1 << b)) !== 0
-                          ? 'rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-amber-300'
+                          ? 'rounded border border-amber-500/60 bg-amber-500/20 px-1.5 py-0.5 text-amber-900 dark:text-amber-100'
                           : 'border-border text-fg-muted rounded border px-1.5 py-0.5'
                       }
                       key={name}
@@ -688,7 +748,7 @@ function AicPanel({ aic }: { aic: AicState }) {
           ))}
         </div>
       </div>
-    </GlassCard>
+    </Card>
   )
 }
 
@@ -700,17 +760,64 @@ function AicPanel({ aic }: { aic: AicState }) {
 // at the bottom. SimEvents render as coloured packets flying along the
 // matching bus lane.
 
-const SVG_W = 440
-const SVG_H = 480
-const BUS_Y = 188
+// Dense pin-out chip-style schematic. Two core chips at the top (with internal
+// sub-blocks for REGS / MMU / EXC / DAIF), a 4-lane parallel bus below them
+// (DATA / ADDR / IRQ / CTRL), peripheral chips on the bus, and the RAM laid
+// out as a fixed-region grid. Event packets fly straight from a chip's pin
+// down/up to the matching pin on its peer, so they visually traverse the
+// correct lane.
+const SVG_W = 480
+const SVG_H = 680
 
+// Four-lane bus geometry (each lane is one of DATA / ADDR / IRQ / CTRL).
+const LANE_DATA_Y = 234
+const LANE_ADDR_Y = 254
+const LANE_IRQ_Y = 274
+const LANE_CTRL_Y = 294
+const LANE_LEFT_X = 14
+const LANE_RIGHT_X = SVG_W - 14
+
+// Core chip outer rectangles.
+const CORE_W = 226
+const CORE_H = 200
+const CORE_Y = 14
+const CORE0_X = 12
+const CORE1_X = SVG_W - CORE_W - 12
+
+// Peripheral chip strip.
+const PERIPH_Y = 326
+const PERIPH_H = 104
+const AIC_X = 20
+const UART_X = 174
+const BLK_X = 332
+const PERIPH_W = 130
+
+// RAM grid rectangle.
+const RAM_X = 20
+const RAM_Y = 458
+const RAM_W = SVG_W - 40
+const RAM_H = 210
+
+// Pin positions per chip — used both for drawing stubs and for routing packets.
+// x is the absolute SVG x of the pin; the y is on the chip's edge.
+const corePins = (coreX: number) => ({
+  data: coreX + 32,
+  addr: coreX + 92,
+  irq: coreX + 152,
+  ctrl: coreX + 198,
+})
+const aicPins = { irq: AIC_X + 32, ack: AIC_X + 78, mask: AIC_X + 110 }
+const uartPins = { data: UART_X + 36, csel: UART_X + 92 }
+const blkPins = { data: BLK_X + 30, csel: BLK_X + 70, irq: BLK_X + 110 }
+
+// Centre x for each chip (used by labels and as a visual anchor).
 const NODE_POS: Record<NodeId, { x: number; y: number }> = {
-  core0: { x: 110, y: 78 },
-  core1: { x: 330, y: 78 },
-  aic: { x: 70, y: 280 },
-  uart: { x: 190, y: 280 },
-  block: { x: 310, y: 280 },
-  ram: { x: 220, y: 410 },
+  core0: { x: CORE0_X + CORE_W / 2, y: CORE_Y + CORE_H / 2 },
+  core1: { x: CORE1_X + CORE_W / 2, y: CORE_Y + CORE_H / 2 },
+  aic: { x: AIC_X + PERIPH_W / 2, y: PERIPH_Y + PERIPH_H / 2 },
+  uart: { x: UART_X + PERIPH_W / 2, y: PERIPH_Y + PERIPH_H / 2 },
+  block: { x: BLK_X + PERIPH_W / 2, y: PERIPH_Y + PERIPH_H / 2 },
+  ram: { x: RAM_X + RAM_W / 2, y: RAM_Y + RAM_H / 2 },
 }
 
 function SystemDiagram({
@@ -731,349 +838,663 @@ function SystemDiagram({
   const ramRegions = useMemo(
     () =>
       [
-        { addr: 0x1000, label: 'UART' },
-        { addr: 0x2000, label: 'AIC' },
-        { addr: 0x3000, label: 'BLK' },
-        { addr: 0x4000, label: 'kernel/tasks' },
-        { addr: 0x4f00, label: 'core 0 slots' },
-        { addr: 0x5000, label: 'core 1 slots' },
+        { addr: 0x0000, label: 'vectors' },
+        { addr: 0x1000, label: 'UART mmio' },
+        { addr: 0x2000, label: 'AIC mmio' },
+        { addr: 0x3000, label: 'BLK mmio' },
+        { addr: 0x4000, label: 'kernel' },
+        { addr: 0x4d00, label: 'task A' },
+        { addr: 0x4e00, label: 'task B' },
+        { addr: 0x4f00, label: 'core 0 ctx' },
+        { addr: 0x5000, label: 'core 1 ctx' },
         { addr: 0x6000, label: 'disk buf' },
-        { addr: 0x8000, label: 'page tables' },
+        { addr: 0x7000, label: 'free' },
+        { addr: 0x8000, label: 'page tbls' },
       ] as const,
     []
   )
   return (
-    <div className="border-border bg-bg/60 relative rounded-xl border p-3">
-      <div className="text-fg-muted mb-2 flex items-center justify-between">
-        <span className="type-small font-semibold tracking-wider uppercase">
-          System layout · live event flow
-        </span>
-        <span className="type-small">{events.length > 0 ? `${events.length} active` : 'idle'}</span>
-      </div>
-      <svg
-        className="block w-full"
-        viewBox={`0 0 ${SVG_W} ${SVG_H}`}
-        xmlns="http://www.w3.org/2000/svg"
-      >
-        {/* Static system bus */}
-        <line
-          stroke="rgb(148 163 184 / 0.35)"
-          strokeWidth="1.5"
-          x1="20"
-          x2={SVG_W - 20}
-          y1={BUS_Y}
-          y2={BUS_Y}
-        />
-        <text
-          fill="rgb(148 163 184 / 0.6)"
-          fontFamily="'Roboto Flex'"
-          fontSize="9"
-          x={SVG_W - 24}
-          y={BUS_Y - 6}
-          textAnchor="end"
-        >
-          system bus
-        </text>
-
-        {/* Stub lines from cores down to bus, from bus up/down to peripherals */}
-        {(['core0', 'core1'] as const).map((id) => (
-          <line
-            key={id}
-            stroke="rgb(148 163 184 / 0.3)"
-            strokeWidth="1"
-            x1={NODE_POS[id].x}
-            x2={NODE_POS[id].x}
-            y1={NODE_POS[id].y + 64}
-            y2={BUS_Y}
-          />
-        ))}
-        {(['aic', 'uart', 'block'] as const).map((id) => (
-          <line
-            key={id}
-            stroke="rgb(148 163 184 / 0.3)"
-            strokeWidth="1"
-            x1={NODE_POS[id].x}
-            x2={NODE_POS[id].x}
-            y1={BUS_Y}
-            y2={NODE_POS[id].y - 32}
-          />
-        ))}
-        {/* RAM bus -- lower half */}
-        <line
-          stroke="rgb(148 163 184 / 0.3)"
-          strokeWidth="1"
-          x1={NODE_POS.ram.x}
-          x2={NODE_POS.ram.x}
-          y1={NODE_POS.block.y + 36}
-          y2={NODE_POS.ram.y - 14}
-        />
-
-        {/* Cores */}
-        <CoreBox core={cores[0]} pos={NODE_POS.core0} slot={slots[0]} />
-        <CoreBox core={cores[1]} pos={NODE_POS.core1} slot={slots[1]} />
-
-        {/* Peripherals */}
-        <AicBox aic={aic} pos={NODE_POS.aic} />
-        <UartBox output={output} pos={NODE_POS.uart} />
-        <BlockBox block={block} pos={NODE_POS.block} />
-        <RamBox pos={NODE_POS.ram} regions={ramRegions} />
-      </svg>
-
-      {/* Animated event packets (HTML overlay positioned over the SVG) */}
-      <div
-        className="pointer-events-none absolute inset-0"
-        style={{ paddingTop: 28, paddingLeft: 12, paddingRight: 12 }}
-      >
-        <div className="relative h-full w-full">
-          {events.map((e) => (
-            <EventPacket event={e} key={e.id} />
-          ))}
+    <Card padding="none">
+      <div className="relative p-3">
+        <div className="text-fg-muted mb-2 flex items-center justify-between">
+          <span className="type-small font-semibold tracking-wider uppercase">
+            AArch64 SoC · pin-out
+          </span>
+          <span className="type-small">
+            {events.length > 0 ? `${events.length} active` : 'idle'}
+          </span>
         </div>
-      </div>
-    </div>
-  )
-}
-
-function CoreBox({
-  core,
-  pos,
-  slot,
-}: {
-  core: CoreState
-  pos: { x: number; y: number }
-  slot: CoreSlot
-}) {
-  const accent = core.id === 0 ? '#22d3ee' : '#a78bfa'
-  const taskLabel = slot.entry === 0x4d00n ? 'task A' : slot.entry === 0x4e00n ? 'task B' : '—'
-  const stateLine = core.last_trap ? 'TRAP' : core.halted ? 'HALT' : core.wfi_halted ? 'WFI' : 'RUN'
-  return (
-    <g>
-      <rect
-        fill="rgb(15 23 42 / 0.9)"
-        height="64"
-        rx="4"
-        stroke={accent}
-        strokeOpacity="0.55"
-        strokeWidth="1"
-        width="160"
-        x={pos.x - 80}
-        y={pos.y}
-      />
-      <text
-        fill={accent}
-        fontFamily="'Roboto Flex'"
-        fontSize="11"
-        fontWeight="bold"
-        x={pos.x - 72}
-        y={pos.y + 14}
-      >
-        core {core.id}
-      </text>
-      <text
-        fill="rgb(148 163 184 / 0.85)"
-        fontFamily="'Roboto Flex'"
-        fontSize="9"
-        x={pos.x - 72}
-        y={pos.y + 26}
-      >
-        {core.kind}
-      </text>
-      <text
-        fill={accent}
-        fontFamily="'Roboto Flex'"
-        fontSize="9"
-        x={pos.x + 72}
-        y={pos.y + 14}
-        textAnchor="end"
-      >
-        EL{core.current_el}
-      </text>
-      <text
-        fill="rgb(241 245 249 / 0.95)"
-        fontFamily="'Roboto Flex'"
-        fontSize="9"
-        x={pos.x + 72}
-        y={pos.y + 26}
-        textAnchor="end"
-      >
-        {stateLine}
-      </text>
-      {/* PC + task */}
-      <text
-        fill="rgb(241 245 249 / 0.95)"
-        fontFamily="'Roboto Flex'"
-        fontSize="11"
-        x={pos.x - 72}
-        y={pos.y + 44}
-      >
-        pc {fmtHex32(Number(core.pc))}
-      </text>
-      <text
-        fill="rgb(148 163 184 / 0.85)"
-        fontFamily="'Roboto Flex'"
-        fontSize="9"
-        x={pos.x - 72}
-        y={pos.y + 56}
-      >
-        {taskLabel} · daif {core.daif.toString(16).padStart(1, '0')}
-      </text>
-    </g>
-  )
-}
-
-function PeripheralBox({
-  accent,
-  lines,
-  pos,
-  title,
-  width = 92,
-}: {
-  accent: string
-  lines: string[]
-  pos: { x: number; y: number }
-  title: string
-  width?: number
-}) {
-  const halfW = width / 2
-  return (
-    <g>
-      <rect
-        fill="rgb(15 23 42 / 0.85)"
-        height="48"
-        rx="3"
-        stroke={accent}
-        strokeOpacity="0.45"
-        strokeWidth="1"
-        width={width}
-        x={pos.x - halfW}
-        y={pos.y - 32}
-      />
-      <text
-        fill={accent}
-        fontFamily="'Roboto Flex'"
-        fontSize="11"
-        fontWeight="bold"
-        x={pos.x}
-        y={pos.y - 18}
-        textAnchor="middle"
-      >
-        {title}
-      </text>
-      {lines.map((ln, i) => (
-        <text
-          fill="rgb(203 213 225 / 0.9)"
-          fontFamily="'Roboto Flex'"
-          fontSize="9"
-          key={i}
-          x={pos.x}
-          y={pos.y - 4 + i * 10}
-          textAnchor="middle"
+        <svg
+          className="block w-full"
+          viewBox={`0 0 ${SVG_W} ${SVG_H}`}
+          xmlns="http://www.w3.org/2000/svg"
         >
-          {ln}
-        </text>
+          {/* Solder-mask backing for the whole SoC strip */}
+          <rect
+            fill="var(--color-bg-secondary)"
+            height={SVG_H - 4}
+            rx="6"
+            stroke="var(--color-border)"
+            strokeWidth="0.5"
+            width={SVG_W - 4}
+            x={2}
+            y={2}
+          />
+
+          {/* Four-lane parallel bus */}
+          <BusLanes />
+
+          {/* Core 0 → bus stubs */}
+          <CorePinStubs coreX={CORE0_X} />
+          <CorePinStubs coreX={CORE1_X} />
+
+          {/* Peripheral → bus stubs */}
+          <PeripheralStubs />
+
+          {/* RAM connection ribbon (CTRL lane → RAM top edge) */}
+          <line
+            stroke="rgb(168 85 247 / 0.35)"
+            strokeDasharray="2 2"
+            strokeWidth="0.8"
+            x1={NODE_POS.ram.x}
+            x2={NODE_POS.ram.x}
+            y1={LANE_CTRL_Y}
+            y2={RAM_Y}
+          />
+
+          {/* Cores */}
+          <CoreChipSvg core={cores[0]} coreX={CORE0_X} slot={slots[0]} />
+          <CoreChipSvg core={cores[1]} coreX={CORE1_X} slot={slots[1]} />
+
+          {/* Peripherals */}
+          <AicChip aic={aic} />
+          <UartChip output={output} />
+          <BlockChip block={block} />
+
+          {/* RAM */}
+          <RamGrid regions={ramRegions} />
+        </svg>
+      </div>
+    </Card>
+  )
+}
+
+// ── Bus + stub primitives ─────────────────────────────────────────────────
+const LANE_LABEL = 'var(--color-fg-muted)'
+const LANE_DATA_COL = '#60a5fa'
+const LANE_ADDR_COL = '#94a3b8'
+const LANE_IRQ_COL = '#fbbf24'
+const LANE_CTRL_COL = '#a78bfa'
+
+function BusLanes() {
+  const lanes: { y: number; col: string; name: string }[] = [
+    { y: LANE_DATA_Y, col: LANE_DATA_COL, name: 'DATA' },
+    { y: LANE_ADDR_Y, col: LANE_ADDR_COL, name: 'ADDR' },
+    { y: LANE_IRQ_Y, col: LANE_IRQ_COL, name: 'IRQ' },
+    { y: LANE_CTRL_Y, col: LANE_CTRL_COL, name: 'CTRL' },
+  ]
+  // Labels live in the gap between the two cores (centered on the SoC), so
+  // they never overlap with chip pins on either side.
+  const labelX = SVG_W / 2
+  return (
+    <g>
+      {lanes.map((l) => (
+        <g key={l.name}>
+          <line
+            stroke={l.col}
+            strokeOpacity="0.5"
+            strokeWidth="1.4"
+            x1={LANE_LEFT_X}
+            x2={LANE_RIGHT_X}
+            y1={l.y}
+            y2={l.y}
+          />
+          {/* Pill behind the label so the bus line reads cleanly */}
+          <rect
+            fill="var(--color-bg-tertiary)"
+            height="11"
+            rx="2"
+            stroke={l.col}
+            strokeOpacity="0.4"
+            strokeWidth="0.5"
+            width="36"
+            x={labelX - 18}
+            y={l.y - 6}
+          />
+          <text
+            fill={l.col}
+            fontFamily="'Roboto Flex', system-ui, sans-serif"
+            fontSize="8"
+            fontWeight="700"
+            letterSpacing="0.06em"
+            textAnchor="middle"
+            x={labelX}
+            y={l.y + 2}
+          >
+            {l.name}
+          </text>
+        </g>
       ))}
     </g>
   )
 }
 
-function AicBox({ aic, pos }: { aic: AicState; pos: { x: number; y: number } }) {
-  const pendingMask = aic.pending.reduce((acc, p) => acc | p, 0)
-  return (
-    <PeripheralBox
-      accent="#fbbf24"
-      lines={[`pnd ${pendingMask.toString(16).padStart(2, '0')}`, `ack ${aic.total_acks}`]}
-      pos={pos}
-      title="AIC"
+// stubs from the four pins on the bottom edge of a core to the matching lanes.
+function CorePinStubs({ coreX }: { coreX: number }) {
+  const p = corePins(coreX)
+  const stub = (x: number, lane: number, col: string) => (
+    <line
+      key={x}
+      stroke={col}
+      strokeOpacity="0.6"
+      strokeWidth="0.8"
+      x1={x}
+      x2={x}
+      y1={CORE_Y + CORE_H}
+      y2={lane}
     />
+  )
+  return (
+    <g>
+      {stub(p.data, LANE_DATA_Y, LANE_DATA_COL)}
+      {stub(p.addr, LANE_ADDR_Y, LANE_ADDR_COL)}
+      {stub(p.irq, LANE_IRQ_Y, LANE_IRQ_COL)}
+      {stub(p.ctrl, LANE_CTRL_Y, LANE_CTRL_COL)}
+    </g>
   )
 }
 
-function UartBox({ output, pos }: { output: string; pos: { x: number; y: number } }) {
-  const tail = output.slice(-12).replace(/\n/g, '↵')
-  return (
-    <PeripheralBox
-      accent="#34d399"
-      lines={[`bytes ${output.length}`, tail || '—']}
-      pos={pos}
-      title="UART"
+function PeripheralStubs() {
+  const stub = (x: number, lane: number, col: string) => (
+    <line
+      key={`${x}-${lane}`}
+      stroke={col}
+      strokeOpacity="0.55"
+      strokeWidth="0.8"
+      x1={x}
+      x2={x}
+      y1={lane}
+      y2={PERIPH_Y}
     />
+  )
+  return (
+    <g>
+      {/* AIC: ack→DATA, mask→ADDR, irq_out→IRQ */}
+      {stub(aicPins.ack, LANE_DATA_Y, LANE_DATA_COL)}
+      {stub(aicPins.mask, LANE_ADDR_Y, LANE_ADDR_COL)}
+      {stub(aicPins.irq, LANE_IRQ_Y, LANE_IRQ_COL)}
+      {/* UART: data→DATA, csel→ADDR */}
+      {stub(uartPins.data, LANE_DATA_Y, LANE_DATA_COL)}
+      {stub(uartPins.csel, LANE_ADDR_Y, LANE_ADDR_COL)}
+      {/* BLK: data→DATA, csel→ADDR, irq→IRQ */}
+      {stub(blkPins.data, LANE_DATA_Y, LANE_DATA_COL)}
+      {stub(blkPins.csel, LANE_ADDR_Y, LANE_ADDR_COL)}
+      {stub(blkPins.irq, LANE_IRQ_Y, LANE_IRQ_COL)}
+    </g>
   )
 }
 
-function BlockBox({ block, pos }: { block: BlockState; pos: { x: number; y: number } }) {
+// ── Core chip ─────────────────────────────────────────────────────────────
+function CoreChipSvg({ core, coreX, slot }: { core: CoreState; coreX: number; slot: CoreSlot }) {
+  const accent = core.id === 0 ? '#22d3ee' : '#a78bfa'
+  const taskLabel = slot.entry === 0x4d00n ? 'task A' : slot.entry === 0x4e00n ? 'task B' : '—'
+  const stateLine = core.last_trap ? 'TRAP' : core.halted ? 'HALT' : core.wfi_halted ? 'WFI' : 'RUN'
+  const x = coreX
+  const y = CORE_Y
+  // sub-block geometry (relative offsets from chip's top-left)
+  const innerL = x + 8
+  const innerT = y + 24
+  const regsW = 96
+  const rightX = innerL + regsW + 8
+  const rightW = CORE_W - 8 - regsW - 8 - 8
   return (
-    <PeripheralBox
-      accent="#fb7185"
-      lines={[`r ${block.total_reads} w ${block.total_writes}`, `sec ${block.sector}`]}
-      pos={pos}
-      title="BLK"
-    />
+    <g>
+      {/* Chip body */}
+      <rect
+        fill="var(--color-bg-tertiary)"
+        height={CORE_H}
+        rx="4"
+        stroke={accent}
+        strokeOpacity="0.55"
+        strokeWidth="1"
+        width={CORE_W}
+        x={x}
+        y={y}
+      />
+      {/* Header band */}
+      <rect
+        fill={`color-mix(in oklab, ${accent} 9%, transparent)`}
+        height="18"
+        rx="4"
+        width={CORE_W}
+        x={x}
+        y={y}
+      />
+      <text
+        fill={accent}
+        fontFamily="'Roboto Flex', system-ui, sans-serif"
+        fontSize="11"
+        fontWeight="700"
+        x={x + 8}
+        y={y + 13}
+      >
+        CORE {core.id} · {core.kind}
+      </text>
+      <text
+        fill={accent}
+        fillOpacity="0.85"
+        fontFamily="'Roboto Flex', system-ui, sans-serif"
+        fontSize="9"
+        x={x + CORE_W - 8}
+        y={y + 13}
+        textAnchor="end"
+      >
+        EL{core.current_el} · {stateLine}
+      </text>
+
+      {/* REGS sub-block (left column, fills available height) */}
+      <SubBlock x={innerL} y={innerT} w={regsW} h={CORE_H - 32} title="REGS">
+        <RegsList accent={accent} core={core} x={innerL + 4} y={innerT + 22} />
+      </SubBlock>
+
+      {/* Right column: PC, MMU, EXC, DAIF stacked with breathing room */}
+      <SubBlock x={rightX} y={innerT} w={rightW} h={32} title="PC / IR">
+        <text
+          fill="var(--color-fg)"
+          fontFamily="'Roboto Flex', system-ui, sans-serif"
+          fontSize="11"
+          x={rightX + 6}
+          y={innerT + 26}
+        >
+          {fmtHex32(Number(core.pc))}
+        </text>
+      </SubBlock>
+      <SubBlock x={rightX} y={innerT + 36} w={rightW} h={38} title="MMU">
+        <text
+          fill="var(--color-fg-secondary)"
+          fontFamily="'Roboto Flex', system-ui, sans-serif"
+          fontSize="9"
+          x={rightX + 6}
+          y={innerT + 36 + 22}
+        >
+          ttbr {fmtHex32(Number(core.ttbr0_el1))}
+        </text>
+        <text
+          fill="var(--color-fg-muted)"
+          fontFamily="'Roboto Flex', system-ui, sans-serif"
+          fontSize="9"
+          x={rightX + 6}
+          y={innerT + 36 + 33}
+        >
+          tcr {fmtHex32(Number(core.tcr_el1))}
+        </text>
+      </SubBlock>
+      <SubBlock x={rightX} y={innerT + 78} w={rightW} h={42} title="EXC">
+        <text
+          fill="var(--color-fg-secondary)"
+          fontFamily="'Roboto Flex', system-ui, sans-serif"
+          fontSize="9"
+          x={rightX + 6}
+          y={innerT + 78 + 22}
+        >
+          esr {fmtHex32(Number(core.esr_el1))}
+        </text>
+        <text
+          fill="var(--color-fg-muted)"
+          fontFamily="'Roboto Flex', system-ui, sans-serif"
+          fontSize="9"
+          x={rightX + 6}
+          y={innerT + 78 + 35}
+        >
+          elr {fmtHex32(Number(core.elr_el1))}
+        </text>
+      </SubBlock>
+      <SubBlock x={rightX} y={innerT + 124} w={rightW} h={32} title="DAIF">
+        <text
+          fill="var(--color-fg)"
+          fontFamily="'Roboto Flex', system-ui, sans-serif"
+          fontSize="9"
+          x={rightX + 6}
+          y={innerT + 124 + 24}
+        >
+          {core.daif.toString(2).padStart(4, '0')} · {taskLabel}
+        </text>
+      </SubBlock>
+
+      {/* Bottom-edge pin markers (small coloured studs only — the bus-lane
+          colour identifies what each pin carries, no per-pin text needed). */}
+      {(['data', 'addr', 'irq', 'ctrl'] as const).map((k) => {
+        const px = corePins(coreX)[k]
+        const col =
+          k === 'data'
+            ? LANE_DATA_COL
+            : k === 'addr'
+              ? LANE_ADDR_COL
+              : k === 'irq'
+                ? LANE_IRQ_COL
+                : LANE_CTRL_COL
+        return (
+          <rect
+            key={k}
+            fill={col}
+            fillOpacity="0.85"
+            height="4"
+            width="8"
+            x={px - 4}
+            y={y + CORE_H - 2}
+          />
+        )
+      })}
+    </g>
   )
 }
 
-function RamBox({
-  pos,
-  regions,
+function SubBlock({
+  x,
+  y,
+  w,
+  h,
+  title,
+  children,
 }: {
-  pos: { x: number; y: number }
-  regions: readonly { addr: number; label: string }[]
+  x: number
+  y: number
+  w: number
+  h: number
+  title: string
+  children?: React.ReactNode
 }) {
-  const W = 320
-  const H = 60
   return (
     <g>
       <rect
-        fill="rgb(15 23 42 / 0.85)"
-        height={H}
-        rx="3"
-        stroke="rgb(96 165 250 / 0.45)"
-        strokeWidth="1"
-        width={W}
-        x={pos.x - W / 2}
-        y={pos.y - 14}
+        fill="var(--color-bg-secondary)"
+        height={h}
+        rx="2"
+        stroke="var(--color-border)"
+        strokeWidth="0.5"
+        width={w}
+        x={x}
+        y={y}
       />
       <text
-        fill="#60a5fa"
-        fontFamily="'Roboto Flex'"
-        fontSize="11"
-        fontWeight="bold"
-        x={pos.x - W / 2 + 8}
-        y={pos.y}
+        fill="var(--color-fg-muted)"
+        fontFamily="'Roboto Flex', system-ui, sans-serif"
+        fontSize="9"
+        fontWeight="600"
+        letterSpacing="0.02em"
+        x={x + 4}
+        y={y + 10}
       >
-        RAM · 64 KiB
+        {title}
       </text>
-      {/* Region strip */}
+      {children}
+    </g>
+  )
+}
+
+function RegsList({
+  accent,
+  core,
+  x,
+  y,
+}: {
+  accent: string
+  core: CoreState
+  x: number
+  y: number
+}) {
+  // Pick a useful slice — X0..X3 for arg passing, X9..X10 used by kernel,
+  // SP and X30 (LR). Tight 8-line column at 9px/line.
+  const labels: { label: string; v: bigint }[] = [
+    { label: 'x0', v: core.x[0] ?? 0n },
+    { label: 'x1', v: core.x[1] ?? 0n },
+    { label: 'x2', v: core.x[2] ?? 0n },
+    { label: 'x3', v: core.x[3] ?? 0n },
+    { label: 'x9', v: core.x[9] ?? 0n },
+    { label: 'x10', v: core.x[10] ?? 0n },
+    { label: 'sp', v: core.sp ?? 0n },
+    { label: 'x30', v: core.x[30] ?? 0n },
+  ]
+  return (
+    <g>
+      {labels.map((r, i) => (
+        <g key={r.label}>
+          <text
+            fill="var(--color-fg-muted)"
+            fontFamily="'Roboto Flex', system-ui, sans-serif"
+            fontSize="9"
+            x={x}
+            y={y + i * 13 + 8}
+          >
+            {r.label}
+          </text>
+          <text
+            fill={accent}
+            fillOpacity="0.95"
+            fontFamily="'Roboto Flex', system-ui, sans-serif"
+            fontSize="9"
+            x={x + 24}
+            y={y + i * 13 + 8}
+          >
+            {fmtHex32(Number(r.v & 0xffffffffn))}
+          </text>
+        </g>
+      ))}
+    </g>
+  )
+}
+
+// ── Peripherals ────────────────────────────────────────────────────────────
+function PeripheralChip({
+  accent,
+  pinLabels,
+  pinXs,
+  bodyLines,
+  title,
+  topX,
+}: {
+  accent: string
+  pinLabels: string[]
+  pinXs: number[]
+  bodyLines: string[]
+  title: string
+  topX: number
+}) {
+  return (
+    <g>
+      <rect
+        fill="var(--color-bg-tertiary)"
+        height={PERIPH_H}
+        rx="4"
+        stroke={accent}
+        strokeOpacity="0.55"
+        strokeWidth="1"
+        width={PERIPH_W}
+        x={topX}
+        y={PERIPH_Y}
+      />
+      <rect
+        fill={`color-mix(in oklab, ${accent} 9%, transparent)`}
+        height="18"
+        rx="4"
+        width={PERIPH_W}
+        x={topX}
+        y={PERIPH_Y}
+      />
+      <text
+        fill={accent}
+        fontFamily="'Roboto Flex', system-ui, sans-serif"
+        fontSize="11"
+        fontWeight="700"
+        x={topX + 8}
+        y={PERIPH_Y + 13}
+      >
+        {title}
+      </text>
+      {/* Body lines */}
+      {bodyLines.map((ln, i) => (
+        <text
+          key={i}
+          fill="var(--color-fg-secondary)"
+          fontFamily="'Roboto Flex', system-ui, sans-serif"
+          fontSize="9"
+          x={topX + 8}
+          y={PERIPH_Y + 32 + i * 12}
+        >
+          {ln}
+        </text>
+      ))}
+      {/* Top-edge pins (matching the bus stubs) */}
+      {pinXs.map((px, i) => (
+        <g key={i}>
+          <rect fill={accent} fillOpacity="0.7" height="3" width="6" x={px - 3} y={PERIPH_Y - 2} />
+          <text
+            fill={LANE_LABEL}
+            fontFamily="'Roboto Flex', system-ui, sans-serif"
+            fontSize="9"
+            textAnchor="middle"
+            x={px}
+            y={PERIPH_Y - 4}
+          >
+            {pinLabels[i]}
+          </text>
+        </g>
+      ))}
+    </g>
+  )
+}
+
+function AicChip({ aic }: { aic: AicState }) {
+  const pendingMask = aic.pending.reduce((acc, p) => acc | p, 0)
+  return (
+    <PeripheralChip
+      accent={LANE_IRQ_COL}
+      bodyLines={[
+        `pnd ${pendingMask.toString(16).padStart(2, '0')}`,
+        `ack ${aic.total_acks}`,
+        `targets ${aic.pending.length}`,
+      ]}
+      pinLabels={['IRQ', 'ACK', 'MSK']}
+      pinXs={[aicPins.irq, aicPins.ack, aicPins.mask]}
+      title="AIC"
+      topX={AIC_X}
+    />
+  )
+}
+
+function UartChip({ output }: { output: string }) {
+  // Strip newlines and cap to 8 chars so the line fits inside a 130px chip.
+  const tail = output.replace(/\n/g, ' ').trimEnd().slice(-8)
+  return (
+    <PeripheralChip
+      accent="#34d399"
+      bodyLines={[`bytes ${output.length}`, `tail ${tail || '—'}`, 'tx fifo 16']}
+      pinLabels={['DAT', 'CS']}
+      pinXs={[uartPins.data, uartPins.csel]}
+      title="UART"
+      topX={UART_X}
+    />
+  )
+}
+
+function BlockChip({ block }: { block: BlockState }) {
+  return (
+    <PeripheralChip
+      accent="#fb7185"
+      bodyLines={[
+        `r ${block.total_reads} · w ${block.total_writes}`,
+        `sec ${block.sector}`,
+        `buf 0x${(Number(block.buf_addr) >>> 0).toString(16).padStart(4, '0')}`,
+      ]}
+      pinLabels={['DAT', 'CS', 'IRQ']}
+      pinXs={[blkPins.data, blkPins.csel, blkPins.irq]}
+      title="BLK"
+      topX={BLK_X}
+    />
+  )
+}
+
+// ── RAM as 4×3 region grid ────────────────────────────────────────────────
+function RamGrid({ regions }: { regions: readonly { addr: number; label: string }[] }) {
+  const cols = 4
+  const rows = 3
+  const cellW = (RAM_W - 8) / cols
+  const cellH = (RAM_H - 24) / rows
+  return (
+    <g>
+      <rect
+        fill="var(--color-bg-tertiary)"
+        height={RAM_H}
+        rx="4"
+        stroke={LANE_DATA_COL}
+        strokeOpacity="0.5"
+        strokeWidth="1"
+        width={RAM_W}
+        x={RAM_X}
+        y={RAM_Y}
+      />
+      <rect
+        fill={`color-mix(in oklab, ${LANE_DATA_COL} 8%, transparent)`}
+        height="18"
+        rx="4"
+        width={RAM_W}
+        x={RAM_X}
+        y={RAM_Y}
+      />
+      <text
+        fill={LANE_DATA_COL}
+        fontFamily="'Roboto Flex', system-ui, sans-serif"
+        fontSize="11"
+        fontWeight="700"
+        x={RAM_X + 8}
+        y={RAM_Y + 13}
+      >
+        RAM · 64 KiB · 16-bank grid
+      </text>
+      <text
+        fill={LANE_LABEL}
+        fontFamily="'Roboto Flex', system-ui, sans-serif"
+        fontSize="9"
+        x={RAM_X + RAM_W - 8}
+        y={RAM_Y + 13}
+        textAnchor="end"
+      >
+        {regions.length} regions
+      </text>
       {regions.map((r, i) => {
-        const cellW = (W - 16) / regions.length
-        const x = pos.x - W / 2 + 8 + i * cellW
+        const c = i % cols
+        const row = Math.floor(i / cols)
+        const cx = RAM_X + 4 + c * cellW
+        const cy = RAM_Y + 22 + row * cellH
         return (
           <g key={r.addr}>
             <rect
-              fill="rgb(96 165 250 / 0.08)"
-              height="22"
+              fill="rgb(96 165 250 / 0.06)"
+              height={cellH - 2}
+              rx="2"
               stroke="rgb(96 165 250 / 0.35)"
               strokeWidth="0.5"
-              width={cellW}
-              x={x}
-              y={pos.y + 8}
+              width={cellW - 2}
+              x={cx}
+              y={cy}
             />
             <text
-              fill="rgb(203 213 225 / 0.85)"
-              fontFamily="'Roboto Flex'"
+              fill="#60a5fa"
+              fillOpacity="0.95"
+              fontFamily="'Roboto Flex', system-ui, sans-serif"
               fontSize="9"
-              x={x + cellW / 2}
-              y={pos.y + 17}
-              textAnchor="middle"
+              fontWeight="600"
+              x={cx + 6}
+              y={cy + 14}
             >
-              {fmtHex32(r.addr).slice(2, 6)}
+              0x{r.addr.toString(16).padStart(4, '0').toUpperCase()}
             </text>
             <text
-              fill="rgb(148 163 184 / 0.7)"
-              fontFamily="'Roboto Flex'"
+              fill="var(--color-fg-secondary)"
+              fontFamily="'Roboto Flex', system-ui, sans-serif"
               fontSize="9"
-              x={x + cellW / 2}
-              y={pos.y + 26}
-              textAnchor="middle"
+              x={cx + 6}
+              y={cy + 28}
             >
               {r.label}
             </text>
@@ -1082,69 +1503,6 @@ function RamBox({
       })}
     </g>
   )
-}
-
-function EventPacket({ event }: { event: SimEvent }) {
-  // Translate SVG coordinates to overlay coordinates. Container fills the
-  // SVG area exactly (we share width via the parent's viewBox aspect).
-  const src = nodeAnchor(event.source, 'out')
-  const dst = nodeAnchor(event.target, 'in')
-  // Scale from SVG units (440×480) to the rendered container, which is the
-  // same DOM box but in absolute pixels — we use percentages so it's
-  // resolution-independent.
-  const fromX = `${(src.x / SVG_W) * 100}%`
-  const fromY = `${(src.y / SVG_H) * 100}%`
-  const toX = `${((dst.x - src.x) / SVG_W) * 100}%`
-  const toY = `${((dst.y - src.y) / SVG_H) * 100}%`
-  const color = packetColor(event.kind)
-  const delay = event.kind === 'timer' && event.target === 'core1' ? '30ms' : '0ms'
-  return (
-    <span
-      className="absolute h-1.5 w-1.5 rounded-full"
-      style={{
-        left: fromX,
-        top: fromY,
-        background: color,
-        boxShadow: `0 0 6px ${color}`,
-        animation: 'packet-fly 700ms ease-in-out forwards',
-        animationDelay: delay,
-        // CSS variables consumed by the keyframes
-        ['--packet-from-x' as string]: '0px',
-        ['--packet-from-y' as string]: '0px',
-        ['--packet-to-x' as string]: toX,
-        ['--packet-to-y' as string]: toY,
-      }}
-    />
-  )
-}
-
-function nodeAnchor(id: NodeId, dir: 'in' | 'out'): { x: number; y: number } {
-  const base = NODE_POS[id]
-  // For cores: anchor on bottom edge. For peripherals (incl. RAM): top edge.
-  if (id === 'core0' || id === 'core1') {
-    return { x: base.x, y: base.y + (dir === 'out' ? 64 : 64) }
-  }
-  if (id === 'ram') {
-    return { x: base.x, y: base.y - 14 }
-  }
-  return { x: base.x, y: base.y - 32 }
-}
-
-function packetColor(kind: SimEventKind): string {
-  switch (kind) {
-    case 'store':
-      return '#34d399' // green to UART
-    case 'timer':
-      return '#fbbf24' // amber from AIC
-    case 'disk_read':
-      return '#fb7185' // rose from Block
-    case 'irq_taken':
-      return '#fbbf24'
-    case 'svc':
-      return '#60a5fa'
-    case 'eret':
-      return '#a78bfa'
-  }
 }
 
 function DisassemblyPanel({ cpu, cores }: { cpu: Cpu; cores: CoreState[] }) {
@@ -1164,7 +1522,7 @@ function DisassemblyPanel({ cpu, cores }: { cpu: Cpu; cores: CoreState[] }) {
     rows.push({ pa, word, mnem: disassemble(word, BigInt(pa)) })
   }
   return (
-    <GlassCard>
+    <Card padding="none">
       <div className="space-y-2 p-4">
         <div className="text-fg-muted flex items-center justify-between">
           <span className="type-small font-semibold tracking-wider uppercase">
@@ -1174,22 +1532,34 @@ function DisassemblyPanel({ cpu, cores }: { cpu: Cpu; cores: CoreState[] }) {
             range {fmtHex32(start)}–{fmtHex32(end - 1)}
           </span>
         </div>
-        <div className="type-small overflow-x-auto">
+        <div className="mono-data type-small overflow-x-auto">
           {rows.map((r) => {
             const isCore0 = r.pa === pc0
             const isCore1 = r.pa === pc1
+            const isPc = isCore0 || isCore1
             const cls = isCore0
-              ? 'bg-cyan-500/10 text-cyan-200'
+              ? 'bg-cyan-500/10 text-fg'
               : isCore1
-                ? 'bg-violet-500/10 text-violet-200'
+                ? 'bg-violet-500/10 text-fg'
                 : ''
             return (
               <div className={`flex gap-3 leading-6 ${cls}`} key={r.pa}>
-                <span className="text-fg-muted w-12 shrink-0">
-                  {isCore0 ? '►0' : isCore1 ? '►1' : '  '}
+                <span
+                  className={`flex w-12 shrink-0 items-center gap-1 ${
+                    isCore0
+                      ? 'live-pulse text-cyan-700 dark:text-cyan-300'
+                      : isCore1
+                        ? 'live-pulse text-violet-700 dark:text-violet-300'
+                        : 'text-fg-muted'
+                  }`}
+                >
+                  {isPc && <span>►</span>}
+                  {isCore0 ? <span>0</span> : isCore1 ? <span>1</span> : null}
                 </span>
-                <span className="text-fg-muted w-16 shrink-0">{fmtHex32(r.pa)}</span>
-                <span className="text-fg-muted w-20 shrink-0">
+                <span className={`${isPc ? 'text-fg' : 'text-fg-muted'} w-16 shrink-0`}>
+                  {fmtHex32(r.pa)}
+                </span>
+                <span className={`${isPc ? 'text-fg' : 'text-fg-muted'} w-20 shrink-0`}>
                   {r.word.toString(16).padStart(8, '0')}
                 </span>
                 <span className="flex-1">{r.mnem}</span>
@@ -1198,12 +1568,14 @@ function DisassemblyPanel({ cpu, cores }: { cpu: Cpu; cores: CoreState[] }) {
           })}
         </div>
       </div>
-    </GlassCard>
+    </Card>
   )
 }
 
 function ControlBar({
+  aic,
   block,
+  cores,
   cpu,
   onRefresh,
   onReset,
@@ -1212,8 +1584,11 @@ function ControlBar({
   running,
   sysInfo,
   totalCoreSteps,
+  uartBytes,
 }: {
+  aic: AicState
   block: BlockState
+  cores: CoreState[]
   cpu: Cpu
   onRefresh: (cpu: Cpu) => void
   onReset: () => void
@@ -1222,49 +1597,93 @@ function ControlBar({
   running: boolean
   sysInfo: SystemInfo
   totalCoreSteps: bigint
+  uartBytes: number
 }) {
   return (
-    <div className="border-border bg-bg/60 flex flex-wrap items-stretch gap-3 rounded-xl border p-3">
+    <div className="space-y-4">
+      {/* Buttons get their own row, all 3 use the GDS Button primitive with
+          visible borders/fills (no "highlight on click only" look). */}
       <div className="flex items-center gap-2">
-        <GlassButton onClick={onStep} size="sm" variant="accent">
+        <Button onClick={onStep} size="sm" variant="primary">
           Step both
-        </GlassButton>
-        <GlassButton onClick={onRunToggle} size="sm">
+        </Button>
+        <Button onClick={onRunToggle} size="sm" variant="secondary">
           {running ? 'Pause' : 'Run'}
-        </GlassButton>
-        <GlassButton onClick={onReset} size="sm">
+        </Button>
+        <Button onClick={onReset} size="sm" variant="secondary">
           Reset
-        </GlassButton>
+        </Button>
       </div>
-      <div className="border-border/40 hidden border-r xl:block" />
-      <SystemInfoStrip info={sysInfo} totalCoreSteps={totalCoreSteps} />
-      <div className="border-border/40 hidden border-r xl:block" />
-      <ControlBarDisk block={block} cpu={cpu} onRefresh={onRefresh} />
+      <Card padding="none">
+        <div className="grid grid-cols-1 gap-3 p-3 lg:grid-cols-2">
+          <ControlBarDisk block={block} cpu={cpu} onRefresh={onRefresh} />
+          <SystemInfoStrip
+            aic={aic}
+            block={block}
+            cores={cores}
+            info={sysInfo}
+            totalCoreSteps={totalCoreSteps}
+            uartBytes={uartBytes}
+          />
+        </div>
+      </Card>
     </div>
   )
 }
 
-function SystemInfoStrip({ info, totalCoreSteps }: { info: SystemInfo; totalCoreSteps: bigint }) {
+function SystemInfoStrip({
+  aic,
+  block,
+  cores,
+  info,
+  totalCoreSteps,
+  uartBytes,
+}: {
+  aic: AicState
+  block: BlockState
+  cores: CoreState[]
+  info: SystemInfo
+  totalCoreSteps: bigint
+  uartBytes: number
+}) {
+  const aicPending = aic.pending.reduce((a, b) => a | b, 0)
+  const stats: { label: string; value: string; emphasize?: boolean }[] = [
+    { label: 'system steps', value: info.systemSteps.toString() },
+    { label: 'retired', value: totalCoreSteps.toString() },
+    { label: 'timer period', value: info.timerPeriod.toString() },
+    {
+      label: 'next IRQ',
+      value: info.timerRemaining.toString(),
+      emphasize: info.timerRemaining === 0n,
+    },
+    { label: 'timer ticks', value: info.timerTicks.toString() },
+    { label: 'aic acks', value: aic.total_acks.toString() },
+    { label: 'aic pending', value: '0x' + aicPending.toString(16).padStart(2, '0') },
+    { label: 'uart bytes', value: uartBytes.toString() },
+    { label: 'blk reads', value: block.total_reads.toString() },
+    { label: 'core 0 pc', value: fmtHex32(Number(cores[0]?.pc ?? 0n)) },
+    { label: 'core 1 pc', value: fmtHex32(Number(cores[1]?.pc ?? 0n)) },
+    { label: 'cores el', value: `${cores[0]?.current_el ?? 0} / ${cores[1]?.current_el ?? 0}` },
+  ]
   return (
-    <div className="type-small grid flex-1 grid-cols-3 gap-x-6 gap-y-0.5 sm:grid-cols-5">
-      <Stat label="system steps" value={info.systemSteps.toString()} />
-      <Stat label="retired" value={totalCoreSteps.toString()} />
-      <Stat label="period" value={info.timerPeriod.toString()} />
-      <Stat
-        emphasize={info.timerRemaining === 0n}
-        label="next IRQ"
-        value={info.timerRemaining.toString()}
-      />
-      <Stat label="ticks" value={info.timerTicks.toString()} />
+    <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+      {stats.map((s) => (
+        <Stat emphasize={s.emphasize} key={s.label} label={s.label} value={s.value} />
+      ))}
     </div>
   )
 }
 
 function Stat({ emphasize, label, value }: { emphasize?: boolean; label: string; value: string }) {
   return (
-    <div className="flex flex-col">
-      <span className="text-fg-muted type-small">{label}</span>
-      <span className={emphasize ? 'type-base text-amber-400' : 'text-fg type-base'}>{value}</span>
+    <div className="border-border bg-bg-secondary flex flex-col rounded border px-2 py-1">
+      <span className="text-fg-muted type-small tracking-wider uppercase">{label}</span>
+      <span
+        className={`mono-data type-base truncate ${emphasize ? 'text-warning' : 'text-fg'}`}
+        title={value}
+      >
+        {value}
+      </span>
     </div>
   )
 }
@@ -1298,14 +1717,14 @@ function ControlBarDisk({
       <span className="text-fg-muted type-small">
         disk sector 0 — task B prints this ({initial.length}/64 bytes)
       </span>
-      <input
-        className="border-border bg-bg/40 text-fg focus:border-accent type-base w-full rounded border px-2 py-1 outline-none"
+      <textarea
+        className="mono-data border-border bg-bg-tertiary text-fg focus:border-accent type-base min-h-16 w-full resize-y rounded border px-2 py-1 outline-none"
         defaultValue={initial}
         key={initial}
         maxLength={64}
         onChange={(e) => apply(e.target.value)}
+        rows={3}
         spellCheck={false}
-        type="text"
       />
     </label>
   )
@@ -1321,7 +1740,7 @@ function DaifChip({ daif }: { daif: number }) {
   ]
   return (
     <span
-      className="border-border bg-bg/40 type-small inline-flex items-center gap-1 rounded border px-1.5 py-0.5 tracking-wider"
+      className="border-border bg-bg-secondary type-base inline-flex items-center gap-1 rounded border px-2 py-1 tracking-wider"
       title="PSTATE.DAIF — 1 = masked, 0 = enabled"
     >
       {bits.map((b) => (
@@ -1334,124 +1753,118 @@ function DaifChip({ daif }: { daif: number }) {
 }
 
 function CoreChip({ core }: { core: CoreState }) {
-  const elClass =
-    core.current_el === 2
-      ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
-      : core.current_el === 1
-        ? 'bg-violet-500/20 text-violet-300 border-violet-500/40'
-        : 'bg-neutral-500/20 text-neutral-300 border-neutral-500/40'
+  // Use GDS Badge with the palette tokens so the colours are theme-aware.
+  // Each core gets its own palette index (core 0 = palette-0, core 1 =
+  // palette-1) so they're visually distinct without hardcoding hue.
+  const variant = core.id === 0 ? 'palette-0' : 'palette-1'
   return (
-    <span
-      className={`type-small inline-flex items-center gap-1.5 rounded border px-2 py-0.5 tracking-wider ${elClass}`}
+    <Badge
+      className="type-base px-2 py-1"
+      variant={variant}
       title={`MPIDR ${fmtHex64(core.mpidr)}`}
     >
       <span className="font-semibold">core{core.id}</span>
       <span className="opacity-70">{core.kind}</span>
       <span className="font-semibold">EL{core.current_el}</span>
-    </span>
+    </Badge>
   )
 }
 
 function CoreColumn({ core, onStep }: { core: CoreState; onStep: () => void }) {
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <div className="flex flex-wrap items-center gap-2">
-          <CoreChip core={core} />
-          <DaifChip daif={core.daif} />
-          {(() => {
-            const label = inferTaskLabel(core.pc)
-            return label ? (
-              <span className="border-border bg-bg/40 type-small inline-flex items-center rounded border px-1.5 py-0.5 tracking-wider">
-                {label}
-              </span>
-            ) : null
-          })()}
-          {core.wfi_halted && (
-            <span className="type-small inline-flex items-center rounded border border-sky-500/40 bg-sky-500/15 px-1.5 py-0.5 tracking-wider text-sky-300">
-              WFI · sleeping
-            </span>
-          )}
-          {core.halted && (
-            <Badge color={core.last_trap ? 'danger' : 'success'}>
-              {core.last_trap ? 'TRAP' : 'HALTED'}
-            </Badge>
-          )}
+    <Card padding="none">
+      <div className="space-y-3 p-3">
+        <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center gap-2">
+            <CoreChip core={core} />
+            <DaifChip daif={core.daif} />
+            {(() => {
+              const label = inferTaskLabel(core.pc)
+              return label ? <Badge className="type-base px-2 py-1">{label}</Badge> : null
+            })()}
+            {core.wfi_halted && (
+              <Badge className="type-base px-2 py-1" variant="info">
+                WFI · sleeping
+              </Badge>
+            )}
+            {core.halted && (
+              <Badge
+                className="type-base px-2 py-1"
+                variant={core.last_trap ? 'danger' : 'success'}
+              >
+                {core.last_trap ? 'TRAP' : 'HALTED'}
+              </Badge>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-fg-muted type-small">steps {core.steps.toString()}</span>
+            <GlassButton onClick={onStep} size="sm">
+              Step
+            </GlassButton>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-fg-muted type-small">steps {core.steps.toString()}</span>
-          <GlassButton onClick={onStep} size="sm">
-            Step
-          </GlassButton>
-        </div>
+        {core.last_trap && (
+          <div className="border-danger/40 bg-danger/10 text-danger type-small rounded border px-2 py-1">
+            {core.last_trap}
+          </div>
+        )}
+        <RegistersSection core={core} />
+        <ExceptionSection core={core} />
       </div>
-      {core.last_trap && (
-        <div className="border-danger/40 bg-danger/10 text-danger type-small rounded border px-2 py-1">
-          {core.last_trap}
-        </div>
-      )}
-      <RegistersCard core={core} />
-      <ExceptionCard core={core} />
+    </Card>
+  )
+}
+
+function RegistersSection({ core }: { core: CoreState }) {
+  return (
+    <div className="border-border bg-bg-secondary rounded border p-3">
+      <div className="text-fg-muted type-base mb-2 font-semibold tracking-wider uppercase">
+        Registers
+      </div>
+      <div className="type-base grid grid-cols-2 gap-x-4 gap-y-1">
+        {REG_LABELS.map((label, i) => (
+          <RegRow key={label} label={label} value={core.x[i]} />
+        ))}
+        <RegRow label="SP" value={core.sp} />
+        <RegRow highlight label="PC" value={core.pc} />
+      </div>
+      <div className="text-fg-muted type-small mt-3">
+        NZCV: <span>{fmtHex32(core.nzcv)}</span> · MPIDR_EL1: <span>{fmtHex64(core.mpidr)}</span>
+      </div>
     </div>
   )
 }
 
-function RegistersCard({ core }: { core: CoreState }) {
-  return (
-    <GlassCard>
-      <div className="p-3">
-        <div className="text-fg-muted type-small mb-2 font-semibold tracking-wider uppercase">
-          Registers
-        </div>
-        <div className="type-small grid grid-cols-2 gap-x-4 gap-y-0.5">
-          {REG_LABELS.map((label, i) => (
-            <RegRow key={label} label={label} value={core.x[i]} />
-          ))}
-          <RegRow label="SP" value={core.sp} />
-          <RegRow highlight label="PC" value={core.pc} />
-        </div>
-        <div className="text-fg-muted type-small mt-2">
-          NZCV: <span>{fmtHex32(core.nzcv)}</span> · MPIDR_EL1: <span>{fmtHex64(core.mpidr)}</span>
-        </div>
-      </div>
-    </GlassCard>
-  )
-}
-
-function ExceptionCard({ core }: { core: CoreState }) {
-  const ec = Number((core.esr_el1 >> 26n) & 0x3fn)
+function ExceptionSection({ core }: { core: CoreState }) {
   // ESR_EL1=0 with current_el=1 typically means we entered via IRQ (no syndrome).
   const inIrq = core.current_el === 1 && core.esr_el1 === 0n && core.elr_el1 !== 0n
-  const ecName = inIrq ? 'IRQ (no ESR syndrome)' : decodeEc(ec)
+  const active = inIrq || core.esr_el1 !== 0n
   return (
-    <GlassCard>
-      <div className="space-y-2 p-3">
-        <div className="text-fg-muted type-small font-semibold tracking-wider uppercase">
-          Exception state
-        </div>
-        <div className="type-small grid gap-x-4 gap-y-0.5 sm:grid-cols-2">
-          <div className="text-fg-muted type-small col-span-full tracking-wider uppercase">EL2</div>
-          <RegRow label="VBAR_EL2" value={core.vbar_el2} />
-          <RegRow label="ELR_EL2" value={core.elr_el2} />
-          <RegRow label="SPSR_EL2" value={core.spsr_el2} />
-          <RegRow label="ESR_EL2" value={core.esr_el2} />
-          <div className="text-fg-muted type-small col-span-full mt-1 tracking-wider uppercase">
-            EL1
-          </div>
-          <RegRow label="VBAR_EL1" value={core.vbar_el1} />
-          <RegRow label="ELR_EL1" value={core.elr_el1} />
-          <RegRow label="SPSR_EL1" value={core.spsr_el1} />
-          <RegRow label="ESR_EL1" value={core.esr_el1} />
-        </div>
-        {(core.esr_el1 !== 0n || inIrq) && (
-          <div className="text-fg-muted type-small">
-            {inIrq
-              ? `entered via ${ecName} (vector VBAR_EL1+0x480)`
-              : `ESR_EL1.EC = 0x${ec.toString(16).padStart(2, '0')} → ${ecName}`}
-          </div>
-        )}
+    <div className="border-border bg-bg-secondary space-y-2 rounded border p-3">
+      <div className="text-fg-muted type-base flex items-center gap-2 font-semibold tracking-wider uppercase">
+        <span
+          aria-label={active ? 'handling exception' : 'idle'}
+          className={`inline-block h-1.5 w-1.5 rounded-full transition-colors ${
+            active ? 'bg-emerald-400' : 'bg-fg-muted/40'
+          }`}
+        />
+        Exception state
       </div>
-    </GlassCard>
+      <div className="type-base grid gap-x-4 gap-y-1 sm:grid-cols-2">
+        <div className="text-fg-muted type-base col-span-full tracking-wider uppercase">EL2</div>
+        <RegRow label="VBAR_EL2" value={core.vbar_el2} />
+        <RegRow label="ELR_EL2" value={core.elr_el2} />
+        <RegRow label="SPSR_EL2" value={core.spsr_el2} />
+        <RegRow label="ESR_EL2" value={core.esr_el2} />
+        <div className="text-fg-muted type-base col-span-full mt-1 tracking-wider uppercase">
+          EL1
+        </div>
+        <RegRow label="VBAR_EL1" value={core.vbar_el1} />
+        <RegRow label="ELR_EL1" value={core.elr_el1} />
+        <RegRow label="SPSR_EL1" value={core.spsr_el1} />
+        <RegRow label="ESR_EL1" value={core.esr_el1} />
+      </div>
+    </div>
   )
 }
 
@@ -1467,23 +1880,35 @@ function RegRow({
   return (
     <div className={`flex justify-between gap-2 ${highlight ? 'text-accent' : ''}`}>
       <span className="text-fg-muted">{label}</span>
-      <span className={value === 0n ? 'text-fg-muted' : 'text-fg'}>{fmtHex64(value)}</span>
+      <span className={`mono-data ${value === 0n ? 'text-fg-muted' : 'text-fg'}`}>
+        {fmtHex64(value)}
+      </span>
     </div>
   )
 }
 
 function OutputPanel({ output }: { output: string }) {
+  // Auto-scroll the box to the bottom whenever new bytes arrive, so the
+  // user always sees the latest line even when the visible window is just
+  // one line tall.
+  const ref = useRef<HTMLPreElement>(null)
+  useEffect(() => {
+    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight
+  }, [output])
   return (
-    <GlassCard>
-      <div className="p-4">
+    <Card className="h-full" padding="none">
+      <div className="flex h-full flex-col p-4">
         <div className="text-fg-muted type-small mb-3 font-semibold tracking-wider uppercase">
           UART Output (PA 0x1000) — shared
         </div>
-        <pre className="text-fg type-base min-h-12 whitespace-pre-wrap">
+        <pre
+          ref={ref}
+          className="text-fg type-base min-h-[1.45em] flex-1 overflow-y-auto leading-[1.45] whitespace-pre-wrap"
+        >
           {output || <span className="text-fg-muted">(no output yet)</span>}
         </pre>
       </div>
-    </GlassCard>
+    </Card>
   )
 }
 
@@ -1493,8 +1918,8 @@ function MemoryPanel({ base, bytes, pcs }: { base: number; bytes: Uint8Array; pc
     rows.push({ addr: base + off, bytes: bytes.slice(off, off + 16) })
   }
   return (
-    <GlassCard>
-      <div className="p-4">
+    <Card className="h-full" padding="none">
+      <div className="flex h-full flex-col p-4">
         <div className="text-fg-muted mb-3 flex items-center justify-between">
           <span className="type-small font-semibold tracking-wider uppercase">
             Memory (around core 0 PC) — shared
@@ -1503,13 +1928,13 @@ function MemoryPanel({ base, bytes, pcs }: { base: number; bytes: Uint8Array; pc
             base {fmtHex32(base)} · pc {pcs.map((pc, i) => `c${i}=${fmtHex32(pc)}`).join(' · ')}
           </span>
         </div>
-        <div className="type-small overflow-x-auto">
+        <div className="mono-data type-small min-h-0 flex-1 overflow-auto">
           {rows.map((r) => (
             <MemoryRow key={r.addr} addr={r.addr} bytes={r.bytes} pcs={pcs} />
           ))}
         </div>
       </div>
-    </GlassCard>
+    </Card>
   )
 }
 
@@ -1520,9 +1945,9 @@ function MemoryRow({ addr, bytes, pcs }: { addr: number; bytes: Uint8Array; pcs:
     const byteAddr = addr + i
     let cls = 'text-fg'
     if (pcs[0] !== undefined && byteAddr >= pcs[0] && byteAddr < pcs[0] + 4) {
-      cls = 'text-accent bg-accent/10 rounded px-0.5'
+      cls = 'text-accent bg-accent/10'
     } else if (pcs[1] !== undefined && byteAddr >= pcs[1] && byteAddr < pcs[1] + 4) {
-      cls = 'rounded bg-violet-500/15 px-0.5 text-violet-300'
+      cls = 'bg-violet-500/15 text-violet-700 dark:text-violet-300'
     }
     cells.push(
       <span className={cls} key={i}>
@@ -1566,13 +1991,13 @@ function MmuPanel({
   const mmuOn = (sel.sctlr_el1 & 1n) !== 0n
 
   return (
-    <GlassCard>
+    <Card padding="none">
       <div className="space-y-4 p-4">
         <div className="text-fg-muted flex items-center justify-between">
           <span className="type-small font-semibold tracking-wider uppercase">
             MMU · Stage-1 Translation
           </span>
-          <Badge color={mmuOn ? 'success' : undefined}>
+          <Badge variant={mmuOn ? 'success' : undefined}>
             SCTLR_EL{1}.M={mmuOn ? '1' : '0'}
           </Badge>
         </div>
@@ -1620,7 +2045,7 @@ function MmuPanel({
             translate VA
           </label>
           <input
-            className="border-border bg-bg/40 text-fg focus:border-accent type-small w-40 rounded border px-2 py-1 outline-none"
+            className="border-border bg-bg-secondary text-fg focus:border-accent type-small w-40 rounded border px-2 py-1 outline-none"
             id="va-input"
             onChange={(e) => onVaChange(e.target.value)}
             placeholder="0x4000"
@@ -1634,15 +2059,25 @@ function MmuPanel({
 
         {trace && <WalkDisplay trace={trace} />}
       </div>
-    </GlassCard>
+    </Card>
   )
 }
 
 function WalkDisplay({ trace }: { trace: TranslationResult }) {
   if (trace.steps.length === 0 && trace.fault) {
+    // "MMU not configured" before the kernel has set up TTBR/TCR is the
+    // expected boot state, not a failure. Render it as a muted note rather
+    // than a red error so it doesn't read as a bug at step 0.
+    const isPreInit = trace.fault.startsWith('MMU not configured')
     return (
-      <div className="border-danger/40 bg-danger/10 text-danger type-small rounded border px-3 py-2">
-        {trace.fault}
+      <div
+        className={`type-small rounded border px-3 py-2 ${
+          isPreInit ? 'border-border text-fg-muted' : 'border-danger/40 bg-danger/10 text-danger'
+        }`}
+      >
+        {isPreInit
+          ? 'MMU not configured yet — kernel will set TTBR0_EL1 + TCR_EL1 during boot.'
+          : trace.fault}
       </div>
     )
   }
@@ -1667,7 +2102,7 @@ function WalkStepRow({ step }: { step: WalkStep }) {
   const tone =
     step.outcome.kind === 'Invalid' || step.outcome.kind === 'Fault' ? 'text-danger' : 'text-fg'
   return (
-    <div className={`border-border/40 rounded border px-3 py-2 ${tone}`}>
+    <div className={`border-border rounded border px-3 py-2 ${tone}`}>
       <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
         <span className="text-accent font-semibold">L{step.level}</span>
         <span className="text-fg-muted">
@@ -1706,30 +2141,5 @@ function OutcomeText({ outcome }: { outcome: WalkOutcome }) {
       return <>invalid descriptor (V=0)</>
     case 'Fault':
       return <>fault: {outcome.reason}</>
-  }
-}
-
-function decodeEc(ec: number): string {
-  switch (ec) {
-    case 0x00:
-      return 'unknown'
-    case 0x15:
-      return 'SVC (AArch64)'
-    case 0x16:
-      return 'HVC (AArch64)'
-    case 0x17:
-      return 'SMC (AArch64)'
-    case 0x20:
-      return 'instruction abort, lower EL'
-    case 0x21:
-      return 'instruction abort, current EL'
-    case 0x24:
-      return 'data abort, lower EL'
-    case 0x25:
-      return 'data abort, current EL'
-    case 0x3c:
-      return 'BRK (AArch64)'
-    default:
-      return '—'
   }
 }

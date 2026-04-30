@@ -9,8 +9,10 @@ const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, 'package.json')
 
 const deps = { ...pkg.dependencies, ...pkg.devDependencies }
 
-export default defineConfig({
-  base: '/',
+export default defineConfig(({ command }) => ({
+  // Production builds are served from labs.golia.jp/aarch64; dev runs at the
+  // host root.
+  base: command === 'build' ? '/aarch64/' : '/',
   plugins: [tailwindcss(), react()],
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
@@ -38,4 +40,4 @@ export default defineConfig({
     globals: true,
     setupFiles: ['./src/test-setup.ts'],
   },
-})
+}))
