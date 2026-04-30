@@ -89,6 +89,7 @@ pub struct CoreState {
     pub steps: u64,
     pub current_el: u8,
     pub daif: u8,
+    pub wfi_halted: bool,
     pub ttbr0_el1: u64,
     pub tcr_el1: u64,
     pub sctlr_el1: u64,
@@ -342,6 +343,9 @@ struct Core {
     /// Low 4 bits of PSTATE.DAIF — D, A, I, F (bit 3 → bit 0). 1 = masked.
     /// On reset (EL2) we mask everything; SVC/IRQ entries also re-mask.
     daif: u8,
+    /// Set by WFI: the core stops fetching until an unmasked IRQ wakes it.
+    /// Cleared when take_irq runs.
+    wfi_halted: bool,
     ttbr0_el1: u64,
     tcr_el1: u64,
     sctlr_el1: u64,
@@ -374,6 +378,7 @@ impl Core {
             steps: 0,
             current_el: 2,
             daif: 0xF, // boot at EL2 with all interrupts masked
+            wfi_halted: false,
             ttbr0_el1: 0,
             tcr_el1: 0,
             sctlr_el1: 0,
@@ -408,6 +413,7 @@ impl Core {
             steps: self.steps,
             current_el: self.current_el,
             daif: self.daif,
+            wfi_halted: self.wfi_halted,
             ttbr0_el1: self.ttbr0_el1,
             tcr_el1: self.tcr_el1,
             sctlr_el1: self.sctlr_el1,
@@ -458,6 +464,8 @@ impl Core {
         self.current_el = 1;
         self.daif = 0xF; // exception entry masks everything
         self.pc = self.vbar_el1.wrapping_add(0x480);
+        // Wake from WFI sleep — handler runs next.
+        self.wfi_halted = false;
     }
 
     fn irq_masked(&self) -> bool {
@@ -918,7 +926,13 @@ impl Core {
             let rt = (insn & 0x1F) as usize;
 
             if op0 < 2 {
-                // Hint / barrier — no-op.
+                // WFI :: 0xD503_207F — set wfi_halted, advance PC.
+                if insn == 0xD503_207F {
+                    self.wfi_halted = true;
+                    self.pc = self.pc.wrapping_add(4);
+                    return Ok(StepResult::Continue);
+                }
+                // Other hints (NOP/YIELD/WFE/SEV…) and barriers — no-op.
                 if insn & 0xFFFF_F01F == 0xD503_201F || insn & 0xFFFF_F01F == 0xD503_301F {
                     self.pc = self.pc.wrapping_add(4);
                     return Ok(StepResult::Continue);
@@ -1087,24 +1101,29 @@ impl Cpu {
             self.timer_ticks = self.timer_ticks.saturating_add(1);
         }
 
-        let mut any = false;
+        let mut any_runnable = false;
         for i in 0..self.cores.len() {
             if self.cores[i].halted {
                 continue;
             }
+            // A WFI'd core counts as "runnable" — the system still needs to
+            // tick because a future timer IRQ can wake it. Only fully halted
+            // cores stop the run() loop.
+            any_runnable = true;
             if self.aic.has_pending(i) && !self.cores[i].irq_masked() {
                 self.cores[i].take_irq();
-                any = true;
-            } else if self.cores[i].step(
-                &mut self.mem,
-                &mut self.output_buf,
-                &mut self.aic,
-                &mut self.block,
-            ) {
-                any = true;
+            } else if self.cores[i].wfi_halted {
+                // sleeping — no fetch this step
+            } else {
+                self.cores[i].step(
+                    &mut self.mem,
+                    &mut self.output_buf,
+                    &mut self.aic,
+                    &mut self.block,
+                );
             }
         }
-        any
+        any_runnable
     }
 
     /// Step a single core. Honours pending IRQs on that core (set either by
@@ -1120,6 +1139,8 @@ impl Cpu {
         if self.aic.has_pending(i) && !self.cores[i].irq_masked() {
             self.cores[i].take_irq();
             true
+        } else if self.cores[i].wfi_halted {
+            false
         } else {
             self.cores[i].step(
                 &mut self.mem,
@@ -1411,13 +1432,15 @@ fn load_demo(mem: &mut [u8]) {
         msr_elr_el1(13),                    // 20
         eret(),                             // 21
     ];
-    // Task A — counts in X3, prints 'A'. X3 persists across context switches.
-    let task_a: [u32; 5] = [
+    // Task A — print one 'A' per scheduling round, then WFI (sleep until the
+    // next IRQ). X3 still accumulates across switches as a tick counter.
+    let task_a: [u32; 6] = [
         movz(1, UART_OUT as u32, 0),
-        add_imm(3, 3, 1),                   // X3 = X3 + 1 (counter)
+        add_imm(3, 3, 1),                   // X3 = X3 + 1 (tick counter)
         movz(0, b'A' as u32, 0),
-        str_imm(0, 1, 0),
-        b_offset(-3),                       // back to ADD (skip the MOVZ)
+        str_imm(0, 1, 0),                   // print 'A'
+        wfi(),                              // sleep until next IRQ
+        b_offset(-4),                       // when scheduler resumes us at top, fall through
     ];
     // Task B — "disk printer". X3 holds the next byte offset into the disk
     // buffer at PA 0x6000 (preserved across context switches via the save
@@ -1582,6 +1605,10 @@ const fn isb() -> u32 {
     0xD503_3FDF
 }
 
+const fn wfi() -> u32 {
+    0xD503_207F
+}
+
 const fn eret() -> u32 {
     0xD69F_03E0
 }
@@ -1701,6 +1728,35 @@ mod tests {
         cpu.run(30);
         assert_eq!(cpu.cores[0].current_el, 0);
         assert_eq!(cpu.cores[0].daif, 0);
+    }
+
+    #[test]
+    fn wfi_sleeps_with_irqs_masked() {
+        // Hand-built program: print 'X', WFI, B-back. With DAIF.I masked the
+        // timer won't wake us — we test that WFI parks the core indefinitely
+        // and the rest of the system keeps ticking.
+        let mut cpu = Cpu::new();
+        let prog = [
+            movz(1, UART_OUT as u32, 0),
+            movz(0, b'X' as u32, 0),
+            str_imm(0, 1, 0),
+            wfi(),
+            b_offset(-1),
+        ];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+        cpu.cores[0].sctlr_el1 = 0;
+        cpu.cores[0].daif = 0xF; // IRQs masked, WFI is permanent here
+        cpu.cores[1].halted = true;
+
+        cpu.run(20);
+        assert!(cpu.cores[0].wfi_halted, "WFI not entered");
+        assert_eq!(cpu.output(), "X");
+
+        // The system_steps clock keeps advancing while a core is WFI'd.
+        let before = cpu.system_steps;
+        cpu.run(50);
+        assert!(cpu.system_steps > before, "system_steps didn't advance during WFI");
+        assert!(cpu.cores[0].wfi_halted, "WFI lifted with IRQs masked?");
     }
 
     #[test]

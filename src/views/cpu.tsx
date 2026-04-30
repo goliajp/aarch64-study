@@ -16,6 +16,7 @@ interface CoreState {
   steps: bigint
   current_el: number
   daif: number
+  wfi_halted: boolean
   ttbr0_el1: bigint
   tcr_el1: bigint
   sctlr_el1: bigint
@@ -265,7 +266,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.12</Badge>
+          <Badge color="info">v0.13</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -276,10 +277,10 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          Per-core scheduling: each core reads <code>MPIDR_EL1</code> at boot and picks its slot
-          region (0x4F00 / 0x5000) plus its initial task. Core 0 starts in task A, core 1 starts in
-          task B (disk printer). Each timer tick swaps both cores to the other task. Output is now
-          genuinely interleaved — at any moment one core is running A and the other B.
+          Task A now uses <code>WFI</code> after each print: print 'A' once, then sleep until the
+          next IRQ. The core running A is mostly asleep (look for the "WFI · sleeping" badge); the
+          core running task B (disk printer) stays busy. Each timer tick swaps both cores — the busy
+          one parks itself, the parked one starts streaming.
         </p>
       </header>
 
@@ -639,6 +640,11 @@ function CoreColumn({ core, onStep }: { core: CoreState; onStep: () => void }) {
               </span>
             ) : null
           })()}
+          {core.wfi_halted && (
+            <span className="inline-flex items-center rounded border border-sky-500/40 bg-sky-500/15 px-1.5 py-0.5 font-mono text-[10px] tracking-wider text-sky-300">
+              WFI · sleeping
+            </span>
+          )}
           {core.halted && (
             <Badge color={core.last_trap ? 'danger' : 'success'}>
               {core.last_trap ? 'TRAP' : 'HALTED'}
