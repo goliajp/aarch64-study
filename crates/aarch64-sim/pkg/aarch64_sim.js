@@ -22,6 +22,15 @@ export class Cpu {
         return takeFromExternrefTable0(ret[0]);
     }
     /**
+     * Reads the shared u64 atomic counter at PA 0x6FF8 — task A's LDXR/STXR
+     * loop bumps it once per scheduling round.
+     * @returns {bigint}
+     */
+    atomic_counter() {
+        const ret = wasm.cpu_atomic_counter(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
      * @returns {any}
      */
     block_state() {

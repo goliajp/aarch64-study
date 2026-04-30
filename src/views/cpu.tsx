@@ -59,6 +59,7 @@ export function CpuView() {
       timerPeriod: c.timer_period(),
       timerRemaining: c.timer_remaining(),
       timerTicks: ticks,
+      atomicCounter: c.atomic_counter(),
     })
     const viewStart = Number(s[0].pc) & ~0xf
     setMemory(c.mem_slice(viewStart, MEMORY_VIEW_BYTES))
@@ -205,7 +206,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge variant="info">v0.16</Badge>
+          <Badge variant="info">v0.17</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}

@@ -36,7 +36,7 @@ bun run dev            # vite dev server on http://127.0.0.1:32030
 
 | Script               | What it runs                                    |
 | -------------------- | ----------------------------------------------- |
-| `bun run test:sim`   | `cargo test` the Rust simulator (15 tests)      |
+| `bun run test:sim`   | `cargo test` the Rust simulator (20 tests)      |
 | `bun run test`       | Vitest the React side                           |
 | `bun run check`      | tsc + eslint + prettier                         |
 | `bun run build`      | production bundle into `./dist`                 |
@@ -62,7 +62,7 @@ bun run dev            # vite dev server on http://127.0.0.1:32030
 | v0.14   | AP-bit enforcement                                                         |
 | v0.15   | Disassembler + editable disk                                               |
 | v0.16   | UI overhaul: pin-out SoC schematic, theme tokens, scheduler pinning        |
-| v0.17   | Atomic LDXR / STXR + spinlock-guarded UART (real concurrency primitive)    |
+| v0.17   | LDXR / STXR / CLREX + cross-core exclusive monitor (real concurrency)      |
 | v0.18   | IPI between cores via AIC software-IRQ                                     |
 | v1.0    | Bare-metal port via m1n1 — same Rust crate runs on real Apple Silicon      |
 

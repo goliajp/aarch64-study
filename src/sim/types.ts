@@ -61,6 +61,7 @@ export interface SystemInfo {
   timerPeriod: bigint
   timerRemaining: bigint
   timerTicks: bigint
+  atomicCounter: bigint
 }
 
 export type NodeId = 'core0' | 'core1' | 'aic' | 'uart' | 'block' | 'ram'

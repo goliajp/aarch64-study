@@ -352,6 +352,13 @@ struct Core {
     /// Set by WFI: the core stops fetching until an unmasked IRQ wakes it.
     /// Cleared when take_irq runs.
     wfi_halted: bool,
+    /// Address reserved by the most-recent LDXR. STXR succeeds only while
+    /// this matches; cleared by CLREX, by IRQ entry, and by a store from
+    /// any other core to the same address.
+    exclusive_monitor: Option<u64>,
+    /// PA of the last store this core performed in this step. Cpu::step
+    /// reads it and invalidates the matching monitor on the other cores.
+    last_store_pa: Option<u64>,
     ttbr0_el1: u64,
     tcr_el1: u64,
     sctlr_el1: u64,
@@ -385,6 +392,8 @@ impl Core {
             current_el: 2,
             daif: 0xF, // boot at EL2 with all interrupts masked
             wfi_halted: false,
+            exclusive_monitor: None,
+            last_store_pa: None,
             ttbr0_el1: 0,
             tcr_el1: 0,
             sctlr_el1: 0,
@@ -470,7 +479,7 @@ impl Core {
         self.current_el = 1;
         self.daif = 0xF; // exception entry masks everything
         self.pc = self.vbar_el1.wrapping_add(0x480);
-        // Wake from WFI sleep — handler runs next.
+        self.exclusive_monitor = None; // exception entry clears the local monitor
         self.wfi_halted = false;
     }
 
@@ -563,7 +572,7 @@ impl Core {
     }
 
     fn store64(
-        &self,
+        &mut self,
         mem: &mut [u8],
         out: &mut Vec<u8>,
         aic: &mut Aic,
@@ -572,6 +581,7 @@ impl Core {
         val: u64,
     ) -> Result<(), String> {
         let pa = self.translate_for_access(mem, va)?;
+        self.last_store_pa = Some(pa);
         if (AIC_BASE..AIC_END).contains(&pa) {
             aic.mmio_write(self.id as usize, pa - AIC_BASE, val);
             return Ok(());
@@ -962,6 +972,47 @@ impl Core {
             return Ok(StepResult::Continue);
         }
 
+        // LDXR Xt, [Xn] :: 1100_1000_0101_1111_0111_1100_Rn_Rt   (size=11, L=1, excl)
+        if insn & 0xFFFF_FC00 == 0xC85F_7C00 {
+            let rt = (insn & 0x1F) as usize;
+            let rn = ((insn >> 5) & 0x1F) as usize;
+            let va = self.read_x(rn);
+            let pa = self.translate_for_access(mem, va)?;
+            let val = read_pa_u64(mem, pa)?;
+            self.write_x(rt, val);
+            self.exclusive_monitor = Some(pa);
+            self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
+        // STXR Ws, Xt, [Xn] :: 1100_1000_000_Rs_0_11111_Rn_Rt   (size=11, L=0, excl)
+        if insn & 0xFFE0_FC00 == 0xC800_7C00 {
+            let rt = (insn & 0x1F) as usize;
+            let rn = ((insn >> 5) & 0x1F) as usize;
+            let rs = ((insn >> 16) & 0x1F) as usize;
+            let va = self.read_x(rn);
+            let pa = self.translate_for_access(mem, va)?;
+            let succeeded = self.exclusive_monitor == Some(pa);
+            self.exclusive_monitor = None;
+            if succeeded {
+                let val = self.read_x(rt);
+                self.last_store_pa = Some(pa);
+                write_pa_u64(mem, pa, val)?;
+                self.write_x(rs, 0);
+            } else {
+                self.write_x(rs, 1);
+            }
+            self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
+        // CLREX :: 0xD503_3F5F (CRm=1111, the only encoding we emit)
+        if insn & 0xFFFF_F0FF == 0xD503_305F {
+            self.exclusive_monitor = None;
+            self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
         // MSR/MRS sysreg
         if insn & 0xFFC0_0000 == 0xD500_0000 {
             let l = (insn >> 21) & 1;
@@ -1169,6 +1220,7 @@ impl Cpu {
                     &mut self.block,
                 );
             }
+            self.invalidate_remote_monitors(i);
         }
         any_runnable
     }
@@ -1183,7 +1235,7 @@ impl Cpu {
         if self.cores[i].halted {
             return false;
         }
-        if self.aic.has_pending(i) && !self.cores[i].irq_masked() {
+        let progressed = if self.aic.has_pending(i) && !self.cores[i].irq_masked() {
             self.cores[i].take_irq();
             true
         } else if self.cores[i].wfi_halted {
@@ -1195,6 +1247,23 @@ impl Cpu {
                 &mut self.aic,
                 &mut self.block,
             )
+        };
+        self.invalidate_remote_monitors(i);
+        progressed
+    }
+
+    /// Implements the cross-core half of the exclusive monitor: a store from
+    /// core `i` clears every *other* core's reservation if it matches the
+    /// stored address. This is what makes LDXR/STXR a real concurrency
+    /// primitive — without it two cores could both think their CAS won.
+    fn invalidate_remote_monitors(&mut self, i: usize) {
+        let Some(pa) = self.cores[i].last_store_pa.take() else {
+            return;
+        };
+        for (j, c) in self.cores.iter_mut().enumerate() {
+            if j != i && c.exclusive_monitor == Some(pa) {
+                c.exclusive_monitor = None;
+            }
         }
     }
 
@@ -1295,7 +1364,15 @@ impl Cpu {
     pub fn num_cores(&self) -> u32 {
         self.cores.len() as u32
     }
+
+    /// Reads the shared u64 atomic counter at PA 0x6FF8 — task A's LDXR/STXR
+    /// loop bumps it once per scheduling round.
+    pub fn atomic_counter(&self) -> u64 {
+        read_pa_u64(&self.mem, ATOMIC_COUNTER_PA_PUB).unwrap_or(0)
+    }
 }
+
+const ATOMIC_COUNTER_PA_PUB: u64 = 0x6FF8;
 
 impl Default for Cpu {
     fn default() -> Self {
@@ -1469,6 +1546,23 @@ pub fn disassemble(insn: u32, pc: u64) -> String {
             format!("{mnem} x{rt1}, x{rt2}, [x{rn}, #{off}]")
         };
     }
+    // LDXR Xt, [Xn]
+    if insn & 0xFFFF_FC00 == 0xC85F_7C00 {
+        let rt = insn & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        return format!("ldxr x{rt}, [x{rn}]");
+    }
+    // STXR Ws, Xt, [Xn]
+    if insn & 0xFFE0_FC00 == 0xC800_7C00 {
+        let rt = insn & 0x1F;
+        let rn = (insn >> 5) & 0x1F;
+        let rs = (insn >> 16) & 0x1F;
+        return format!("stxr w{rs}, x{rt}, [x{rn}]");
+    }
+    // CLREX (any CRm — canonical CRm=1111)
+    if insn & 0xFFFF_F0FF == 0xD503_305F {
+        return "clrex".into();
+    }
     // SVC #imm16
     if insn & 0xFFE0_001F == 0xD400_0001 {
         let imm = (insn >> 5) & 0xFFFF;
@@ -1614,6 +1708,10 @@ fn load_demo(mem: &mut [u8]) {
     const SLOT_BASE_BASE: u32 = 0x4F00; // base for core 0
     const MPIDR_BASE_HI: u32 = 0x8000; // moved to upper half via LSL #16
     const DISK_BUF_PA: u32 = 0x6000;
+    // Atomic counter sits in the same user-mapped page as the disk buffer
+    // (0x6000–0x6FFF), well past the 64-byte sector. Task A bumps it via
+    // LDXR/STXR; the UI reads it from RAM.
+    const ATOMIC_COUNTER_PA: u32 = 0x6FF8;
     const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
     let kernel: [u32; 35] = [
@@ -1681,13 +1779,20 @@ fn load_demo(mem: &mut [u8]) {
         ldr_imm(10, 9, 0),           // 1: X10 = irq id (read clears pending)
         eret(),                      // 2: return to preempted task
     ];
-    // Task A — pure WFI sleeper. Bumps X3 each scheduling round so the
-    // counter is observable, then sleeps until the next IRQ. Does not touch
-    // UART, so task B's output stays clean.
-    let task_a: [u32; 3] = [
-        add_imm(3, 3, 1), // X3 += 1 (tick counter)
-        wfi(),            // sleep until next IRQ
-        b_offset(-2),     // resume → loop back to add+wfi
+    // Task A — atomic counter. Each scheduling round it increments the
+    // shared u64 at PA 0x6FF8 via an LDXR/STXR pair, retrying on monitor
+    // failure (CBNZ on Ws), then WFIs until the next IRQ. The MOVZ that
+    // loads the counter address runs once at first entry; subsequent
+    // resumes loop back to the LDXR. Does not touch UART, so task B's
+    // output stays clean.
+    let task_a: [u32; 7] = [
+        movz(4, ATOMIC_COUNTER_PA, 0), // 0: X4 = &counter (PA 0x6FF8)
+        ldxr(5, 4),                    // 1: X5 = *X4, set local monitor
+        add_imm(5, 5, 1),              // 2: X5 += 1
+        stxr(6, 5, 4),                 // 3: try CAS, W6 = 0/1 (ok/retry)
+        cbnz(6, -2),                   // 4: if W6 != 0 → branch back to LDXR
+        wfi(),                         // 5: sleep until next IRQ
+        b_offset(-5),                  // 6: on resume → back to LDXR
     ];
     // Task B — "disk printer". Walks the 64-byte disk buffer at PA 0x6000
     // once, emitting each byte to the UART. On hitting the null terminator
@@ -1856,6 +1961,23 @@ const fn wfi() -> u32 {
     0xD503_207F
 }
 
+/// LDXR Xt, [Xn] — load-exclusive 64-bit. Sets the local monitor to PA(Xn).
+const fn ldxr(rt: u32, rn: u32) -> u32 {
+    0xC85F_7C00 | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+
+/// STXR Ws, Xt, [Xn] — store-exclusive 64-bit. Writes Ws=0 on success, 1 on
+/// monitor mismatch. Always clears the local monitor.
+const fn stxr(rs: u32, rt: u32, rn: u32) -> u32 {
+    0xC800_7C00 | ((rs & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+
+/// CLREX — clear the local monitor unconditionally.
+#[allow(dead_code)]
+const fn clrex() -> u32 {
+    0xD503_3F5F
+}
+
 const fn eret() -> u32 {
     0xD69F_03E0
 }
@@ -1890,6 +2012,9 @@ mod tests {
         assert_eq!(disassemble(eret(), 0x4000), "eret");
         assert_eq!(disassemble(wfi(), 0x4000), "wfi");
         assert_eq!(disassemble(isb(), 0x4000), "isb sy");
+        assert_eq!(disassemble(ldxr(5, 4), 0x4000), "ldxr x5, [x4]");
+        assert_eq!(disassemble(stxr(6, 5, 4), 0x4000), "stxr w6, x5, [x4]");
+        assert_eq!(disassemble(clrex(), 0x4000), "clrex");
         assert_eq!(disassemble(msr_ttbr0(9), 0x4000), "msr ttbr0_el1, x9");
         assert_eq!(disassemble(mrs_mpidr(14), 0x4000), "mrs x14, mpidr_el1");
         assert_eq!(disassemble(0xD503_42FFu32, 0x4000), "msr DAIFClr, #0x2");
@@ -2141,5 +2266,130 @@ mod tests {
         cpu.run(20);
         // Core 0 should have computed X0 = 12 then halted on B .
         assert_eq!(cpu.cores[0].x[0], 12);
+    }
+
+    /// Helper for the LL/SC tests below — a tiny program does
+    /// LDXR/ADD/STXR at PA 0x100 then halts.
+    fn ll_sc_program() -> [u32; 5] {
+        [
+            movz(4, 0x100, 0),       // X4 = &counter
+            ldxr(5, 4),              // X5 = *X4
+            add_imm(5, 5, 1),        // X5 += 1
+            stxr(6, 5, 4),           // try CAS
+            b_self(),                // halt
+        ]
+    }
+
+    #[test]
+    fn stxr_succeeds_after_clean_ldxr() {
+        let mut cpu = Cpu::new();
+        write_words(&mut cpu.mem, ENTRY_PC, &ll_sc_program());
+        cpu.mem[0x100..0x108].copy_from_slice(&41u64.to_le_bytes());
+        cpu.cores[0].sctlr_el1 = 0;
+        cpu.cores[1].halted = true;
+        cpu.run(20);
+        let cnt = u64::from_le_bytes(cpu.mem[0x100..0x108].try_into().unwrap());
+        assert_eq!(cnt, 42, "STXR did not commit");
+        assert_eq!(cpu.cores[0].x[6], 0, "STXR success flag should be 0");
+    }
+
+    #[test]
+    fn stxr_fails_after_clrex() {
+        // LDXR; CLREX; STXR — the STXR must fail because CLREX wiped the monitor.
+        let mut cpu = Cpu::new();
+        let prog = [
+            movz(4, 0x100, 0),
+            ldxr(5, 4),
+            clrex(),
+            stxr(6, 5, 4),
+            b_self(),
+        ];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+        cpu.mem[0x100..0x108].copy_from_slice(&7u64.to_le_bytes());
+        cpu.cores[0].sctlr_el1 = 0;
+        cpu.cores[1].halted = true;
+        cpu.run(20);
+        let cnt = u64::from_le_bytes(cpu.mem[0x100..0x108].try_into().unwrap());
+        assert_eq!(cnt, 7, "STXR after CLREX must NOT commit");
+        assert_eq!(cpu.cores[0].x[6], 1, "STXR fail flag should be 1");
+    }
+
+    #[test]
+    fn irq_clears_local_monitor() {
+        // After LDXR the monitor is set; IRQ entry must clear it so a later
+        // STXR fails. We simulate by calling take_irq() directly.
+        let mut cpu = Cpu::new();
+        cpu.cores[0].exclusive_monitor = Some(0x100);
+        cpu.cores[0].vbar_el1 = 0x4400;
+        cpu.cores[0].take_irq();
+        assert_eq!(cpu.cores[0].exclusive_monitor, None);
+    }
+
+    #[test]
+    fn cross_core_store_invalidates_monitor() {
+        // Core 0 reserves PA 0x100. Core 1 stores to 0x100. Core 0's
+        // subsequent STXR must fail and the counter must reflect core 1's
+        // store, not core 0's.
+        let mut cpu = Cpu::new();
+        cpu.mem[0x100..0x108].copy_from_slice(&100u64.to_le_bytes());
+        cpu.cores[0].sctlr_el1 = 0;
+        cpu.cores[1].sctlr_el1 = 0;
+        // Core 0: LDXR; B-here (busy-wait until core 1 stores); STXR; halt.
+        // We sequence the cores by setting them up at different PCs and
+        // stepping each manually.
+        let core0_prog = [
+            movz(4, 0x100, 0),
+            ldxr(5, 4),
+            add_imm(5, 5, 1),
+            // Pause here — caller advances core 1 first.
+            b_self(),
+            stxr(6, 5, 4),
+            b_self(),
+        ];
+        let core1_prog = [
+            movz(4, 0x100, 0),
+            movz(5, 999, 0),
+            str_imm(5, 4, 0),
+            b_self(),
+        ];
+        const C0_BASE: u64 = ENTRY_PC;
+        const C1_BASE: u64 = ENTRY_PC + 0x80;
+        write_words(&mut cpu.mem, C0_BASE, &core0_prog);
+        write_words(&mut cpu.mem, C1_BASE, &core1_prog);
+        cpu.cores[1].pc = C1_BASE;
+
+        // Step core 0 through MOVZ + LDXR + ADD; reservation now held.
+        for _ in 0..3 {
+            cpu.step_core(0);
+        }
+        assert_eq!(cpu.cores[0].exclusive_monitor, Some(0x100));
+
+        // Step core 1 through MOVZ + MOVZ + STR — its store invalidates
+        // core 0's monitor.
+        for _ in 0..3 {
+            cpu.step_core(1);
+        }
+        assert_eq!(cpu.cores[0].exclusive_monitor, None,
+            "core 1's store should have wiped core 0's reservation");
+
+        // Now run core 0's STXR — must fail (W6 = 1) and leave counter at 999.
+        cpu.cores[0].pc = C0_BASE + 4 * 4; // skip the b_self
+        cpu.step_core(0);
+        let cnt = u64::from_le_bytes(cpu.mem[0x100..0x108].try_into().unwrap());
+        assert_eq!(cnt, 999, "core 1's value must survive — STXR failed");
+        assert_eq!(cpu.cores[0].x[6], 1, "STXR fail flag should be 1");
+    }
+
+    #[test]
+    fn task_a_atomic_counter_increments() {
+        // Boot the demo and let task A churn for many cycles; the atomic
+        // counter at 0x6FF8 must be strictly increasing.
+        let mut cpu = Cpu::new();
+        cpu.run(2000);
+        let v1 = cpu.atomic_counter();
+        cpu.run(2000);
+        let v2 = cpu.atomic_counter();
+        assert!(v1 > 0, "task A's counter never advanced past zero");
+        assert!(v2 > v1, "counter stalled: {v1} -> {v2}");
     }
 }

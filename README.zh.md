@@ -31,7 +31,7 @@ bun run dev            # vite dev server，端口 32030
 
 | 脚本                  | 作用                                             |
 | --------------------- | ------------------------------------------------ |
-| `bun run test:sim`    | `cargo test` 跑模拟器测试（15 个）               |
+| `bun run test:sim`    | `cargo test` 跑模拟器测试（20 个）               |
 | `bun run test`        | React 侧 vitest                                  |
 | `bun run check`       | tsc + eslint + prettier                          |
 | `bun run build`       | 产线打包到 `./dist`                              |
@@ -57,7 +57,7 @@ bun run dev            # vite dev server，端口 32030
 | v0.14 | AP 位保护                                                                    |
 | v0.15 | 反汇编器 + 可编辑 disk                                                       |
 | v0.16 | UI 大改：pin-out SoC 图、主题 token、scheduler 固定每核任务                   |
-| v0.17 | 原子 LDXR / STXR + spinlock 守护的 UART（真正的并发原语）                    |
+| v0.17 | LDXR / STXR / CLREX + 跨核排他监视器（真正的并发原语）                       |
 | v0.18 | 跨核 IPI（通过 AIC 软件 IRQ）                                                |
 | v1.0  | 通过 m1n1 跑到真机——同一份 Rust crate 在 Apple Silicon 上裸跑                 |
 

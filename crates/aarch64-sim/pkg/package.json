@@ -1,7 +1,13 @@
 {
   "name": "aarch64-sim",
   "type": "module",
-  "version": "0.10.0",
+  "description": "AArch64 SoC simulator core (Rust → WASM) powering aarch64-study",
+  "version": "0.17.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/goliajp/aarch64-study"
+  },
   "files": [
     "aarch64_sim_bg.wasm",
     "aarch64_sim.js",

@@ -92,6 +92,7 @@ function Stats({ aic, block, cores, info, totalCoreSteps, uartBytes }: StatsProp
     { label: 'core 0 pc', value: fmtHex32(Number(cores[0]?.pc ?? 0n)) },
     { label: 'core 1 pc', value: fmtHex32(Number(cores[1]?.pc ?? 0n)) },
     { label: 'cores el', value: `${cores[0]?.current_el ?? 0} / ${cores[1]?.current_el ?? 0}` },
+    { label: 'atomic ctr', value: info.atomicCounter.toString() },
   ]
   return (
     <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">

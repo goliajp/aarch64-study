@@ -15,8 +15,8 @@ v0.12  + per-core scheduler — cores run A/B concurrently via MPIDR
 v0.13  + WFI — idle cores stop spinning
 v0.14  + AP-bit enforcement — kernel pages reject EL0 access
 v0.15  + disassembler, core monitors, editable disk text
-v0.16  + UI overhaul: pin-out SoC schematic, theme tokens, scheduler pinning  ← here
-v0.17  + atomic LDXR / STXR + spinlock-guarded UART
+v0.16  + UI overhaul: pin-out SoC schematic, theme tokens, scheduler pinning
+v0.17  + atomic LDXR / STXR / CLREX + cross-core exclusive monitor  ← here
 v0.18  + IPI between cores via AIC software-IRQ
 v1.0   + bare-metal port via m1n1 (same Rust crate runs on real Apple Silicon)`
 
