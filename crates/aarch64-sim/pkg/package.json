@@ -1,7 +1,7 @@
 {
   "name": "aarch64-sim",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.10.0",
   "files": [
     "aarch64_sim_bg.wasm",
     "aarch64_sim.js",
