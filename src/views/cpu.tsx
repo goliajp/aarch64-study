@@ -35,6 +35,25 @@ interface AicState {
   total_acks: bigint
 }
 
+type SimEventKind = 'store' | 'timer' | 'disk_read' | 'irq_taken' | 'svc' | 'eret'
+
+interface SimEvent {
+  id: number
+  kind: SimEventKind
+  source: NodeId
+  target: NodeId
+  ts: number
+}
+
+type NodeId = 'core0' | 'core1' | 'aic' | 'uart' | 'block' | 'ram'
+
+interface PrevSnapshot {
+  cores: { pc: bigint; current_el: number; wfi_halted: boolean }[]
+  outputLen: number
+  ticks: bigint
+  totalReads: bigint
+}
+
 interface BlockState {
   sector: bigint
   buf_addr: bigint
@@ -142,27 +161,134 @@ export function CpuView() {
   const [running, setRunning] = useState(false)
   const [vaText, setVaText] = useState('0x4000')
   const [translateCoreIdx, setTranslateCoreIdx] = useState(0)
+  const [events, setEvents] = useState<SimEvent[]>([])
   const runRafRef = useRef<number | null>(null)
+  const prevRef = useRef<PrevSnapshot | null>(null)
+  const eventIdRef = useRef(0)
 
   const refresh = useCallback((c: Cpu) => {
     const s = c.state() as CoreState[]
     setCores(s)
-    setAic(c.aic_state() as AicState)
-    setBlock(c.block_state() as BlockState)
+    const aicState = c.aic_state() as AicState
+    const blockState = c.block_state() as BlockState
+    setAic(aicState)
+    setBlock(blockState)
+    const ticks = c.timer_ticks()
     setSysInfo({
       systemSteps: c.system_steps(),
       timerPeriod: c.timer_period(),
       timerRemaining: c.timer_remaining(),
-      timerTicks: c.timer_ticks(),
+      timerTicks: ticks,
     })
     // Center memory on core 0's PC.
     const viewStart = Number(s[0].pc) & ~0xf
     setMemory(c.mem_slice(viewStart, MEMORY_VIEW_BYTES))
-    setOutput(c.output())
+    const newOutput = c.output()
+    setOutput(newOutput)
     // Pull each core's slot region (0x4F00 = core 0, 0x5000 = core 1).
     const slot0 = parseCoreSlot(c.mem_slice(0x4f00, 0x50))
     const slot1 = parseCoreSlot(c.mem_slice(0x5000, 0x50))
     setCoreSlots([slot0, slot1])
+
+    // --- Event detection: diff against previous snapshot ---
+    const now = performance.now()
+    const newEvents: SimEvent[] = []
+    const prev = prevRef.current
+    if (prev) {
+      // Store events: output grew. Attribute to whichever core(s) are at EL0
+      // and not WFI/halted (the only ones that could've STR'd).
+      if (newOutput.length > prev.outputLen) {
+        s.forEach((core, i) => {
+          if (!core.wfi_halted && !core.halted && core.current_el === 0) {
+            newEvents.push({
+              id: ++eventIdRef.current,
+              kind: 'store',
+              source: i === 0 ? 'core0' : 'core1',
+              target: 'uart',
+              ts: now,
+            })
+          }
+        })
+      }
+      // Timer fire: AIC raises IRQ on every core.
+      if (ticks > prev.ticks) {
+        newEvents.push({
+          id: ++eventIdRef.current,
+          kind: 'timer',
+          source: 'aic',
+          target: 'core0',
+          ts: now,
+        })
+        newEvents.push({
+          id: ++eventIdRef.current,
+          kind: 'timer',
+          source: 'aic',
+          target: 'core1',
+          ts: now + 30,
+        })
+      }
+      // Disk read: block.total_reads++ → bytes flowed Block → RAM.
+      if (blockState.total_reads > prev.totalReads) {
+        newEvents.push({
+          id: ++eventIdRef.current,
+          kind: 'disk_read',
+          source: 'block',
+          target: 'ram',
+          ts: now,
+        })
+      }
+      // Per-core PC transitions: IRQ taken / SVC entry / ERET drop.
+      s.forEach((core, i) => {
+        const prevCore = prev.cores[i]
+        if (!prevCore) return
+        const pc = Number(core.pc)
+        const prevPc = Number(prevCore.pc)
+        const vbar = 0x4400 // demo VBAR_EL1
+        if (pc === vbar + 0x480 && prevPc !== vbar + 0x480) {
+          newEvents.push({
+            id: ++eventIdRef.current,
+            kind: 'irq_taken',
+            source: 'aic',
+            target: i === 0 ? 'core0' : 'core1',
+            ts: now,
+          })
+        }
+        if (pc === vbar + 0x400 && prevPc !== vbar + 0x400) {
+          newEvents.push({
+            id: ++eventIdRef.current,
+            kind: 'svc',
+            source: i === 0 ? 'core0' : 'core1',
+            target: i === 0 ? 'core0' : 'core1',
+            ts: now,
+          })
+        }
+        if (core.current_el < prevCore.current_el) {
+          newEvents.push({
+            id: ++eventIdRef.current,
+            kind: 'eret',
+            source: i === 0 ? 'core0' : 'core1',
+            target: i === 0 ? 'core0' : 'core1',
+            ts: now,
+          })
+        }
+      })
+    }
+    if (newEvents.length > 0) {
+      setEvents((prevEvents) => [...prevEvents.filter((e) => now - e.ts < 800), ...newEvents])
+    } else {
+      setEvents((prevEvents) => prevEvents.filter((e) => now - e.ts < 800))
+    }
+
+    prevRef.current = {
+      cores: s.map((c2) => ({
+        pc: c2.pc,
+        current_el: c2.current_el,
+        wfi_halted: c2.wfi_halted,
+      })),
+      outputLen: newOutput.length,
+      ticks,
+      totalReads: blockState.total_reads,
+    }
   }, [])
 
   useEffect(() => {
@@ -309,8 +435,10 @@ export function CpuView() {
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_440px]">
         <div className="min-w-0 space-y-4">
-          <DisassemblyPanel cpu={cpu} cores={cores} />
-          <MemoryPanel base={memBaseAddr} bytes={memory} pcs={corePcs} />
+          <div className="grid gap-4 lg:grid-cols-2">
+            <DisassemblyPanel cpu={cpu} cores={cores} />
+            <MemoryPanel base={memBaseAddr} bytes={memory} pcs={corePcs} />
+          </div>
           <MmuPanel
             cores={cores}
             onCoreChange={setTranslateCoreIdx}
@@ -330,9 +458,14 @@ export function CpuView() {
         </div>
 
         <div className="space-y-4 xl:sticky xl:top-4 xl:self-start">
-          {cores.map((c) => (
-            <SciFiCoreCard core={c} key={c.id} slot={coreSlots[c.id]} />
-          ))}
+          <SystemDiagram
+            aic={aic}
+            block={block}
+            cores={cores}
+            events={events}
+            output={output}
+            slots={coreSlots}
+          />
           <EditableDisk cpu={cpu} block={block} onChange={refresh} />
         </div>
       </div>
@@ -567,229 +700,460 @@ function AicPanel({ aic }: { aic: AicState }) {
   )
 }
 
-function SciFiCoreCard({ core, slot }: { core: CoreState; slot: CoreSlot }) {
-  // Map a sci-fi accent per core: cyan for P-core, violet for E-core.
-  const accent = core.id === 0 ? 'cyan' : 'violet'
-  const taskLabel =
-    slot.entry === 0x4d00n ? 'TASK A' : slot.entry === 0x4e00n ? 'TASK B' : '— idle —'
-  const elColor =
-    core.current_el === 2
-      ? 'text-cyan-300'
-      : core.current_el === 1
-        ? 'text-violet-300'
-        : 'text-emerald-300'
-  const stateLine = core.last_trap
-    ? 'TRAP'
-    : core.halted
-      ? 'HALTED'
-      : core.wfi_halted
-        ? 'WFI · idle'
-        : 'EXECUTING'
-  const stateColor = core.last_trap
-    ? 'text-rose-300'
-    : core.wfi_halted
-      ? 'text-sky-300'
-      : 'text-emerald-300'
+// === System architecture diagram ============================================
+// One SVG that lays out the whole simulated machine: two cores, the system
+// bus (a horizontal trunk), and four peripherals (UART, AIC, Block, RAM).
+// Static structure is drawn in muted strokes; every detected SimEvent is
+// rendered as a small packet that flies along the corresponding link, so
+// what you see moving on screen 1:1 maps to what just happened in the
+// simulator.
+
+const NODE_POS: Record<NodeId, { x: number; y: number }> = {
+  core0: { x: 110, y: 78 },
+  core1: { x: 330, y: 78 },
+  aic: { x: 70, y: 280 },
+  uart: { x: 190, y: 280 },
+  block: { x: 310, y: 280 },
+  ram: { x: 220, y: 410 },
+}
+const BUS_Y = 188
+const SVG_W = 440
+const SVG_H = 480
+
+function SystemDiagram({
+  aic,
+  block,
+  cores,
+  events,
+  output,
+  slots,
+}: {
+  aic: AicState
+  block: BlockState
+  cores: CoreState[]
+  events: SimEvent[]
+  output: string
+  slots: CoreSlot[]
+}) {
+  const ramRegions = useMemo(
+    () =>
+      [
+        { addr: 0x1000, label: 'UART' },
+        { addr: 0x2000, label: 'AIC' },
+        { addr: 0x3000, label: 'BLK' },
+        { addr: 0x4000, label: 'kernel/tasks' },
+        { addr: 0x4f00, label: 'core 0 slots' },
+        { addr: 0x5000, label: 'core 1 slots' },
+        { addr: 0x6000, label: 'disk buf' },
+        { addr: 0x8000, label: 'page tables' },
+      ] as const,
+    []
+  )
   return (
-    <div
-      className={`scifi-card relative rounded-xl border p-4 ${
-        accent === 'cyan'
-          ? 'border-cyan-400/30 bg-gradient-to-br from-cyan-950/40 via-slate-950/60 to-violet-950/30'
-          : 'border-violet-400/30 bg-gradient-to-br from-violet-950/40 via-slate-950/60 to-cyan-950/30'
-      }`}
-    >
-      {/* scan line */}
-      <div
-        className={`scifi-scan pointer-events-none absolute inset-x-0 h-px ${
-          accent === 'cyan' ? 'bg-cyan-400' : 'bg-violet-400'
-        }`}
-      />
-      <div className="relative flex items-center justify-between">
-        <div className="flex items-baseline gap-2 font-mono">
-          <span
-            className={`text-lg font-bold tracking-[0.2em] ${
-              accent === 'cyan' ? 'text-cyan-200' : 'text-violet-200'
-            }`}
-          >
-            CORE_{core.id}
-          </span>
-          <span className="text-fg-muted text-[10px] tracking-widest uppercase">{core.kind}</span>
-        </div>
-        <span
-          className={`rounded-full border border-current/40 px-2 py-0.5 font-mono text-[10px] tracking-widest uppercase ${elColor}`}
-        >
-          EL{core.current_el}
+    <div className="border-border bg-bg/60 relative rounded-xl border p-3">
+      <div className="text-fg-muted mb-2 flex items-center justify-between">
+        <span className="text-[10px] font-semibold tracking-wider uppercase">
+          System layout · live event flow
+        </span>
+        <span className="font-mono text-[10px]">
+          {events.length > 0 ? `${events.length} active` : 'idle'}
         </span>
       </div>
-
       <svg
-        className="my-3 w-full"
-        height="86"
-        viewBox="0 0 400 86"
+        className="block w-full"
+        viewBox={`0 0 ${SVG_W} ${SVG_H}`}
         xmlns="http://www.w3.org/2000/svg"
       >
-        <defs>
-          <linearGradient id={`grad-${core.id}`} x1="0" x2="1" y1="0" y2="1">
-            <stop
-              offset="0%"
-              stopColor={accent === 'cyan' ? '#22d3ee' : '#a78bfa'}
-              stopOpacity="0.8"
-            />
-            <stop
-              offset="100%"
-              stopColor={accent === 'cyan' ? '#0e7490' : '#6d28d9'}
-              stopOpacity="0.4"
-            />
-          </linearGradient>
-        </defs>
-        {/* CPU "die" */}
-        <rect
-          fill={`url(#grad-${core.id})`}
-          height="56"
-          rx="6"
-          stroke={accent === 'cyan' ? '#22d3ee' : '#a78bfa'}
-          strokeOpacity="0.6"
+        {/* Static system bus */}
+        <line
+          stroke="rgb(148 163 184 / 0.35)"
+          strokeWidth="1.5"
+          x1="20"
+          x2={SVG_W - 20}
+          y1={BUS_Y}
+          y2={BUS_Y}
+        />
+        <text
+          fill="rgb(148 163 184 / 0.6)"
+          fontFamily="monospace"
+          fontSize="9"
+          x={SVG_W - 24}
+          y={BUS_Y - 6}
+          textAnchor="end"
+        >
+          system bus
+        </text>
+
+        {/* Stub lines from cores down to bus, from bus up/down to peripherals */}
+        {(['core0', 'core1'] as const).map((id) => (
+          <line
+            key={id}
+            stroke="rgb(148 163 184 / 0.3)"
+            strokeWidth="1"
+            x1={NODE_POS[id].x}
+            x2={NODE_POS[id].x}
+            y1={NODE_POS[id].y + 64}
+            y2={BUS_Y}
+          />
+        ))}
+        {(['aic', 'uart', 'block'] as const).map((id) => (
+          <line
+            key={id}
+            stroke="rgb(148 163 184 / 0.3)"
+            strokeWidth="1"
+            x1={NODE_POS[id].x}
+            x2={NODE_POS[id].x}
+            y1={BUS_Y}
+            y2={NODE_POS[id].y - 32}
+          />
+        ))}
+        {/* RAM bus -- lower half */}
+        <line
+          stroke="rgb(148 163 184 / 0.3)"
           strokeWidth="1"
-          width="80"
-          x="160"
-          y="14"
+          x1={NODE_POS.ram.x}
+          x2={NODE_POS.ram.x}
+          y1={NODE_POS.block.y + 36}
+          y2={NODE_POS.ram.y - 14}
         />
-        <text
-          fill={accent === 'cyan' ? '#cffafe' : '#ede9fe'}
-          fontFamily="monospace"
-          fontSize="10"
-          x="200"
-          y="34"
-          textAnchor="middle"
-        >
-          PC
-        </text>
-        <text
-          fill={accent === 'cyan' ? '#cffafe' : '#ede9fe'}
-          fontFamily="monospace"
-          fontSize="11"
-          fontWeight="bold"
-          x="200"
-          y="50"
-          textAnchor="middle"
-        >
-          {fmtHex32(Number(core.pc))}
-        </text>
 
-        {/* Connection lines: UART, AIC, RAM */}
-        <PeripheralLink
-          accent={accent}
-          active={!core.wfi_halted && !core.halted}
-          label="UART"
-          orientation="left"
-        />
-        <g transform="translate(0,28)">
-          <PeripheralLink accent={accent} active={core.daif === 0} label="AIC" orientation="left" />
-        </g>
-        <PeripheralLink
-          accent={accent}
-          active={(core.sctlr_el1 & 1n) !== 0n}
-          label="MMU"
-          orientation="right"
-        />
-        <g transform="translate(0,28)">
-          <PeripheralLink
-            accent={accent}
-            active={core.id === 1 || taskLabel === 'TASK B'}
-            label="DISK"
-            orientation="right"
-          />
-        </g>
+        {/* Cores */}
+        <CoreBox core={cores[0]} pos={NODE_POS.core0} slot={slots[0]} />
+        <CoreBox core={cores[1]} pos={NODE_POS.core1} slot={slots[1]} />
 
-        {/* Activity blip — tied to non-WFI/halted state */}
-        {!core.wfi_halted && !core.halted && (
-          <circle
-            className="scifi-blip"
-            cx="200"
-            cy="78"
-            fill={accent === 'cyan' ? '#22d3ee' : '#a78bfa'}
-            r="3"
-          />
-        )}
+        {/* Peripherals */}
+        <AicBox aic={aic} pos={NODE_POS.aic} />
+        <UartBox output={output} pos={NODE_POS.uart} />
+        <BlockBox block={block} pos={NODE_POS.block} />
+        <RamBox pos={NODE_POS.ram} regions={ramRegions} />
       </svg>
 
-      <div className="grid gap-x-3 gap-y-1 font-mono text-[11px]">
-        <div className="flex items-center justify-between">
-          <span className="text-fg-muted text-[10px] tracking-wider uppercase">running</span>
-          <span
-            className={`font-mono font-semibold ${
-              taskLabel === '— idle —'
-                ? 'text-fg-muted'
-                : accent === 'cyan'
-                  ? 'text-cyan-200'
-                  : 'text-violet-200'
-            }`}
-          >
-            {taskLabel}
-          </span>
+      {/* Animated event packets (HTML overlay positioned over the SVG) */}
+      <div
+        className="pointer-events-none absolute inset-0"
+        style={{ paddingTop: 28, paddingLeft: 12, paddingRight: 12 }}
+      >
+        <div className="relative h-full w-full">
+          {events.map((e) => (
+            <EventPacket event={e} key={e.id} />
+          ))}
         </div>
-        <div className="flex items-center justify-between">
-          <span className="text-fg-muted text-[10px] tracking-wider uppercase">state</span>
-          <span className={`font-semibold ${stateColor}`}>{stateLine}</span>
-        </div>
-        <div className="flex items-center justify-between">
-          <span className="text-fg-muted text-[10px] tracking-wider uppercase">DAIF</span>
-          <DaifChip daif={core.daif} />
-        </div>
-      </div>
-
-      <div className="border-border/40 mt-3 grid grid-cols-2 gap-x-3 gap-y-0.5 border-t pt-2 font-mono text-[10px]">
-        <RegRow label="X0" value={core.x[0]} />
-        <RegRow label="X1" value={core.x[1]} />
-        <RegRow label="X2" value={core.x[2]} />
-        <RegRow label="X3" value={core.x[3]} />
-        <RegRow label="MPIDR" value={core.mpidr} />
-        <RegRow label="steps" value={core.steps} />
       </div>
     </div>
   )
 }
 
-function PeripheralLink({
-  accent,
-  active,
-  label,
-  orientation,
+function CoreBox({
+  core,
+  pos,
+  slot,
 }: {
-  accent: 'cyan' | 'violet'
-  active: boolean
-  label: string
-  orientation: 'left' | 'right'
+  core: CoreState
+  pos: { x: number; y: number }
+  slot: CoreSlot
 }) {
-  const stroke = accent === 'cyan' ? '#22d3ee' : '#a78bfa'
-  const opacity = active ? 0.9 : 0.25
-  const x1 = orientation === 'left' ? 6 : 240
-  const x2 = orientation === 'left' ? 160 : 394
-  const labelX = orientation === 'left' ? 8 : 392
-  const labelAnchor = orientation === 'left' ? 'start' : 'end'
+  const accent = core.id === 0 ? '#22d3ee' : '#a78bfa'
+  const taskLabel = slot.entry === 0x4d00n ? 'task A' : slot.entry === 0x4e00n ? 'task B' : '—'
+  const stateLine = core.last_trap ? 'TRAP' : core.halted ? 'HALT' : core.wfi_halted ? 'WFI' : 'RUN'
   return (
-    <g style={{ opacity }}>
-      <line
-        className={active ? 'scifi-stream' : ''}
-        stroke={stroke}
-        strokeWidth="1.2"
-        x1={x1}
-        x2={x2}
-        y1="22"
-        y2="22"
+    <g>
+      <rect
+        fill="rgb(15 23 42 / 0.9)"
+        height="64"
+        rx="4"
+        stroke={accent}
+        strokeOpacity="0.55"
+        strokeWidth="1"
+        width="160"
+        x={pos.x - 80}
+        y={pos.y}
       />
       <text
-        fill={stroke}
+        fill={accent}
+        fontFamily="monospace"
+        fontSize="11"
+        fontWeight="bold"
+        x={pos.x - 72}
+        y={pos.y + 14}
+      >
+        core {core.id}
+      </text>
+      <text
+        fill="rgb(148 163 184 / 0.85)"
         fontFamily="monospace"
         fontSize="9"
-        textAnchor={labelAnchor}
-        x={labelX}
-        y="14"
+        x={pos.x - 72}
+        y={pos.y + 26}
       >
-        {label}
+        {core.kind}
+      </text>
+      <text
+        fill={accent}
+        fontFamily="monospace"
+        fontSize="9"
+        x={pos.x + 72}
+        y={pos.y + 14}
+        textAnchor="end"
+      >
+        EL{core.current_el}
+      </text>
+      <text
+        fill="rgb(241 245 249 / 0.95)"
+        fontFamily="monospace"
+        fontSize="9"
+        x={pos.x + 72}
+        y={pos.y + 26}
+        textAnchor="end"
+      >
+        {stateLine}
+      </text>
+      {/* PC + task */}
+      <text
+        fill="rgb(241 245 249 / 0.95)"
+        fontFamily="monospace"
+        fontSize="10"
+        x={pos.x - 72}
+        y={pos.y + 44}
+      >
+        pc {fmtHex32(Number(core.pc))}
+      </text>
+      <text
+        fill="rgb(148 163 184 / 0.85)"
+        fontFamily="monospace"
+        fontSize="9"
+        x={pos.x - 72}
+        y={pos.y + 56}
+      >
+        {taskLabel} · daif {core.daif.toString(16).padStart(1, '0')}
       </text>
     </g>
   )
+}
+
+function PeripheralBox({
+  accent,
+  lines,
+  pos,
+  title,
+  width = 92,
+}: {
+  accent: string
+  lines: string[]
+  pos: { x: number; y: number }
+  title: string
+  width?: number
+}) {
+  const halfW = width / 2
+  return (
+    <g>
+      <rect
+        fill="rgb(15 23 42 / 0.85)"
+        height="48"
+        rx="3"
+        stroke={accent}
+        strokeOpacity="0.45"
+        strokeWidth="1"
+        width={width}
+        x={pos.x - halfW}
+        y={pos.y - 32}
+      />
+      <text
+        fill={accent}
+        fontFamily="monospace"
+        fontSize="10"
+        fontWeight="bold"
+        x={pos.x}
+        y={pos.y - 18}
+        textAnchor="middle"
+      >
+        {title}
+      </text>
+      {lines.map((ln, i) => (
+        <text
+          fill="rgb(203 213 225 / 0.9)"
+          fontFamily="monospace"
+          fontSize="9"
+          key={i}
+          x={pos.x}
+          y={pos.y - 4 + i * 10}
+          textAnchor="middle"
+        >
+          {ln}
+        </text>
+      ))}
+    </g>
+  )
+}
+
+function AicBox({ aic, pos }: { aic: AicState; pos: { x: number; y: number } }) {
+  const pendingMask = aic.pending.reduce((acc, p) => acc | p, 0)
+  return (
+    <PeripheralBox
+      accent="#fbbf24"
+      lines={[`pnd ${pendingMask.toString(16).padStart(2, '0')}`, `ack ${aic.total_acks}`]}
+      pos={pos}
+      title="AIC"
+    />
+  )
+}
+
+function UartBox({ output, pos }: { output: string; pos: { x: number; y: number } }) {
+  const tail = output.slice(-12).replace(/\n/g, '↵')
+  return (
+    <PeripheralBox
+      accent="#34d399"
+      lines={[`bytes ${output.length}`, tail || '—']}
+      pos={pos}
+      title="UART"
+    />
+  )
+}
+
+function BlockBox({ block, pos }: { block: BlockState; pos: { x: number; y: number } }) {
+  return (
+    <PeripheralBox
+      accent="#fb7185"
+      lines={[`r ${block.total_reads} w ${block.total_writes}`, `sec ${block.sector}`]}
+      pos={pos}
+      title="BLK"
+    />
+  )
+}
+
+function RamBox({
+  pos,
+  regions,
+}: {
+  pos: { x: number; y: number }
+  regions: readonly { addr: number; label: string }[]
+}) {
+  const W = 320
+  const H = 60
+  return (
+    <g>
+      <rect
+        fill="rgb(15 23 42 / 0.85)"
+        height={H}
+        rx="3"
+        stroke="rgb(96 165 250 / 0.45)"
+        strokeWidth="1"
+        width={W}
+        x={pos.x - W / 2}
+        y={pos.y - 14}
+      />
+      <text
+        fill="#60a5fa"
+        fontFamily="monospace"
+        fontSize="10"
+        fontWeight="bold"
+        x={pos.x - W / 2 + 8}
+        y={pos.y}
+      >
+        RAM · 64 KiB
+      </text>
+      {/* Region strip */}
+      {regions.map((r, i) => {
+        const cellW = (W - 16) / regions.length
+        const x = pos.x - W / 2 + 8 + i * cellW
+        return (
+          <g key={r.addr}>
+            <rect
+              fill="rgb(96 165 250 / 0.08)"
+              height="22"
+              stroke="rgb(96 165 250 / 0.35)"
+              strokeWidth="0.5"
+              width={cellW}
+              x={x}
+              y={pos.y + 8}
+            />
+            <text
+              fill="rgb(203 213 225 / 0.85)"
+              fontFamily="monospace"
+              fontSize="7"
+              x={x + cellW / 2}
+              y={pos.y + 17}
+              textAnchor="middle"
+            >
+              {fmtHex32(r.addr).slice(2, 6)}
+            </text>
+            <text
+              fill="rgb(148 163 184 / 0.7)"
+              fontFamily="monospace"
+              fontSize="6.5"
+              x={x + cellW / 2}
+              y={pos.y + 26}
+              textAnchor="middle"
+            >
+              {r.label}
+            </text>
+          </g>
+        )
+      })}
+    </g>
+  )
+}
+
+function EventPacket({ event }: { event: SimEvent }) {
+  // Translate SVG coordinates to overlay coordinates. Container fills the
+  // SVG area exactly (we share width via the parent's viewBox aspect).
+  const src = nodeAnchor(event.source, 'out')
+  const dst = nodeAnchor(event.target, 'in')
+  // Scale from SVG units (440×480) to the rendered container, which is the
+  // same DOM box but in absolute pixels — we use percentages so it's
+  // resolution-independent.
+  const fromX = `${(src.x / SVG_W) * 100}%`
+  const fromY = `${(src.y / SVG_H) * 100}%`
+  const toX = `${((dst.x - src.x) / SVG_W) * 100}%`
+  const toY = `${((dst.y - src.y) / SVG_H) * 100}%`
+  const color = packetColor(event.kind)
+  const delay = event.kind === 'timer' && event.target === 'core1' ? '30ms' : '0ms'
+  return (
+    <span
+      className="absolute h-1.5 w-1.5 rounded-full"
+      style={{
+        left: fromX,
+        top: fromY,
+        background: color,
+        boxShadow: `0 0 6px ${color}`,
+        animation: 'packet-fly 700ms ease-in-out forwards',
+        animationDelay: delay,
+        // CSS variables consumed by the keyframes
+        ['--packet-from-x' as string]: '0px',
+        ['--packet-from-y' as string]: '0px',
+        ['--packet-to-x' as string]: toX,
+        ['--packet-to-y' as string]: toY,
+      }}
+    />
+  )
+}
+
+function nodeAnchor(id: NodeId, dir: 'in' | 'out'): { x: number; y: number } {
+  const base = NODE_POS[id]
+  // For cores: anchor on bottom edge. For peripherals (incl. RAM): top edge.
+  if (id === 'core0' || id === 'core1') {
+    return { x: base.x, y: base.y + (dir === 'out' ? 64 : 64) }
+  }
+  if (id === 'ram') {
+    return { x: base.x, y: base.y - 14 }
+  }
+  return { x: base.x, y: base.y - 32 }
+}
+
+function packetColor(kind: SimEventKind): string {
+  switch (kind) {
+    case 'store':
+      return '#34d399' // green to UART
+    case 'timer':
+      return '#fbbf24' // amber from AIC
+    case 'disk_read':
+      return '#fb7185' // rose from Block
+    case 'irq_taken':
+      return '#fbbf24'
+    case 'svc':
+      return '#60a5fa'
+    case 'eret':
+      return '#a78bfa'
+  }
 }
 
 function DisassemblyPanel({ cpu, cores }: { cpu: Cpu; cores: CoreState[] }) {
