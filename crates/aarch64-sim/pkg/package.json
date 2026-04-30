@@ -2,7 +2,7 @@
   "name": "aarch64-sim",
   "type": "module",
   "description": "AArch64 SoC simulator core (Rust + WASM): two cores, MMU, AIC, virtio-blk-shaped block device, LL/SC, IPIs",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "license": "MIT",
   "repository": {
     "type": "git",

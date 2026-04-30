@@ -31,7 +31,7 @@ bun run dev            # vite dev server，端口 32030
 
 | 脚本                  | 作用                                             |
 | --------------------- | ------------------------------------------------ |
-| `bun run test:sim`    | `cargo test` 跑模拟器测试（36 个）               |
+| `bun run test:sim`    | `cargo test` 跑模拟器测试（37 个）               |
 | `bun run test`        | React 侧 vitest                                  |
 | `bun run check`       | tsc + eslint + prettier                          |
 | `bun run build`       | 产线打包到 `./dist`                              |

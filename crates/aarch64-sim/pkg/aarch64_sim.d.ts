@@ -14,6 +14,7 @@ export class Cpu {
     constructor();
     num_cores(): number;
     output(): string;
+    processes(): any;
     reset(): void;
     run(max: number): number;
     set_disk_text(text: string): void;
@@ -47,6 +48,7 @@ export interface InitOutput {
     readonly cpu_new_wasm: () => number;
     readonly cpu_num_cores: (a: number) => number;
     readonly cpu_output: (a: number) => [number, number];
+    readonly cpu_processes: (a: number) => [number, number, number];
     readonly cpu_reset: (a: number) => void;
     readonly cpu_run: (a: number, b: number) => number;
     readonly cpu_set_disk_text: (a: number, b: number, c: number) => void;

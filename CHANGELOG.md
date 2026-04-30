@@ -2,6 +2,54 @@
 
 Each entry is one architectural concept added on top of the previous one.
 
+## v0.23
+
+PCBs + a real round-robin scheduler (the v0.16 task-pinning hack is gone).
+
+- Each task now has a process control block — 80 bytes in shared memory:
+  ```
+  +0x00  task entry (informational)
+  +0x08  ELR_EL1 — where the task resumes
+  +0x10  SPSR_EL1
+  +0x18  SP_EL0
+  +0x20  X0..X1
+  +0x30  X2..X3
+  +0x40  X4..X5
+  +0x50  X6..X7
+  +0x60  X29..X30  (frame pointer + link register)
+  ```
+  PCB_A lives at PA `0x5800`; PCB_B at `0x5900`. The 0x100 spacing is
+  picked so each core can derive its "home" PCB from `mpidr_offset`
+  with the same trick used for slot regions and stack tops.
+- Per-core slot region now stores a single u64: `slot[0] = current PCB
+  pointer`. The old `save_ptr` slot is gone.
+- The IRQ vector at `VBAR_EL1 + 0x480` becomes a single
+  `b sched_handler` (32 instruction-words forward). The full save/
+  restore handler at PA `0x4900`:
+  1. Acks AIC; if the IRQ isn't a timer (e.g. an IPI), branches to the
+     ERET-only tail and resumes the same task.
+  2. On timer: derives my slot, reads my current PCB, stashes
+     `X0..X7 / X29 / X30 / ELR_EL1 / SPSR_EL1 / SP_EL0` into it.
+  3. Computes `new_pcb = PCB_SUM - current` (with two PCBs the swap is
+     branchless).
+  4. Loads the new PCB's regs and sysregs.
+  5. Writes `slot[0] = new_pcb` and ERETs into the new task.
+- Both cores swap in lockstep on every timer broadcast, so task A and
+  task B alternate cores forever — and they never collide on the same
+  task because for any (core_id, current_pcb) tuple the swap target is
+  unique.
+- New Rust API `Cpu::processes() -> Vec<Process>` exposing each PCB
+  plus which host core (if any) is currently running it. Mirrored on
+  the JS side via `cpu.processes()`.
+- UI: new `SchedulerPanel` showing each PCB (entry, ELR, SP_EL0, SPSR,
+  fp, lr, low halves of X0..X7) and which core is hosting it right now.
+- Two new tests + two updates: `each_core_uses_its_own_slot_region`
+  now verifies `slot[0] ∈ {PCB_A, PCB_B}` and the two cores never
+  share a PCB; `round_robin_actually_swaps_tasks_across_cores`
+  observes the host slot pointers cycling; `sp_el0_and_sp_el1_are_isolated`
+  checks SP_EL0 lives at one of the two home tops on both cores after a
+  long run. Total cargo tests: 37.
+
 ## v0.22
 
 Per-core I-cache + cache maintenance — the self-modifying-code lesson.

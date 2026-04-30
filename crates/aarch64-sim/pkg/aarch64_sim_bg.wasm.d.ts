@@ -10,6 +10,7 @@ export const cpu_mem_slice: (a: number, b: number, c: number) => [number, number
 export const cpu_new_wasm: () => number;
 export const cpu_num_cores: (a: number) => number;
 export const cpu_output: (a: number) => [number, number];
+export const cpu_processes: (a: number) => [number, number, number];
 export const cpu_reset: (a: number) => void;
 export const cpu_run: (a: number, b: number) => number;
 export const cpu_set_disk_text: (a: number, b: number, c: number) => void;

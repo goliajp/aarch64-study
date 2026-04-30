@@ -41,7 +41,7 @@ License: MIT
 bun install            # also: rm -rf node_modules/aarch64-sim if WASM was rebuilt
 bun run build:sim      # wasm-pack the Rust simulator
 bun run dev            # vite dev server on :32030
-bun run test:sim       # cargo test (36 tests)
+bun run test:sim       # cargo test (37 tests)
 bun run check          # tsc + eslint + prettier
 bun run build          # production bundle into ./dist
 bun run deploy         # build + rsync dist/ to the production target
@@ -64,11 +64,16 @@ cargo publish -p aarch64-sim --dry-run       # verify before releasing
 - Roboto Mono for any numeric / hex / register column (via `mono-data`);
   Roboto Flex for plain UI text with `tabular-nums`.
 - Animations depict real simulator events. No ambient sci-fi.
-- Tasks pinned per core: core 0 = task A (calls `bump_counter` as a real
-  function — BL/RET + STP/LDP frame, atomic counter at PA 0x6FF8, then
-  SVC #0 to ping core 1, then WFI), core 1 = task B (disk printer,
-  parks in WFI after one pass). Auto-run pauses once every core is
-  halted or parked in WFI; pressing Run again auto-resets.
-- Per-core EL0 stacks live in the user-mapped 0x7000 page: SP_EL0 =
-  0x7800 (core 0) / 0x7900 (core 1). SP_EL1 unused so far (kernel
-  handlers don't push).
+- Two tasks (A, B), each with a PCB at 0x5800 / 0x5900. Round-robin
+  scheduler at PA 0x4900 (reached via `b` from the IRQ vector at
+  0x4880) swaps PCBs in lockstep on every timer IRQ, so the two
+  tasks alternate cores forever — they never collide because
+  `new_pcb = PCB_SUM - current_pcb` always picks the peer.
+- Task A: calls `bump_counter` as a real function (BL/RET + STP/LDP
+  frame, atomic counter at PA 0x6FF8), then SVC #0 to ping the peer
+  core, then WFI. Task B: disk printer, parks in WFI after one pass.
+- Per-task EL0 stacks live in the user-mapped 0x7000 page: SP_EL0 =
+  0x7800 / 0x7900 (both saved in their PCBs and swapped with the
+  task). SP_EL1 unused (kernel handlers don't push).
+- Auto-run pauses once every core is halted or parked in WFI;
+  pressing Run again auto-resets.

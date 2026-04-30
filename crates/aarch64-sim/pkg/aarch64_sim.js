@@ -106,6 +106,16 @@ export class Cpu {
             wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
         }
     }
+    /**
+     * @returns {any}
+     */
+    processes() {
+        const ret = wasm.cpu_processes(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
     reset() {
         wasm.cpu_reset(this.__wbg_ptr);
     }

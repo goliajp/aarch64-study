@@ -138,6 +138,11 @@ impl Cpu {
     pub fn atomic_counter_wasm(&self) -> u64 {
         self.atomic_counter()
     }
+
+    #[wasm_bindgen(js_name = "processes")]
+    pub fn processes_wasm(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.processes())
+    }
 }
 
 /// Disassemble a single 32-bit AArch64 instruction. Mirrors the in-crate

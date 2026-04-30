@@ -12,6 +12,7 @@ import { DisassemblyPanel } from '../components/panels/disassembly-panel'
 import { MemoryPanel } from '../components/panels/memory-panel'
 import { MmuPanel } from '../components/panels/mmu-panel'
 import { ICachePanel } from '../components/panels/icache-panel'
+import { SchedulerPanel } from '../components/panels/scheduler-panel'
 import { TlbPanel } from '../components/panels/tlb-panel'
 import { OutputPanel } from '../components/panels/output-panel'
 import { SavePanel } from '../components/panels/save-panel'
@@ -26,6 +27,7 @@ import type {
   PrevSnapshot,
   SimEvent,
   SystemInfo,
+  Process,
   TranslationResult,
 } from '../sim/types'
 
@@ -36,6 +38,7 @@ export function CpuView() {
   const [cores, setCores] = useState<CoreState[] | null>(null)
   const [aic, setAic] = useState<AicState | null>(null)
   const [block, setBlock] = useState<BlockState | null>(null)
+  const [processes, setProcesses] = useState<Process[] | null>(null)
   const [coreSlots, setCoreSlots] = useState<CoreSlot[] | null>(null)
   const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null)
   const [memory, setMemory] = useState<Uint8Array>(new Uint8Array(MEMORY_VIEW_BYTES))
@@ -56,6 +59,7 @@ export function CpuView() {
     setCores(s)
     setAic(aicState)
     setBlock(blockState)
+    setProcesses(c.processes() as Process[])
     setSysInfo({
       systemSteps: c.system_steps(),
       timerPeriod: c.timer_period(),
@@ -192,7 +196,7 @@ export function CpuView() {
     }
   }, [cpu, cores, vaText, translateCoreIdx])
 
-  if (!cpu || !cores || !sysInfo || !aic || !coreSlots || !block) {
+  if (!cpu || !cores || !sysInfo || !aic || !coreSlots || !block || !processes) {
     return <div className="text-fg-muted type-base">Loading WASM…</div>
   }
 
@@ -210,7 +214,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge variant="info">v0.22</Badge>
+          <Badge variant="info">v0.23</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -280,6 +284,7 @@ export function CpuView() {
           <AicPanel aic={aic} />
           <TlbPanel cores={cores} />
           <ICachePanel cores={cores} />
+          <SchedulerPanel processes={processes} />
         </div>
 
         <div className="space-y-4">

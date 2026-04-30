@@ -91,6 +91,19 @@ export interface CoreSlot {
   save1: TaskSave
 }
 
+export interface Process {
+  pid: number
+  pcb_pa: bigint
+  entry: bigint
+  elr: bigint
+  spsr: bigint
+  sp_el0: bigint
+  x: bigint[]
+  fp: bigint
+  lr: bigint
+  host_core: number | null
+}
+
 export interface SystemInfo {
   systemSteps: bigint
   timerPeriod: bigint

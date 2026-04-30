@@ -1751,9 +1751,62 @@ impl Cpu {
     pub fn atomic_counter(&self) -> u64 {
         read_pa_u64(&self.mem, ATOMIC_COUNTER_PA_PUB).unwrap_or(0)
     }
+
+    /// Snapshot the two PCBs at PA 0x5800 and 0x5900, plus which host core
+    /// is currently running each. Useful for the UI's scheduler panel.
+    pub fn processes(&self) -> Vec<Process> {
+        let mut out = Vec::with_capacity(2);
+        for (idx, &pa) in [(0x5800u64), (0x5900u64)].iter().enumerate() {
+            let read = |off: u64| read_pa_u64(&self.mem, pa + off).unwrap_or(0);
+            // Which (if any) host core has slot[0] == this PCB right now?
+            let host_core = self.cores.iter().find_map(|c| {
+                let slot_pa = 0x4F00 + (c.mpidr & 0x100);
+                let slot_val = read_pa_u64(&self.mem, slot_pa).unwrap_or(0);
+                (slot_val == pa).then_some(c.id)
+            });
+            out.push(Process {
+                pid: idx as u32,
+                pcb_pa: pa,
+                entry: read(0x00),
+                elr: read(0x08),
+                spsr: read(0x10),
+                sp_el0: read(0x18),
+                x: [
+                    read(0x20),
+                    read(0x28),
+                    read(0x30),
+                    read(0x38),
+                    read(0x40),
+                    read(0x48),
+                    read(0x50),
+                    read(0x58),
+                ],
+                fp: read(0x60),
+                lr: read(0x68),
+                host_core,
+            });
+        }
+        out
+    }
 }
 
 const ATOMIC_COUNTER_PA_PUB: u64 = 0x6FF8;
+
+#[derive(Serialize, Clone, Debug)]
+pub struct Process {
+    pub pid: u32,
+    pub pcb_pa: u64,
+    pub entry: u64,
+    pub elr: u64,
+    pub spsr: u64,
+    pub sp_el0: u64,
+    pub x: [u64; 8],
+    pub fp: u64,
+    pub lr: u64,
+    /// `Some(core_id)` if this PCB is currently scheduled on a host core,
+    /// else `None`. With 2 cores and 2 PCBs both PCBs are always running.
+    pub host_core: Option<u8>,
+}
 
 impl Default for Cpu {
     fn default() -> Self {
@@ -2109,50 +2162,63 @@ fn sysreg_name(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> String {
 fn load_demo(mem: &mut [u8]) {
     // Memory regions, both cores execute the same code:
     //   PA 0x4000  kernel boot
-    //   PA 0x4800  sync handler (stub)
-    //   PA 0x4880  IRQ handler = scheduler with X0-X3 save/restore
-    //   PA 0x4D00  task A — silent WFI sleeper (pinned to core 0)
+    //   PA 0x4800  sync handler (kernel-side IPI dispatch on SVC #0)
+    //   PA 0x4880  IRQ vector — single `b sched_handler`
+    //   PA 0x4900  sched_handler (round-robin context switch on timer IRQ)
+    //   PA 0x4D00  task A — atomic counter via bump_counter, then SVC + WFI
     //   PA 0x4E00  task B — disk printer (walks 0x6000 byte by byte)
-    //   PA 0x4F00  core 0's slot region (entry + save_ptr + 2 save areas)
-    //   PA 0x5000  core 1's slot region (same layout)
+    //   PA 0x4F00  core 0's slot region — slot[0] = current PCB pointer
+    //   PA 0x5000  core 1's slot region — same layout
+    //   PA 0x5800  PCB_A — task A's process control block (80 bytes)
+    //   PA 0x5900  PCB_B — task B's PCB
     //
-    // Each core derives "my slot region" from MPIDR_EL1: bit 8 of MPIDR
-    // distinguishes our two clusters (P-core 0x80000000, E-core 0x80000100),
-    // so mpidr_offset = mpidr - 0x80000000 ∈ {0, 0x100} maps directly:
+    // Each core derives "my slot" from MPIDR_EL1: bit 8 of MPIDR distinguishes
+    // our two clusters (P-core 0x80000000, E-core 0x80000100), so
+    // mpidr_offset = mpidr - 0x80000000 ∈ {0, 0x100}. With PCBs spaced by
+    // exactly 0x100 the same offset picks each core's "home" PCB:
     //   slot_base = 0x4F00 + mpidr_offset → 0x4F00 / 0x5000
-    //   initial_task = TASK_A_ENTRY + mpidr_offset → 0x4D00 / 0x4E00
-    // So core 0 boots into task A and core 1 boots into task B; they run
-    // concurrently with independent state and the UART output truly
-    // interleaves instead of duplicating.
+    //   home_pcb  = 0x5800 + mpidr_offset → 0x5800 / 0x5900
+    //   home_task = TASK_A_ENTRY + mpidr_offset → 0x4D00 / 0x4E00
     //
-    // Within a slot region:
-    //   +0x00  current task entry (8 bytes)
-    //   +0x08  current task save-area pointer (8 bytes)
-    //   +0x10  save area 0 (32 bytes — X0..X3)
-    //   +0x30  save area 1 (32 bytes — X0..X3)
-    // The scheduler swaps between save areas via the (2*slot_base + 0x40 -
-    // current_save_ptr) trick — no per-core constants baked into the handler.
+    // PCB layout (80 bytes; pre-populated in `load_demo`, then mutated by
+    // sched_handler on every timer IRQ):
+    //   +0x00  task entry (informational; not read by the scheduler)
+    //   +0x08  ELR_EL1 — where the task resumes
+    //   +0x10  SPSR_EL1
+    //   +0x18  SP_EL0 — task's user stack
+    //   +0x20  X0..X1
+    //   +0x30  X2..X3
+    //   +0x40  X4..X5
+    //   +0x50  X6..X7
+    //   +0x60  X29..X30 (frame pointer + link register)
+    //
+    // sched_handler swaps via (PCB_SUM - current_pcb): with two PCBs the
+    // arithmetic gives us "the other one" without any branches. With both
+    // cores running the swap in lockstep on every timer broadcast, A and B
+    // alternate cores forever — and they never collide on the same task,
+    // since for any (core_id, current_pcb) tuple the swap target is unique.
     const SPSR_EL1H_DAIF: u32 = 0x3C5;
     const VBAR: u32 = 0x4400;
     const SYNC_HANDLER_PA: u64 = 0x4800;
     const IRQ_HANDLER_PA: u64 = 0x4880;
+    const SCHED_HANDLER_PA: u64 = 0x4900;
     const TASK_A_ENTRY: u32 = 0x4D00;
     const TASK_B_ENTRY: u32 = 0x4E00;
-    const TASK_SUM: u32 = TASK_A_ENTRY + TASK_B_ENTRY; // 0x9B00
     const SLOT_BASE_BASE: u32 = 0x4F00; // base for core 0
     const MPIDR_BASE_HI: u32 = 0x8000; // moved to upper half via LSL #16
     const DISK_BUF_PA: u32 = 0x6000;
     // Atomic counter sits in the same user-mapped page as the disk buffer
-    // (0x6000–0x6FFF), well past the 64-byte sector. Task A bumps it via
-    // LDXR/STXR; the UI reads it from RAM.
+    // (0x6000–0x6FFF), well past the 64-byte sector.
     const ATOMIC_COUNTER_PA: u32 = 0x6FF8;
-    // Sync handler dispatches IPIs to core 1 via AIC_REG_IPI_SET (offset
-    // 0x10 = imm12 #2 in an 8-byte-scaled STR).
+    // Sync handler dispatches IPIs to core 1 via AIC_REG_IPI_SET.
     const IPI_TARGET: u32 = 1;
     const IPI_OFFSET_WORDS: u32 = (AIC_REG_IPI_SET / 8) as u32;
     // Per-core EL0 stack tops in the user-mapped 0x7000 page. Stacks grow
-    // downwards. Core 0 gets 0x7800; core 1 gets 0x7900 (mpidr_offset = 0x100).
+    // downwards. Core 0 gets 0x7800; core 1 gets 0x7900.
     const USER_STACK_BASE: u32 = 0x7800;
+    // PCB region — kernel-only via the L3 entry for 0x5000.
+    const PCB_A_PA: u32 = 0x5800;
+    const PCB_SUM_LOW: u32 = 0xB100; // PCB_A + PCB_B = 0x5800 + 0x5900
     const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
     let kernel: [u32; 38] = [
@@ -2173,38 +2239,39 @@ fn load_demo(mem: &mut [u8]) {
         // --- EL1: synchronous disk read sector 0 → DISK_BUF_PA ---
         movz(9, BLK_BASE as u32, 0),
         movz(10, 0, 0),
-        str_imm(10, 9, 0), // SECTOR = 0
+        str_imm(10, 9, 0),
         movz(10, DISK_BUF_PA, 0),
-        str_imm(10, 9, 1), // BUF_ADDR = 0x6000
+        str_imm(10, 9, 1),
         movz(10, BLK_CMD_READ as u32, 0),
-        str_imm(10, 9, 2), // CMD = READ
+        str_imm(10, 9, 2),
         // --- EL1: install vector base ---
         movz(9, VBAR, 0),
         msr_vbar_el1(9),
-        // --- EL1: derive per-core slot region from MPIDR_EL1 ---
-        // X9 = mpidr_offset ∈ {0, 0x100}
+        // --- EL1: derive per-core mpidr_offset (0 or 0x100) ---
         mrs_mpidr(9),
-        movz(10, MPIDR_BASE_HI, 1), // X10 = 0x80000000 (LSL #16)
+        movz(10, MPIDR_BASE_HI, 1), // X10 = 0x80000000
         sub_reg(9, 9, 10),
-        // X14 = my slot base
+        // X14 = my slot base = SLOT_BASE_BASE + mpidr_offset
         movz(10, SLOT_BASE_BASE, 0),
         add_reg(14, 10, 9),
-        // X11 = my initial task entry
-        movz(10, TASK_A_ENTRY, 0),
+        // X11 = my home PCB = PCB_A_PA + mpidr_offset
+        movz(10, PCB_A_PA, 0),
         add_reg(11, 10, 9),
-        // X12 = my initial save area = slot_base + 0x10
-        add_imm(12, 14, 0x10),
-        // Initialise my slot: [slot_base+0]=entry, [slot_base+8]=save_ptr
+        // slot[0] = my current PCB pointer (initially my home PCB)
         str_imm(11, 14, 0),
-        str_imm(12, 14, 1),
-        // --- EL1: install per-core EL0 stack — core 0 → 0x7800, core 1 → 0x7900 ---
+        // X12 = my home task entry = TASK_A_ENTRY + mpidr_offset
+        movz(10, TASK_A_ENTRY, 0),
+        add_reg(12, 10, 9),
+        // ELR_EL1 = my task entry
+        msr_elr_el1(12),
+        // SPSR_EL1 = 0 (EL0t, DAIF clear)
+        movz(10, 0, 0),
+        msr_spsr_el1(10),
+        // SP_EL0 = USER_STACK_BASE + mpidr_offset
         movz(10, USER_STACK_BASE, 0),
         add_reg(13, 10, 9),
         msr_sp_el0(13),
-        // --- EL1: ERET into my initial task at EL0t with DAIF=0 ---
-        msr_elr_el1(11),
-        movz(10, 0, 0),
-        msr_spsr_el1(10),
+        // ERET into EL0
         eret(),
     ];
     // Sync handler at VBAR+0x400 — kernel-side IPI service. Task A calls
@@ -2217,14 +2284,99 @@ fn load_demo(mem: &mut [u8]) {
         str_imm(10, 9, IPI_OFFSET_WORDS), // 2: STR X10, [X9, #0x10]
         eret(),                          // 3: back to task A
     ];
-    // IRQ handler at VBAR+0x480 — minimal: ack the AIC and ERET back to the
-    // *same* preempted task. Tasks are pinned per core (core 0 = task A,
-    // core 1 = task B), so no context-switch is needed and the UART output
-    // stays monotonic (only one core ever writes it).
-    let scheduler: [u32; 3] = [
-        movz(9, AIC_BASE as u32, 0), // 0: X9 = AIC_BASE
-        ldr_imm(10, 9, 0),           // 1: X10 = irq id (read clears pending)
-        eret(),                      // 2: return to preempted task
+    // IRQ vector at VBAR+0x480 — single forward branch to the long
+    // sched_handler at PA 0x4900 (32 instruction-words ahead). Saves us
+    // having to inline the full save/restore in the 32-instruction vector
+    // slot.
+    let scheduler: [u32; 1] = [b_offset(32)];
+
+    // sched_handler at 0x4900. On a timer IRQ:
+    //   1. Ack AIC; if irq != 0 (i.e. not timer), ERET back to current task.
+    //   2. Save user state (X0..X7, X29, X30, ELR, SPSR, SP_EL0) into the
+    //      currently-running PCB.
+    //   3. Compute new PCB = PCB_SUM - current_pcb.
+    //   4. Load new state from the new PCB.
+    //   5. Update slot[0] = new PCB so the next IRQ saves into the right one.
+    //   6. ERET into the new task.
+    // Uses X9..X14 as scratch — never X0..X7, X29, X30, so the user regs
+    // we save are exactly the ones the running task could have set.
+    let sched_handler: [u32; 36] = [
+        // 0  X9 = AIC_BASE
+        movz(9, AIC_BASE as u32, 0),
+        // 1  X10 = irq id (read clears pending)
+        ldr_imm(10, 9, 0),
+        // 2  if irq != 0 (not timer), branch to the eret-only tail
+        cbnz(10, 33),
+        // 3  X9 = mpidr
+        mrs_mpidr(9),
+        // 4  X10 = 0x80000000
+        movz(10, MPIDR_BASE_HI, 1),
+        // 5  X11 = mpidr_offset (0 or 0x100)
+        sub_reg(11, 9, 10),
+        // 6  X9 = SLOT_BASE_BASE
+        movz(9, SLOT_BASE_BASE, 0),
+        // 7  X12 = my slot base
+        add_reg(12, 9, 11),
+        // 8  X13 = my current PCB
+        ldr_imm(13, 12, 0),
+        // --- save X0..X7, X29, X30 to current PCB ---
+        // 9  PCB+0x20 = X0,X1
+        stp_imm(0, 1, 13, 4),
+        // 10 PCB+0x30 = X2,X3
+        stp_imm(2, 3, 13, 6),
+        // 11 PCB+0x40 = X4,X5
+        stp_imm(4, 5, 13, 8),
+        // 12 PCB+0x50 = X6,X7
+        stp_imm(6, 7, 13, 10),
+        // 13 PCB+0x60 = X29,X30
+        stp_imm(29, 30, 13, 12),
+        // --- save sysregs (ELR, SPSR, SP_EL0) ---
+        // 14 X9 = ELR_EL1
+        mrs_elr_el1(9),
+        // 15 PCB+0x08 = X9
+        str_imm(9, 13, 1),
+        // 16 X9 = SPSR_EL1
+        mrs_spsr_el1(9),
+        // 17 PCB+0x10 = X9
+        str_imm(9, 13, 2),
+        // 18 X9 = SP_EL0
+        mrs_sp_el0(9),
+        // 19 PCB+0x18 = X9
+        str_imm(9, 13, 3),
+        // --- compute new PCB = PCB_SUM - current ---
+        // 20 X9 = PCB_SUM_LOW
+        movz(9, PCB_SUM_LOW, 0),
+        // 21 X14 = X9 - X13
+        sub_reg(14, 9, 13),
+        // --- load new task's state from new PCB ---
+        // 22 X0,X1 = new PCB+0x20
+        ldp_imm(0, 1, 14, 4),
+        // 23
+        ldp_imm(2, 3, 14, 6),
+        // 24
+        ldp_imm(4, 5, 14, 8),
+        // 25
+        ldp_imm(6, 7, 14, 10),
+        // 26 X29,X30 = new PCB+0x60
+        ldp_imm(29, 30, 14, 12),
+        // 27 X9 = new PCB+0x08 (ELR)
+        ldr_imm(9, 14, 1),
+        // 28 ELR_EL1 = X9
+        msr_elr_el1(9),
+        // 29 X9 = new PCB+0x10 (SPSR)
+        ldr_imm(9, 14, 2),
+        // 30 SPSR_EL1 = X9
+        msr_spsr_el1(9),
+        // 31 X9 = new PCB+0x18 (SP_EL0)
+        ldr_imm(9, 14, 3),
+        // 32 SP_EL0 = X9
+        msr_sp_el0(9),
+        // 33 slot[0] = new PCB
+        str_imm(14, 12, 0),
+        // 34 ERET into new task
+        eret(),
+        // 35 (eret-only tail; CBNZ at insn 2 lands here for non-timer IRQs)
+        eret(),
     ];
     // Task A — atomic-counter loop now split into a real `bump_counter`
     // function with the canonical AArch64 prologue/epilogue. The loop body
@@ -2280,8 +2432,24 @@ fn load_demo(mem: &mut [u8]) {
     write_words(mem, ENTRY_PC, &kernel);
     write_words(mem, SYNC_HANDLER_PA, &sync_handler);
     write_words(mem, IRQ_HANDLER_PA, &scheduler);
+    write_words(mem, SCHED_HANDLER_PA, &sched_handler);
     write_words(mem, TASK_A_ENTRY as u64, &task_a);
     write_words(mem, TASK_B_ENTRY as u64, &task_b);
+
+    // Pre-populate the PCBs so each task can be loaded "for the first time"
+    // by sched_handler the same way it'd be loaded after preemption. Without
+    // this, the very first context-switch onto the peer task would jump to
+    // an all-zero ELR.
+    init_pcb(mem, 0x5800, TASK_A_ENTRY as u64, 0x7800);
+    init_pcb(mem, 0x5900, TASK_B_ENTRY as u64, 0x7900);
+}
+
+fn init_pcb(mem: &mut [u8], pcb_pa: u64, entry: u64, sp_el0: u64) {
+    write_u64(mem, pcb_pa + 0x00, entry);   // task entry (informational)
+    write_u64(mem, pcb_pa + 0x08, entry);   // ELR_EL1 — initial PC
+    write_u64(mem, pcb_pa + 0x10, 0);        // SPSR_EL1 — EL0t, DAIF=0
+    write_u64(mem, pcb_pa + 0x18, sp_el0);   // SP_EL0
+    // X0..X7, X29, X30 stay zero (mem is already zeroed).
 }
 
 fn setup_demo_pgtable(mem: &mut [u8]) {
@@ -2443,6 +2611,18 @@ const fn mrs_sysreg(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -
 
 const fn mrs_mpidr(rt: u32) -> u32 {
     mrs_sysreg(rt, 3, 0, 0, 0, 5)
+}
+
+const fn mrs_elr_el1(rt: u32) -> u32 {
+    mrs_sysreg(rt, 3, 0, 4, 0, 1)
+}
+
+const fn mrs_spsr_el1(rt: u32) -> u32 {
+    mrs_sysreg(rt, 3, 0, 4, 0, 0)
+}
+
+const fn mrs_sp_el0(rt: u32) -> u32 {
+    mrs_sysreg(rt, 3, 0, 4, 1, 0)
 }
 
 const fn isb() -> u32 {
@@ -2617,17 +2797,40 @@ mod tests {
         let read_u64 = |mem: &[u8], pa: usize| -> u64 {
             u64::from_le_bytes(mem[pa..pa + 8].try_into().unwrap())
         };
-        // Core 0's slot is at 0x4F00, core 1's at 0x5000. With pinned tasks
-        // they stay on their initial entries (A on core 0, B on core 1).
-        let core0_entry = read_u64(&cpu.mem, 0x4F00);
-        let core1_entry = read_u64(&cpu.mem, 0x5000);
-        assert_eq!(core0_entry, 0x4D00, "core 0 should be on task A");
-        assert_eq!(core1_entry, 0x4E00, "core 1 should be on task B");
-        // Save-area pointers stay inside their own slot region.
-        let core0_save = read_u64(&cpu.mem, 0x4F08);
-        let core1_save = read_u64(&cpu.mem, 0x5008);
-        assert!((0x4F00..0x5000).contains(&core0_save), "core0 save_ptr escaped: {:#x}", core0_save);
-        assert!((0x5000..0x6000).contains(&core1_save), "core1 save_ptr escaped: {:#x}", core1_save);
+        // After v0.23 each core's slot[0] holds the PCB pointer of the task
+        // currently scheduled there. The two cores must always disagree —
+        // PCB_A ↔ PCB_B can be on either core, but never the same one
+        // simultaneously.
+        let core0_pcb = read_u64(&cpu.mem, 0x4F00);
+        let core1_pcb = read_u64(&cpu.mem, 0x5000);
+        assert!(core0_pcb == 0x5800 || core0_pcb == 0x5900, "core0 pcb: {:#x}", core0_pcb);
+        assert!(core1_pcb == 0x5800 || core1_pcb == 0x5900, "core1 pcb: {:#x}", core1_pcb);
+        assert_ne!(core0_pcb, core1_pcb, "two cores must never share a PCB");
+    }
+
+    #[test]
+    fn round_robin_actually_swaps_tasks_across_cores() {
+        // Boot the demo and watch the slot[0] pointers change over time. With
+        // lockstep round-robin both cores swap on every timer broadcast, so
+        // PCB[0] and PCB[1] alternate roles.
+        let mut cpu = Cpu::new();
+        let mut seen_swap = false;
+        let read_u64 = |mem: &[u8], pa: usize| -> u64 {
+            u64::from_le_bytes(mem[pa..pa + 8].try_into().unwrap())
+        };
+        let mut last_core0_pcb = 0u64;
+        cpu.run(80);
+        last_core0_pcb = read_u64(&cpu.mem, 0x4F00);
+        let _ = last_core0_pcb;
+        for _ in 0..10 {
+            cpu.run(100);
+            let now = read_u64(&cpu.mem, 0x4F00);
+            if now != last_core0_pcb && now != 0 {
+                seen_swap = true;
+            }
+            last_core0_pcb = now;
+        }
+        assert!(seen_swap, "core 0 never swapped tasks");
     }
 
     #[test]
@@ -3043,14 +3246,28 @@ mod tests {
         // kernel itself never wrote to sp_el1, so it stays at 0.
         let mut cpu = Cpu::new();
         cpu.run(80); // past kernel boot for both cores
+        // Each core's sp_el0 starts at its home stack top.
         assert_eq!(cpu.cores[0].sp_el0, 0x7800, "core 0 sp_el0");
         assert_eq!(cpu.cores[1].sp_el0, 0x7900, "core 1 sp_el0");
         assert_eq!(cpu.cores[0].sp_el1, 0, "kernel never set sp_el1");
-        // Each task A iteration moves SP_EL0 by 16 bytes during the prologue
-        // and back during the epilogue, so post-iteration SP_EL0 returns to
-        // its initial top.
+        // After many iterations + v0.23 round-robin, each core's sp_el0
+        // tracks whichever task it's currently running. Each task's SP_EL0
+        // is always one of {0x7800, 0x7900} when the PCB is loaded, and
+        // task A's prologue/epilogue keeps frames balanced. Both cores must
+        // hold a stack-top value (one of the two home tops) at any quiescent
+        // sample, with the two cores' SPs always picking different homes.
         cpu.run(2000);
-        assert_eq!(cpu.cores[0].sp_el0, 0x7800, "stack frame must be balanced");
+        for c in &cpu.cores {
+            assert!(
+                c.sp_el0 == 0x7800 || c.sp_el0 == 0x7900,
+                "sp_el0 not at a home top: {:#x}",
+                c.sp_el0
+            );
+        }
+        assert_ne!(
+            cpu.cores[0].sp_el0, cpu.cores[1].sp_el0,
+            "the two cores must never share a stack",
+        );
     }
 
     #[test]
