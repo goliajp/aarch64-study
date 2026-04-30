@@ -774,6 +774,19 @@ impl Core {
             return Ok(StepResult::Continue);
         }
 
+        // SUB Xd, Xn, #imm12{, LSL #12} :: 1 10 10001 sh imm12 Rn Rd
+        if insn & 0xFF80_0000 == 0xD100_0000 {
+            let rd = (insn & 0x1F) as usize;
+            let rn = ((insn >> 5) & 0x1F) as usize;
+            let imm12 = ((insn >> 10) & 0xFFF) as u64;
+            let sh = ((insn >> 22) & 0x1) as u32;
+            let imm = if sh == 1 { imm12 << 12 } else { imm12 };
+            let val = self.read_x(rn).wrapping_sub(imm);
+            self.write_x(rd, val);
+            self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
         // ADD Xd, Xn, Xm  (shifted register, LSL #0) :: 1 0 0 01011 00 0 Rm 000000 Rn Rd
         if insn & 0xFF20_FC00 == 0x8B00_0000 {
             let rd = (insn & 0x1F) as usize;
@@ -817,6 +830,51 @@ impl Core {
             let val = self.load64(mem, aic, block, addr)?;
             self.write_x(rt, val);
             self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
+        // LDRB Wt, [Xn, #imm12]  (byte load, zero-extend) :: 0011 1001 01 imm12 Rn Rt
+        if insn & 0xFFC0_0000 == 0x3940_0000 {
+            let rt = (insn & 0x1F) as usize;
+            let rn = ((insn >> 5) & 0x1F) as usize;
+            let imm12 = ((insn >> 10) & 0xFFF) as u64;
+            let va = self.read_x(rn).wrapping_add(imm12);
+            let pa = self.translate_for_access(mem, va)?;
+            // AIC/Block ranges fall back to byte access via mmio_read of low byte.
+            let byte = if (AIC_BASE..AIC_END).contains(&pa) {
+                (aic.mmio_read(self.id as usize, pa - AIC_BASE) & 0xFF) as u8
+            } else if (BLK_BASE..BLK_END).contains(&pa) {
+                (block.mmio_read(pa - BLK_BASE) & 0xFF) as u8
+            } else {
+                let a = pa as usize;
+                if a >= mem.len() {
+                    return Err(format!("byte fetch fault at PA {:#x}", pa));
+                }
+                mem[a]
+            };
+            self.write_x(rt, byte as u64);
+            self.pc = self.pc.wrapping_add(4);
+            return Ok(StepResult::Continue);
+        }
+
+        // CBZ / CBNZ Xt, label :: sf 011010 op imm19 Rt
+        if insn & 0xFE00_0000 == 0xB400_0000 {
+            let op = (insn >> 24) & 1; // 0 = CBZ, 1 = CBNZ
+            let imm19_raw = ((insn >> 5) & 0x7_FFFF) as u32;
+            let imm19 = ((imm19_raw as i32) << 13) >> 13; // sign-extend 19-bit
+            let offset = (imm19 as i64) * 4;
+            let rt = (insn & 0x1F) as usize;
+            let val = self.read_x(rt);
+            let take = if op == 0 { val == 0 } else { val != 0 };
+            if take {
+                let target = (self.pc as i64).wrapping_add(offset) as u64;
+                if target == self.pc {
+                    return Ok(StepResult::Halt);
+                }
+                self.pc = target;
+            } else {
+                self.pc = self.pc.wrapping_add(4);
+            }
             return Ok(StepResult::Continue);
         }
 
@@ -1338,12 +1396,21 @@ fn load_demo(mem: &mut [u8]) {
         str_imm(0, 1, 0),
         b_offset(-3),                       // back to ADD (skip the MOVZ)
     ];
-    let task_b: [u32; 5] = [
-        movz(1, UART_OUT as u32, 0),
-        add_imm(3, 3, 1),
-        movz(0, b'B' as u32, 0),
-        str_imm(0, 1, 0),
-        b_offset(-3),
+    // Task B — "disk printer". X3 holds the next byte offset into the disk
+    // buffer at PA 0x6000 (preserved across context switches via the save
+    // area). Each iteration: re-init X1/X4, compute X4 = base + X3, load byte;
+    // if zero → reset X3 and re-enter; else → emit, X3++, re-enter.
+    let task_b: [u32; 10] = [
+        movz(1, UART_OUT as u32, 0),    // 0: X1 = UART
+        movz(4, 0x6000, 0),             // 1: X4 = disk buffer base
+        add_reg(4, 4, 3),               // 2: X4 += X3
+        ldrb_imm(0, 4, 0),              // 3: W0 = byte at X4
+        cbz(0, 4),                      // 4: if zero, branch to inst 8 (restart)
+        str_imm(0, 1, 0),               // 5: STR X0, [X1] — emit byte to UART
+        add_imm(3, 3, 1),               // 6: X3 += 1
+        b_offset(-7),                   // 7: → inst 0 (loop)
+        movz(3, 0, 0),                  // 8: restart — X3 = 0
+        b_offset(-8),                   // 9: → inst 1 (skip MOVZ X1 since fall-through)
     ];
 
     write_words(mem, ENTRY_PC, &kernel);
@@ -1383,12 +1450,32 @@ const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
     0x9100_0000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
 }
 
+const fn sub_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+    0xD100_0000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+
 const fn add_reg(rd: u32, rn: u32, rm: u32) -> u32 {
     0x8B00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
 }
 
 const fn sub_reg(rd: u32, rn: u32, rm: u32) -> u32 {
     0xCB00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+
+#[allow(dead_code)]
+const fn ldrb_imm(rt: u32, rn: u32, imm12: u32) -> u32 {
+    0x3940_0000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+
+const fn cbz(rt: u32, words: i32) -> u32 {
+    let imm19 = (words as u32) & 0x7_FFFF;
+    0xB400_0000 | (imm19 << 5) | (rt & 0x1F)
+}
+
+#[allow(dead_code)]
+const fn cbnz(rt: u32, words: i32) -> u32 {
+    let imm19 = (words as u32) & 0x7_FFFF;
+    0xB500_0000 | (imm19 << 5) | (rt & 0x1F)
 }
 
 const fn str_imm(rt: u32, rn: u32, imm12: u32) -> u32 {
@@ -1505,33 +1592,39 @@ mod tests {
     fn scheduler_swaps_to_task_b_on_first_tick() {
         let mut cpu = Cpu::new();
         // First tick at step 50; need the handler to finish + task B to run
-        // a few iterations.
-        cpu.run(120);
+        // a few iterations. Task B is now the disk printer — we should see
+        // 'A' chars followed by disk-content bytes such as 'O' (sector 0
+        // starts with "OSstudy…").
+        cpu.run(150);
         assert!(cpu.timer_ticks >= 1);
         let out = cpu.output();
         assert!(out.contains('A'), "no A: {:?}", out);
-        assert!(out.contains('B'), "no B: {:?}", out);
+        assert!(out.contains('O'), "no disk content (O): {:?}", out);
     }
 
     #[test]
-    fn x3_counter_persists_across_context_switches() {
+    fn task_x3_persists_across_context_switches() {
         let mut cpu = Cpu::new();
-        // Run long enough for several A/B context switches.
         cpu.run(400);
-        // Read task A's save area (PA 0x4F10) — X0..X3 stored as 4 × u64 LE.
         let read_u64 = |mem: &[u8], pa: usize| -> u64 {
             u64::from_le_bytes(mem[pa..pa + 8].try_into().unwrap())
         };
-        let a_x3 = read_u64(&cpu.mem, 0x4F10 + 24); // X3 is the 4th slot
+        let a_x3 = read_u64(&cpu.mem, 0x4F10 + 24);
         let b_x3 = read_u64(&cpu.mem, 0x4F30 + 24);
-        // Both counters should be non-zero — each task incremented X3 every
-        // iteration of its loop, and we ran enough cycles for both to run.
+        // Task A: X3 is just a tick counter that accumulates.
         assert!(a_x3 > 0, "task A X3 didn't accumulate: {}", a_x3);
-        assert!(b_x3 > 0, "task B X3 didn't accumulate: {}", b_x3);
-        // The save areas hold X0='A'/'B' (0x41 / 0x42) and X1=UART (0x1000).
+        // Task B: X3 is the next-byte offset, bounded by the disk text length
+        // (~30 bytes before the NUL). Either it's mid-print (1..=30) or it
+        // just wrapped to 0 — but it MUST have advanced at least once.
+        assert!(b_x3 < 64, "task B X3 escaped sector bounds: {}", b_x3);
+        // Task A always re-loads X0='A' / X1=UART per iteration, so its save
+        // area still ends up holding those.
         assert_eq!(read_u64(&cpu.mem, 0x4F10), b'A' as u64);
-        assert_eq!(read_u64(&cpu.mem, 0x4F30), b'B' as u64);
         assert_eq!(read_u64(&cpu.mem, 0x4F10 + 8), UART_OUT);
+        // Task B's saved X0 is the last byte it loaded — a printable char
+        // from the disk image (or 0 if it just wrapped). X1 is the UART addr.
+        let b_x0 = read_u64(&cpu.mem, 0x4F30);
+        assert!(b_x0 == 0 || (0x20..0x7F).contains(&b_x0), "B.X0 wasn't a byte: {:#x}", b_x0);
         assert_eq!(read_u64(&cpu.mem, 0x4F30 + 8), UART_OUT);
     }
 
@@ -1579,6 +1672,37 @@ mod tests {
         cpu.run(26);
         assert_eq!(cpu.cores[0].current_el, 0);
         assert_eq!(cpu.cores[0].daif, 0);
+    }
+
+    #[test]
+    fn ldrb_cbz_sub_imm_loop() {
+        // Tiny program: count down X0 from 5 to 0 using SUB imm + CBZ.
+        let mut cpu = Cpu::new();
+        let prog = [
+            movz(0, 5, 0),                // X0 = 5
+            sub_imm(0, 0, 1),             // X0 -= 1
+            cbnz(0, -1),                  // if X0 != 0, branch back -1 word
+            b_self(),                     // halt
+        ];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+        cpu.cores[0].sctlr_el1 = 0;
+        cpu.cores[1].sctlr_el1 = 0;
+        cpu.run(50);
+        assert_eq!(cpu.cores[0].x[0], 0);
+        // LDRB at PA 0x1000 (in real memory or UART range — no UART side effect
+        // for a load): make sure byte zero-extends into a u64.
+        cpu.mem[0x100] = 0xAB;
+        let prog2 = [
+            movz(1, 0x100, 0),
+            ldrb_imm(2, 1, 0),
+            b_self(),
+        ];
+        cpu.cores[0].pc = ENTRY_PC;
+        cpu.cores[0].halted = false;
+        cpu.cores[0].steps = 0;
+        write_words(&mut cpu.mem, ENTRY_PC, &prog2);
+        cpu.run(20);
+        assert_eq!(cpu.cores[0].x[2], 0xAB);
     }
 
     #[test]

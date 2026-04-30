@@ -255,7 +255,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.10</Badge>
+          <Badge color="info">v0.11</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -266,10 +266,11 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          Block device added: a tiny virtio-blk-shaped controller at MMIO <code>0x3000</code> with 8
-          × 64-byte sectors. At boot the kernel issues a synchronous <code>READ</code> of sector 0
-          into PA <code>0x6000</code>, so by the time tasks start running the buffer at 0x6000
-          already holds "OSstudy disk image — sector 0".
+          Task B is now a "disk printer" — it walks the buffer at PA <code>0x6000</code> one byte at
+          a time using <code>LDRB</code>, prints each non-zero byte to UART, and uses{' '}
+          <code>CBZ</code> to detect the trailing NUL and reset its X3 offset back to 0. So after
+          enough timer ticks the UART output should show <em>OSstudy disk image — sector 0</em>{' '}
+          interleaved with task A's plain 'A's.
         </p>
       </header>
 
