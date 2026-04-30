@@ -73,6 +73,7 @@ export function CpuView() {
     const now = performance.now()
     const newEvents = deriveEvents({
       cores: s,
+      aicState,
       blockState,
       outputLen: newOutput.length,
       ticks,
@@ -94,6 +95,7 @@ export function CpuView() {
       outputLen: newOutput.length,
       ticks,
       totalReads: blockState.total_reads,
+      totalIpis: aicState.total_ipis,
     }
   }, [])
 
@@ -206,7 +208,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge variant="info">v0.17</Badge>
+          <Badge variant="info">v0.18</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}

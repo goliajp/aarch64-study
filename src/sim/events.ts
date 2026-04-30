@@ -1,4 +1,4 @@
-import type { BlockState, CoreState, PrevSnapshot, SimEvent } from './types'
+import type { AicState, BlockState, CoreState, PrevSnapshot, SimEvent } from './types'
 
 export const EVENT_TTL_MS = 800
 
@@ -8,6 +8,7 @@ const SYNC_VECTOR = VBAR_EL1 + 0x400
 
 interface DeriveArgs {
   cores: CoreState[]
+  aicState: AicState
   blockState: BlockState
   outputLen: number
   ticks: bigint
@@ -18,7 +19,7 @@ interface DeriveArgs {
 
 /** Produce SimEvents for whatever changed since `prev`. Pure function. */
 export function deriveEvents(args: DeriveArgs): SimEvent[] {
-  const { cores, blockState, outputLen, ticks, prev, now, nextId } = args
+  const { cores, aicState, blockState, outputLen, ticks, prev, now, nextId } = args
   if (!prev) return []
   const out: SimEvent[] = []
 
@@ -44,6 +45,15 @@ export function deriveEvents(args: DeriveArgs): SimEvent[] {
 
   if (blockState.total_reads > prev.totalReads) {
     out.push({ id: nextId(), kind: 'disk_read', source: 'block', target: 'ram', ts: now })
+  }
+
+  if (aicState.total_ipis > prev.totalIpis && aicState.last_ipi_target !== null) {
+    const tgt = aicState.last_ipi_target === 0 ? ('core0' as const) : ('core1' as const)
+    // Two-leg packet: sender → AIC, then AIC → target.
+    const senderIdx = aicState.last_ipi_target === 0 ? 1 : 0
+    const sender = senderIdx === 0 ? ('core0' as const) : ('core1' as const)
+    out.push({ id: nextId(), kind: 'ipi', source: sender, target: 'aic', ts: now })
+    out.push({ id: nextId(), kind: 'ipi', source: 'aic', target: tgt, ts: now + 60 })
   }
 
   cores.forEach((core, i) => {

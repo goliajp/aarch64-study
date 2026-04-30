@@ -2,6 +2,31 @@
 
 Each entry is one architectural concept added on top of the previous one.
 
+## v0.18
+
+Inter-processor interrupts (IPIs) — SVC-mediated, AIC-routed.
+
+- AIC gains an `IPI_SET` MMIO register at `AIC_BASE + 0x10`. Writing a
+  target core ID raises `IRQ_IPI` (=1) on that core; the bit is cleared
+  by an ACK read like any other AIC interrupt. The page is `AP=00`, so
+  EL0 cannot send IPIs directly.
+- Sync handler at `VBAR_EL1 + 0x400` becomes a real privileged service:
+  on `SVC #0` it stores `IPI_TARGET` to `AIC_REG_IPI_SET` and ERETs
+  back. This is the canonical "user asks kernel to ping a peer" flow.
+- Task A's loop becomes `LDXR / ADD / STXR / CBNZ / SVC #0 / WFI / B`.
+  Each scheduling round it atomically bumps the counter, asks the
+  kernel to ping core 1, and sleeps. Core 1 (parked at task B's WFI
+  after printing the disk image) wakes, takes the IPI through its IRQ
+  handler, ACKs, and ERETs back to WFI — a real cross-core wake.
+- AIC tracks `total_ipis` and `last_ipi_target`; both surface in the UI
+  (header strip + AIC panel) and drive a two-leg `ipi` SimEvent
+  (sender → AIC → target).
+- Four new tests: `aic_ipi_raises_target_only`,
+  `aic_ipi_to_invalid_core_is_dropped`, `task_a_svc_dispatches_ipis`,
+  `ipi_wakes_a_wfi_d_core`. Total cargo tests: 24.
+- SVC entry now also clears the local exclusive monitor (parity with
+  IRQ entry — any exception entry kills the reservation).
+
 ## v0.17
 
 LL/SC — atomic primitives via the exclusive monitor.

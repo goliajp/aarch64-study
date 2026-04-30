@@ -34,7 +34,7 @@ License: MIT
 bun install            # also: rm -rf node_modules/aarch64-sim if WASM was rebuilt
 bun run build:sim      # wasm-pack the Rust simulator
 bun run dev            # vite dev server on :32030
-bun run test:sim       # cargo test (20 tests)
+bun run test:sim       # cargo test (24 tests)
 bun run check          # tsc + eslint + prettier
 bun run build          # production bundle into ./dist
 bun run deploy         # build + rsync dist/ to the production target
@@ -51,6 +51,7 @@ before `bun run build` so Vite picks up the regenerated WASM.
   Roboto Flex for plain UI text with `tabular-nums`.
 - Animations depict real simulator events. No ambient sci-fi.
 - Tasks pinned per core: core 0 = task A (LDXR/STXR atomic counter at
-  PA 0x6FF8, then WFI), core 1 = task B (disk printer). Auto-run pauses
-  once every core is halted or parked in WFI; pressing Run again
+  PA 0x6FF8, then SVC #0 to ask the kernel to ping core 1, then WFI),
+  core 1 = task B (disk printer, parks in WFI after one pass). Auto-run
+  pauses once every core is halted or parked in WFI; pressing Run again
   auto-resets.

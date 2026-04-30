@@ -12,7 +12,9 @@ export function AicPanel({ aic }: { aic: AicState }) {
             AIC · Apple-style interrupt controller
           </span>
           <span className="type-small">
-            base 0x2000 · ACK reads cleared {aic.total_acks.toString()}
+            base 0x2000 · ACK reads cleared {aic.total_acks.toString()} · IPIs sent{' '}
+            {aic.total_ipis.toString()}
+            {aic.last_ipi_target !== null ? ` → core ${aic.last_ipi_target}` : ''}
           </span>
         </div>
         <div className="grid gap-3 sm:grid-cols-2">

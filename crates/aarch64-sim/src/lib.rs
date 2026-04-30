@@ -145,6 +145,12 @@ pub struct AicState {
     /// Per-core pending bitmap. Bit 0 = IRQ_TIMER, bit 1 = IRQ_IPI.
     pub pending: Vec<u32>,
     pub total_acks: u64,
+    /// Cumulative number of IPIs the AIC has dispatched (every successful
+    /// MMIO write to AIC_REG_IPI_SET counts once).
+    pub total_ipis: u64,
+    /// Index of the most recent IPI's target core, or None if no IPI yet.
+    /// Cleared back to None at reset.
+    pub last_ipi_target: Option<u32>,
 }
 
 // === Aic: tiny Apple-style interrupt controller ===============================
@@ -152,6 +158,8 @@ pub struct AicState {
 struct Aic {
     pending: [u32; NUM_CORES],
     total_acks: u64,
+    total_ipis: u64,
+    last_ipi_target: Option<u32>,
 }
 
 impl Aic {
@@ -159,6 +167,8 @@ impl Aic {
         Aic {
             pending: [0; NUM_CORES],
             total_acks: 0,
+            total_ipis: 0,
+            last_ipi_target: None,
         }
     }
 
@@ -167,6 +177,8 @@ impl Aic {
             *p = 0;
         }
         self.total_acks = 0;
+        self.total_ipis = 0;
+        self.last_ipi_target = None;
     }
 
     fn set_irq(&mut self, core: usize, irq_id: u32) {
@@ -201,8 +213,12 @@ impl Aic {
     fn mmio_write(&mut self, _core: usize, offset: u64, val: u64) {
         match offset {
             AIC_REG_IPI_SET => {
-                let target = val as usize;
-                self.set_irq(target, IRQ_IPI);
+                let target = val as u32;
+                if (target as usize) < NUM_CORES {
+                    self.set_irq(target as usize, IRQ_IPI);
+                    self.total_ipis = self.total_ipis.saturating_add(1);
+                    self.last_ipi_target = Some(target);
+                }
             }
             _ => {}
         }
@@ -212,6 +228,8 @@ impl Aic {
         AicState {
             pending: self.pending.to_vec(),
             total_acks: self.total_acks,
+            total_ipis: self.total_ipis,
+            last_ipi_target: self.last_ipi_target,
         }
     }
 }
@@ -1084,6 +1102,7 @@ impl Core {
             self.current_el = 1;
             self.daif = 0xF; // exception entry masks DAIF
             self.pc = self.vbar_el1.wrapping_add(0x400);
+            self.exclusive_monitor = None; // any exception entry clears the monitor
             return Ok(StepResult::Continue);
         }
 
@@ -1712,6 +1731,10 @@ fn load_demo(mem: &mut [u8]) {
     // (0x6000–0x6FFF), well past the 64-byte sector. Task A bumps it via
     // LDXR/STXR; the UI reads it from RAM.
     const ATOMIC_COUNTER_PA: u32 = 0x6FF8;
+    // Sync handler dispatches IPIs to core 1 via AIC_REG_IPI_SET (offset
+    // 0x10 = imm12 #2 in an 8-byte-scaled STR).
+    const IPI_TARGET: u32 = 1;
+    const IPI_OFFSET_WORDS: u32 = (AIC_REG_IPI_SET / 8) as u32;
     const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
     let kernel: [u32; 35] = [
@@ -1762,13 +1785,15 @@ fn load_demo(mem: &mut [u8]) {
         msr_spsr_el1(10),
         eret(),
     ];
-    // Sync handler at VBAR+0x400 — stub for any stray SVC.
-    let sync_handler: [u32; 5] = [
-        movz(1, UART_OUT as u32, 0),
-        movz(0, b'K' as u32, 0),
-        str_imm(0, 1, 0),
-        add_imm(0, 0, 0),
-        eret(),
+    // Sync handler at VBAR+0x400 — kernel-side IPI service. Task A calls
+    // SVC #0 to ask the kernel to ping core 1 via the AIC, then ERETs.
+    // Real systems route IPIs through a privileged path because the AIC
+    // page is AP=00 (kernel-only); user code must trap to ask.
+    let sync_handler: [u32; 4] = [
+        movz(9, AIC_BASE as u32, 0),     // 0: X9 = AIC_BASE
+        movz(10, IPI_TARGET as u32, 0),  // 1: X10 = peer core id (1)
+        str_imm(10, 9, IPI_OFFSET_WORDS), // 2: STR X10, [X9, #0x10]
+        eret(),                          // 3: back to task A
     ];
     // IRQ handler at VBAR+0x480 — minimal: ack the AIC and ERET back to the
     // *same* preempted task. Tasks are pinned per core (core 0 = task A,
@@ -1779,20 +1804,21 @@ fn load_demo(mem: &mut [u8]) {
         ldr_imm(10, 9, 0),           // 1: X10 = irq id (read clears pending)
         eret(),                      // 2: return to preempted task
     ];
-    // Task A — atomic counter. Each scheduling round it increments the
-    // shared u64 at PA 0x6FF8 via an LDXR/STXR pair, retrying on monitor
-    // failure (CBNZ on Ws), then WFIs until the next IRQ. The MOVZ that
-    // loads the counter address runs once at first entry; subsequent
-    // resumes loop back to the LDXR. Does not touch UART, so task B's
-    // output stays clean.
-    let task_a: [u32; 7] = [
+    // Task A — atomic counter + IPI generator. Each scheduling round it
+    // (1) atomically bumps the u64 at PA 0x6FF8 via an LDXR/STXR pair,
+    // (2) issues SVC #0 to ask the kernel to ping core 1 via the AIC, and
+    // (3) WFIs until the next IRQ. The MOVZ that loads the counter
+    // address runs once at first entry; subsequent resumes loop back to
+    // the LDXR. Does not touch UART, so task B's output stays clean.
+    let task_a: [u32; 8] = [
         movz(4, ATOMIC_COUNTER_PA, 0), // 0: X4 = &counter (PA 0x6FF8)
         ldxr(5, 4),                    // 1: X5 = *X4, set local monitor
         add_imm(5, 5, 1),              // 2: X5 += 1
         stxr(6, 5, 4),                 // 3: try CAS, W6 = 0/1 (ok/retry)
         cbnz(6, -2),                   // 4: if W6 != 0 → branch back to LDXR
-        wfi(),                         // 5: sleep until next IRQ
-        b_offset(-5),                  // 6: on resume → back to LDXR
+        svc_imm(0),                    // 5: kernel: please ping core 1
+        wfi(),                         // 6: sleep until next IRQ
+        b_offset(-6),                  // 7: on resume → back to LDXR
     ];
     // Task B — "disk printer". Walks the 64-byte disk buffer at PA 0x6000
     // once, emitting each byte to the UART. On hitting the null terminator
@@ -2391,5 +2417,57 @@ mod tests {
         let v2 = cpu.atomic_counter();
         assert!(v1 > 0, "task A's counter never advanced past zero");
         assert!(v2 > v1, "counter stalled: {v1} -> {v2}");
+    }
+
+    #[test]
+    fn aic_ipi_raises_target_only() {
+        // Direct AIC.mmio_write to IPI_SET should raise pending on the
+        // target core only, and bump total_ipis / last_ipi_target.
+        let mut aic = Aic::new();
+        aic.mmio_write(0, AIC_REG_IPI_SET, 1);
+        assert!(aic.has_pending(1), "IPI did not raise pending on core 1");
+        assert!(!aic.has_pending(0), "IPI leaked onto sender");
+        let snap = aic.snapshot();
+        assert_eq!(snap.total_ipis, 1);
+        assert_eq!(snap.last_ipi_target, Some(1));
+        // ACK from core 1 returns IRQ_IPI and clears the bit.
+        let id = aic.read_ack(1);
+        assert_eq!(id, IRQ_IPI);
+        assert!(!aic.has_pending(1));
+    }
+
+    #[test]
+    fn aic_ipi_to_invalid_core_is_dropped() {
+        let mut aic = Aic::new();
+        aic.mmio_write(0, AIC_REG_IPI_SET, 99);
+        assert_eq!(aic.snapshot().total_ipis, 0);
+        assert!(aic.snapshot().last_ipi_target.is_none());
+    }
+
+    #[test]
+    fn task_a_svc_dispatches_ipis() {
+        // End-to-end demo run: task A's SVC #0 handler should write to
+        // AIC_REG_IPI_SET and the AIC counter should grow.
+        let mut cpu = Cpu::new();
+        cpu.run(3000);
+        let snap = cpu.aic.snapshot();
+        assert!(snap.total_ipis > 0, "no IPIs dispatched after 3000 steps");
+        assert_eq!(snap.last_ipi_target, Some(1), "expected IPIs to target core 1");
+    }
+
+    #[test]
+    fn ipi_wakes_a_wfi_d_core() {
+        // Park core 1 in WFI with IRQs unmasked (DAIF=0). Have core 0 send
+        // an IPI directly via the AIC. Core 1 must take the IRQ.
+        let mut cpu = Cpu::new();
+        // Boot far enough that core 1 is parked in task B's WFI.
+        cpu.run(500);
+        assert!(cpu.cores[1].wfi_halted, "core 1 should be parked in WFI");
+        let pc_before = cpu.cores[1].pc;
+        cpu.aic.mmio_write(0, AIC_REG_IPI_SET, 1);
+        // One step is enough for take_irq to fire on core 1.
+        cpu.step();
+        assert!(!cpu.cores[1].wfi_halted, "WFI not lifted by IPI");
+        assert_ne!(cpu.cores[1].pc, pc_before, "core 1 PC unchanged after IPI");
     }
 }

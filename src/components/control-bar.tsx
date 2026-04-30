@@ -86,6 +86,7 @@ function Stats({ aic, block, cores, info, totalCoreSteps, uartBytes }: StatsProp
     },
     { label: 'timer ticks', value: info.timerTicks.toString() },
     { label: 'aic acks', value: aic.total_acks.toString() },
+    { label: 'ipis sent', value: aic.total_ipis.toString() },
     { label: 'aic pending', value: '0x' + aicPending.toString(16).padStart(2, '0') },
     { label: 'uart bytes', value: uartBytes.toString() },
     { label: 'blk reads', value: block.total_reads.toString() },

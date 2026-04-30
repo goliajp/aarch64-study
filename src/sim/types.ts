@@ -30,6 +30,8 @@ export interface CoreState {
 export interface AicState {
   pending: number[]
   total_acks: bigint
+  total_ipis: bigint
+  last_ipi_target: number | null
 }
 
 export interface BlockState {
@@ -66,7 +68,7 @@ export interface SystemInfo {
 
 export type NodeId = 'core0' | 'core1' | 'aic' | 'uart' | 'block' | 'ram'
 
-export type SimEventKind = 'store' | 'timer' | 'disk_read' | 'irq_taken' | 'svc' | 'eret'
+export type SimEventKind = 'store' | 'timer' | 'disk_read' | 'irq_taken' | 'svc' | 'eret' | 'ipi'
 
 export interface SimEvent {
   id: number
@@ -81,6 +83,7 @@ export interface PrevSnapshot {
   outputLen: number
   ticks: bigint
   totalReads: bigint
+  totalIpis: bigint
 }
 
 export interface PageAttrs {

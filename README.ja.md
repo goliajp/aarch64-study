@@ -33,7 +33,7 @@ bun run dev            # vite dev server（http://127.0.0.1:32030）
 
 | スクリプト             | 内容                                            |
 | --------------------- | ----------------------------------------------- |
-| `bun run test:sim`    | `cargo test`（20 件）                           |
+| `bun run test:sim`    | `cargo test`（24 件）                           |
 | `bun run test`        | React 側の vitest                               |
 | `bun run check`       | tsc + eslint + prettier                         |
 | `bun run build`       | `./dist` への本番ビルド                         |
@@ -60,7 +60,7 @@ bun run dev            # vite dev server（http://127.0.0.1:32030）
 | v0.15      | 逆アセンブラ + 編集可能なディスク                                                  |
 | v0.16      | UI 全面改修：pin-out SoC 図、テーマトークン、コア固定スケジューラ                  |
 | v0.17      | LDXR / STXR / CLREX + コア横断の排他モニタ（本物の同期プリミティブ）               |
-| v0.18      | コア間 IPI（AIC のソフトウェア IRQ 経由）                                          |
+| v0.18      | コア間 IPI — SVC で要求し、AIC のソフトウェア IRQ で配送                            |
 | v1.0       | m1n1 経由で実機 Apple Silicon 上にベアメタル化                                     |
 
 ## ディレクトリ構成

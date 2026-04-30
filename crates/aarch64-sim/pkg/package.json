@@ -2,7 +2,7 @@
   "name": "aarch64-sim",
   "type": "module",
   "description": "AArch64 SoC simulator core (Rust → WASM) powering aarch64-study",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "license": "MIT",
   "repository": {
     "type": "git",
