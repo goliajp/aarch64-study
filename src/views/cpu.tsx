@@ -101,12 +101,21 @@ function fmtHex32(v: number): string {
   return '0x' + (v >>> 0).toString(16).padStart(8, '0')
 }
 
-function parseSaveAreas(bytes: Uint8Array): { a: TaskSave; b: TaskSave } {
+interface CoreSlot {
+  entry: bigint
+  savePtr: bigint
+  save0: TaskSave
+  save1: TaskSave
+}
+
+function parseCoreSlot(bytes: Uint8Array): CoreSlot {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const u64 = (off: number) => view.getBigUint64(off, true)
   return {
-    a: { x0: u64(0), x1: u64(8), x2: u64(16), x3: u64(24) },
-    b: { x0: u64(32), x1: u64(40), x2: u64(48), x3: u64(56) },
+    entry: u64(0),
+    savePtr: u64(8),
+    save0: { x0: u64(0x10), x1: u64(0x18), x2: u64(0x20), x3: u64(0x28) },
+    save1: { x0: u64(0x30), x1: u64(0x38), x2: u64(0x40), x3: u64(0x48) },
   }
 }
 
@@ -125,7 +134,7 @@ export function CpuView() {
   const [cores, setCores] = useState<CoreState[] | null>(null)
   const [aic, setAic] = useState<AicState | null>(null)
   const [block, setBlock] = useState<BlockState | null>(null)
-  const [saveArea, setSaveArea] = useState<{ a: TaskSave; b: TaskSave } | null>(null)
+  const [coreSlots, setCoreSlots] = useState<CoreSlot[] | null>(null)
   const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null)
   const [memory, setMemory] = useState<Uint8Array>(new Uint8Array(MEMORY_VIEW_BYTES))
   const [output, setOutput] = useState('')
@@ -149,9 +158,10 @@ export function CpuView() {
     const viewStart = Number(s[0].pc) & ~0xf
     setMemory(c.mem_slice(viewStart, MEMORY_VIEW_BYTES))
     setOutput(c.output())
-    // Pull both task save areas (PA 0x4F10 and 0x4F30, 32 bytes each).
-    const saveBytes = c.mem_slice(0x4f10, 0x40)
-    setSaveArea(parseSaveAreas(saveBytes))
+    // Pull each core's slot region (0x4F00 = core 0, 0x5000 = core 1).
+    const slot0 = parseCoreSlot(c.mem_slice(0x4f00, 0x50))
+    const slot1 = parseCoreSlot(c.mem_slice(0x5000, 0x50))
+    setCoreSlots([slot0, slot1])
   }, [])
 
   useEffect(() => {
@@ -236,7 +246,7 @@ export function CpuView() {
     }
   }, [cpu, cores, vaText, translateCoreIdx])
 
-  if (!cpu || !cores || !sysInfo || !aic || !saveArea || !block) {
+  if (!cpu || !cores || !sysInfo || !aic || !coreSlots || !block) {
     return <div className="text-fg-muted text-sm">Loading WASM…</div>
   }
 
@@ -255,7 +265,7 @@ export function CpuView() {
           >
             AArch64 CPU
           </h1>
-          <Badge color="info">v0.11</Badge>
+          <Badge color="info">v0.12</Badge>
           {cores.map((c) => (
             <CoreChip core={c} key={c.id} />
           ))}
@@ -266,11 +276,10 @@ export function CpuView() {
           )}
         </div>
         <p className="text-fg-muted max-w-2xl text-xs">
-          Task B is now a "disk printer" — it walks the buffer at PA <code>0x6000</code> one byte at
-          a time using <code>LDRB</code>, prints each non-zero byte to UART, and uses{' '}
-          <code>CBZ</code> to detect the trailing NUL and reset its X3 offset back to 0. So after
-          enough timer ticks the UART output should show <em>OSstudy disk image — sector 0</em>{' '}
-          interleaved with task A's plain 'A's.
+          Per-core scheduling: each core reads <code>MPIDR_EL1</code> at boot and picks its slot
+          region (0x4F00 / 0x5000) plus its initial task. Core 0 starts in task A, core 1 starts in
+          task B (disk printer). Each timer tick swaps both cores to the other task. Output is now
+          genuinely interleaved — at any moment one core is running A and the other B.
         </p>
       </header>
 
@@ -278,7 +287,7 @@ export function CpuView() {
 
       <AicPanel aic={aic} />
 
-      <SavePanel save={saveArea} />
+      <SavePanel slots={coreSlots} />
 
       <BlockPanel block={block} />
 
@@ -423,37 +432,82 @@ function DiskHexRow({ bytes, sector }: { bytes: Uint8Array; sector: number }) {
   )
 }
 
-function SavePanel({ save }: { save: { a: TaskSave; b: TaskSave } }) {
+function SavePanel({ slots }: { slots: CoreSlot[] }) {
   return (
     <GlassCard>
       <div className="space-y-2 p-4">
         <div className="text-fg-muted text-[10px] font-semibold tracking-wider uppercase">
-          Task save areas — kernel-managed X0–X3 per task
+          Per-core scheduler slots — entry + save_ptr + 2 save areas each
         </div>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <SaveCard label="task A @ 0x4F10" save={save.a} />
-          <SaveCard label="task B @ 0x4F30" save={save.b} />
+        <div className="grid gap-3 lg:grid-cols-2">
+          {slots.map((slot, i) => (
+            <CoreSlotCard base={i === 0 ? 0x4f00 : 0x5000} coreId={i} key={i} slot={slot} />
+          ))}
         </div>
         <div className="text-fg-muted text-[11px]">
-          On every timer IRQ the scheduler at <code>VBAR_EL1+0x480</code> stores X0–X3 to the
-          outgoing task's slot via two STP instructions, then loads the incoming task's slot via two
-          LDP instructions. X3 is the loop counter — watch it grow on both tasks.
+          Each core derives its slot base from MPIDR_EL1: bit 8 (cluster) maps directly to 0x4F00 /
+          0x5000. The scheduler reads "current entry" / "current save_ptr", saves X0–X3 there with
+          STP, swaps via the (sum − current) trick, restores the other save area with LDP, and ERETs
+          into the other task. X3 is preserved across context switches.
         </div>
       </div>
     </GlassCard>
   )
 }
 
-function SaveCard({ label, save }: { label: string; save: TaskSave }) {
+function CoreSlotCard({ base, coreId, slot }: { base: number; coreId: number; slot: CoreSlot }) {
+  const taskLabel = slot.entry === 0x4d00n ? 'task A' : slot.entry === 0x4e00n ? 'task B' : '?'
+  const activeIdx =
+    slot.savePtr === BigInt(base + 0x10) ? 0 : slot.savePtr === BigInt(base + 0x30) ? 1 : null
+  return (
+    <div className="border-border bg-bg/40 space-y-2 rounded border px-3 py-2 font-mono text-[11px]">
+      <div className="text-fg-muted flex items-center justify-between text-[10px] tracking-wider uppercase">
+        <span>
+          core {coreId} slot @ 0x{base.toString(16)}
+        </span>
+        <span className="text-accent normal-case">running {taskLabel}</span>
+      </div>
+      <div className="grid gap-x-4 gap-y-0.5">
+        <RegRow label="entry" value={slot.entry} />
+        <RegRow label="save_ptr" value={slot.savePtr} />
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <SaveAreaCard
+          active={activeIdx === 0}
+          label={`save 0 @ 0x${(base + 0x10).toString(16)}`}
+          save={slot.save0}
+        />
+        <SaveAreaCard
+          active={activeIdx === 1}
+          label={`save 1 @ 0x${(base + 0x30).toString(16)}`}
+          save={slot.save1}
+        />
+      </div>
+    </div>
+  )
+}
+
+function SaveAreaCard({ active, label, save }: { active: boolean; label: string; save: TaskSave }) {
   const x0Char = Number(save.x0 & 0xffn)
   const ascii = x0Char >= 0x20 && x0Char < 0x7f ? `'${String.fromCharCode(x0Char)}'` : ''
   return (
-    <div className="border-border bg-bg/40 space-y-1 rounded border px-3 py-2 font-mono text-[11px]">
-      <div className="text-fg-muted text-[10px] tracking-wider uppercase">{label}</div>
+    <div
+      className={`rounded border px-2 py-1 ${
+        active ? 'border-accent/60 bg-accent/5' : 'border-border'
+      }`}
+    >
+      <div
+        className={`mb-1 flex items-center justify-between text-[10px] tracking-wider uppercase ${
+          active ? 'text-accent' : 'text-fg-muted'
+        }`}
+      >
+        <span>{label}</span>
+        {active && <span>active</span>}
+      </div>
       <RegRow label={`X0 ${ascii}`} value={save.x0} />
       <RegRow label="X1" value={save.x1} />
       <RegRow label="X2" value={save.x2} />
-      <RegRow highlight label="X3 (counter)" value={save.x3} />
+      <RegRow highlight label="X3" value={save.x3} />
     </div>
   )
 }

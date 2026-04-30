@@ -32,7 +32,8 @@ v0.7  + DAIF + AIC timer IRQ + IRQ vector (VBAR+0x480)
 v0.8  + AIC abstraction + scheduler swaps tasks A/B on every tick
 v0.9  + LDP/STP + real context switch (X0–X3 persist across switches)
 v0.10 + Block device (virtio-blk-shaped) — kernel reads sector 0 at boot
-v0.11 + LDRB/CBZ/CBNZ/SUB-imm; task B walks disk buffer and prints it  ← here
+v0.11 + LDRB/CBZ/CBNZ/SUB-imm; task B walks disk buffer and prints it
+v0.12 + per-core scheduler — cores 0/1 run A/B concurrently via MPIDR  ← here
 v1.0  + bare-metal port via m1n1 (same Rust crate runs on real Apple Silicon)`}
           </pre>
         </Card>

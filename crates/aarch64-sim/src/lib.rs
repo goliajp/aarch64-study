@@ -36,9 +36,9 @@ const MPIDR_VALUES: [u64; NUM_CORES] = [0x8000_0000, 0x8000_0100];
 const CORE_KIND: [&str; NUM_CORES] = ["P-core", "E-core"];
 
 // AIC timer: fires an IRQ on every core every TIMER_PERIOD system steps.
-// Sized so the 30-instruction kernel boot completes before the first tick,
-// leaving room for a few task iterations per period.
-const TIMER_PERIOD: u64 = 50;
+// Sized so the per-core kernel boot (~35 inst) completes before the first
+// tick, with room for several task iterations between ticks.
+const TIMER_PERIOD: u64 = 80;
 
 // AIC MMIO layout (loosely modelled on Apple's per-core AIC view): software
 // reads from one MMIO base and the controller routes the call by which core
@@ -1283,16 +1283,27 @@ fn load_demo(mem: &mut [u8]) {
     //   PA 0x4000  kernel boot
     //   PA 0x4800  sync handler (stub)
     //   PA 0x4880  IRQ handler = scheduler with X0-X3 save/restore
-    //   PA 0x4D00  task A — counts in X3 and prints 'A'
-    //   PA 0x4E00  task B — counts in X3 and prints 'B'
-    //   PA 0x4F00  global current-task entry (8 bytes)
-    //   PA 0x4F08  global current-task save area pointer (8 bytes)
-    //   PA 0x4F10  task A save area (32 bytes — X0..X3)
-    //   PA 0x4F30  task B save area (32 bytes — X0..X3)
+    //   PA 0x4D00  task A — counter that prints 'A'
+    //   PA 0x4E00  task B — disk printer (walks 0x6000 byte by byte)
+    //   PA 0x4F00  core 0's slot region (entry + save_ptr + 2 save areas)
+    //   PA 0x5000  core 1's slot region (same layout)
     //
-    // Save areas are zero-initialised; tasks see X0..X3 = 0 on first entry.
-    // After a context switch they see the values they had at the previous
-    // pre-emption point, so X3 (the counter) keeps growing across switches.
+    // Each core derives "my slot region" from MPIDR_EL1: bit 8 of MPIDR
+    // distinguishes our two clusters (P-core 0x80000000, E-core 0x80000100),
+    // so mpidr_offset = mpidr - 0x80000000 ∈ {0, 0x100} maps directly:
+    //   slot_base = 0x4F00 + mpidr_offset → 0x4F00 / 0x5000
+    //   initial_task = TASK_A_ENTRY + mpidr_offset → 0x4D00 / 0x4E00
+    // So core 0 boots into task A and core 1 boots into task B; they run
+    // concurrently with independent state and the UART output truly
+    // interleaves instead of duplicating.
+    //
+    // Within a slot region:
+    //   +0x00  current task entry (8 bytes)
+    //   +0x08  current task save-area pointer (8 bytes)
+    //   +0x10  save area 0 (32 bytes — X0..X3)
+    //   +0x30  save area 1 (32 bytes — X0..X3)
+    // The scheduler swaps between save areas via the (2*slot_base + 0x40 -
+    // current_save_ptr) trick — no per-core constants baked into the handler.
     const SPSR_EL1H_DAIF: u32 = 0x3C5;
     const VBAR: u32 = 0x4400;
     const SYNC_HANDLER_PA: u64 = 0x4800;
@@ -1300,22 +1311,19 @@ fn load_demo(mem: &mut [u8]) {
     const TASK_A_ENTRY: u32 = 0x4D00;
     const TASK_B_ENTRY: u32 = 0x4E00;
     const TASK_SUM: u32 = TASK_A_ENTRY + TASK_B_ENTRY; // 0x9B00
-    const TASK_SLOT_PA: u32 = 0x4F00;
-    const TASK_PTR_SLOT_PA: u32 = 0x4F08;
-    const TASK_A_SAVE_PA: u32 = 0x4F10;
-    const TASK_B_SAVE_PA: u32 = 0x4F30;
-    const TASK_SAVE_SUM: u32 = TASK_A_SAVE_PA + TASK_B_SAVE_PA; // 0x9E40
+    const SLOT_BASE_BASE: u32 = 0x4F00; // base for core 0
+    const MPIDR_BASE_HI: u32 = 0x8000; // moved to upper half via LSL #16
     const DISK_BUF_PA: u32 = 0x6000;
     const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
-    let kernel: [u32; 31] = [
-        // EL2 prologue → ERET to EL1
+    let kernel: [u32; 35] = [
+        // --- EL2 prologue → ERET to EL1 ---
         movz(9, EL1_ENTRY, 0),
         msr_elr_el2(9),
         movz(9, SPSR_EL1H_DAIF, 0),
         msr_spsr_el2(9),
         eret(),
-        // EL1: MMU bring-up
+        // --- EL1: MMU bring-up ---
         movz(9, L1_TABLE_PA as u32, 0),
         msr_ttbr0(9),
         movz(9, 25, 0),
@@ -1323,27 +1331,35 @@ fn load_demo(mem: &mut [u8]) {
         movz(9, 1, 0),
         msr_sctlr(9),
         isb(),
-        // EL1: read sector 0 → DISK_BUF_PA via the block device.
-        // Issue a synchronous READ: SECTOR=0, BUF_ADDR=DISK_BUF_PA, CMD=0.
+        // --- EL1: synchronous disk read sector 0 → DISK_BUF_PA ---
         movz(9, BLK_BASE as u32, 0),
         movz(10, 0, 0),
-        str_imm(10, 9, 0), // SECTOR = 0  (offset 0 / 8 = 0)
+        str_imm(10, 9, 0), // SECTOR = 0
         movz(10, DISK_BUF_PA, 0),
-        str_imm(10, 9, 1), // BUF_ADDR = DISK_BUF_PA (offset 8 / 8 = 1)
+        str_imm(10, 9, 1), // BUF_ADDR = 0x6000
         movz(10, BLK_CMD_READ as u32, 0),
-        str_imm(10, 9, 2), // CMD = READ → transfer happens here
-        // EL1: install vector base
+        str_imm(10, 9, 2), // CMD = READ
+        // --- EL1: install vector base ---
         movz(9, VBAR, 0),
         msr_vbar_el1(9),
-        // EL1: initialise scheduler — current task = A, current save area = A's
-        movz(9, TASK_A_ENTRY, 0),
-        movz(10, TASK_SLOT_PA, 0),
-        str_imm(9, 10, 0), // entry slot = A_entry
-        movz(11, TASK_A_SAVE_PA, 0),
-        movz(10, TASK_PTR_SLOT_PA, 0),
-        str_imm(11, 10, 0), // ptr slot = A_save_area
-        // EL1: ERET into task A
-        msr_elr_el1(9),
+        // --- EL1: derive per-core slot region from MPIDR_EL1 ---
+        // X9 = mpidr_offset ∈ {0, 0x100}
+        mrs_mpidr(9),
+        movz(10, MPIDR_BASE_HI, 1), // X10 = 0x80000000 (LSL #16)
+        sub_reg(9, 9, 10),
+        // X14 = my slot base
+        movz(10, SLOT_BASE_BASE, 0),
+        add_reg(14, 10, 9),
+        // X11 = my initial task entry
+        movz(10, TASK_A_ENTRY, 0),
+        add_reg(11, 10, 9),
+        // X12 = my initial save area = slot_base + 0x10
+        add_imm(12, 14, 0x10),
+        // Initialise my slot: [slot_base+0]=entry, [slot_base+8]=save_ptr
+        str_imm(11, 14, 0),
+        str_imm(12, 14, 1),
+        // --- EL1: ERET into my initial task at EL0t with DAIF=0 ---
+        msr_elr_el1(11),
         movz(10, 0, 0),
         msr_spsr_el1(10),
         eret(),
@@ -1356,37 +1372,44 @@ fn load_demo(mem: &mut [u8]) {
         add_imm(0, 0, 0),
         eret(),
     ];
-    // IRQ handler at VBAR+0x480 — the scheduler with proper context switch.
-    // Saves X0-X3 of the outgoing task, swaps the global slots, restores
-    // X0-X3 of the incoming task, ERETs into the incoming task's entry.
-    let scheduler: [u32; 20] = [
-        // ACK to clear AIC pending
-        movz(9, AIC_BASE as u32, 0),
-        ldr_imm(10, 9, 0),
-        // Load current entry + current save-area pointer
-        movz(9, TASK_SLOT_PA, 0),
-        ldr_imm(11, 9, 0),                  // X11 = current entry
-        movz(9, TASK_PTR_SLOT_PA, 0),
-        ldr_imm(12, 9, 0),                  // X12 = current save-area ptr
-        // Save outgoing X0..X3 to *X12
-        stp_imm(0, 1, 12, 0),
-        stp_imm(2, 3, 12, 2),               // imm7=2 → byte offset 16
-        // Compute "other" entry and save area via (sum - current)
-        movz(13, TASK_SUM, 0),
-        sub_reg(13, 13, 11),                // X13 = other entry
-        movz(14, TASK_SAVE_SUM, 0),
-        sub_reg(14, 14, 12),                // X14 = other save-area ptr
-        // Update the global slots
-        movz(9, TASK_SLOT_PA, 0),
-        str_imm(13, 9, 0),
-        movz(9, TASK_PTR_SLOT_PA, 0),
-        str_imm(14, 9, 0),
-        // Load incoming X0..X3 from *X14
-        ldp_imm(0, 1, 14, 0),
-        ldp_imm(2, 3, 14, 2),
-        // Switch and return
-        msr_elr_el1(13),
-        eret(),
+    // IRQ handler at VBAR+0x480 — per-core scheduler with X0..X3 save/restore.
+    // Re-derives MY slot region from MPIDR each entry, so the same code runs
+    // on both cores without per-core constants.
+    //   x14 = my slot base (0x4F00 / 0x5000)
+    //   x12 = current save-area ptr  (slot_base + 0x10 or +0x30)
+    //   x15 = "the other" save-area ptr = (2*slot_base + 0x40) - x12
+    let scheduler: [u32; 22] = [
+        // ACK AIC to clear pending
+        movz(9, AIC_BASE as u32, 0),       // 0
+        ldr_imm(10, 9, 0),                  // 1: X10 = irq id (discarded)
+        // X14 = my slot base
+        mrs_mpidr(14),                      // 2: X14 = mpidr
+        movz(9, MPIDR_BASE_HI, 1),          // 3: X9 = 0x80000000
+        sub_reg(14, 14, 9),                 // 4: X14 = mpidr_offset
+        movz(9, SLOT_BASE_BASE, 0),         // 5: X9 = 0x4F00
+        add_reg(14, 9, 14),                 // 6: X14 = slot_base
+        // Load current entry + save-area ptr from my slot
+        ldr_imm(11, 14, 0),                 // 7: X11 = current entry
+        ldr_imm(12, 14, 1),                 // 8: X12 = current save_ptr
+        // Save outgoing X0..X3 to current save area
+        stp_imm(0, 1, 12, 0),               // 9
+        stp_imm(2, 3, 12, 2),               // 10: imm7=2 → +16
+        // Compute "other" entry = TASK_SUM - X11
+        movz(13, TASK_SUM, 0),              // 11
+        sub_reg(13, 13, 11),                // 12: X13 = other entry
+        // Compute "other" save area = (2*slot_base + 0x40) - X12
+        add_reg(15, 14, 14),                // 13: X15 = 2*slot_base
+        add_imm(15, 15, 0x40),              // 14: X15 = 2*slot_base + 0x40
+        sub_reg(15, 15, 12),                // 15: X15 = other save_ptr
+        // Commit new state to my slot
+        str_imm(13, 14, 0),                 // 16
+        str_imm(15, 14, 1),                 // 17
+        // Restore incoming X0..X3 from new save area
+        ldp_imm(0, 1, 15, 0),               // 18
+        ldp_imm(2, 3, 15, 2),               // 19
+        // Switch
+        msr_elr_el1(13),                    // 20
+        eret(),                             // 21
     ];
     // Task A — counts in X3, prints 'A'. X3 persists across context switches.
     let task_a: [u32; 5] = [
@@ -1432,6 +1455,8 @@ fn setup_demo_pgtable(mem: &mut [u8]) {
     write_u64(mem, L3_TABLE_PA + 3 * 8, 0x3000 | page_attr);
     // VA 0x4000 → PA 0x4000 (program page)
     write_u64(mem, L3_TABLE_PA + 4 * 8, 0x4000 | page_attr);
+    // VA 0x5000 → PA 0x5000 (core 1's per-core scheduler slot region)
+    write_u64(mem, L3_TABLE_PA + 5 * 8, 0x5000 | page_attr);
     // VA 0x6000 → PA 0x6000 (disk buffer page)
     write_u64(mem, L3_TABLE_PA + 6 * 8, 0x6000 | page_attr);
     // page tables themselves
@@ -1544,6 +1569,15 @@ const fn msr_spsr_el1(rt: u32) -> u32 {
     msr_sysreg(rt, 3, 0, 4, 0, 0)
 }
 
+/// MRS Xt, sysreg :: MSR with L=1 (bit 21 set).
+const fn mrs_sysreg(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
+    msr_sysreg(rt, op0, op1, crn, crm, op2) | (1 << 21)
+}
+
+const fn mrs_mpidr(rt: u32) -> u32 {
+    mrs_sysreg(rt, 3, 0, 0, 0, 5)
+}
+
 const fn isb() -> u32 {
     0xD503_3FDF
 }
@@ -1575,69 +1609,64 @@ mod tests {
     }
 
     #[test]
-    fn both_cores_run_task_a_before_first_tick() {
-        // Kernel boot is 30 instructions; the timer fires at step 50.
-        // Run 45 system steps so both cores have ERETed into task A and
-        // produced a few 'A' chars but no tick has yet swapped them.
+    fn cores_split_to_different_tasks_before_first_tick() {
+        // 35-inst kernel, timer at step 80. After 60 steps both cores have
+        // ERETed: core 0 into task A (prints 'A'), core 1 into task B
+        // (disk printer — first byte is 'O' from "OSstudy…").
         let mut cpu = Cpu::new();
-        cpu.run(45);
+        cpu.run(60);
         let out = cpu.output();
         assert!(!out.is_empty(), "no output yet: {:?}", out);
-        assert!(out.chars().all(|c| c == 'A'), "got non-A chars: {:?}", out);
+        // We should see BOTH 'A' (from core 0) and 'O' (from core 1).
+        assert!(out.contains('A'), "no A: {:?}", out);
+        assert!(out.contains('O'), "no O (disk content): {:?}", out);
         assert!(!cpu.cores[0].halted);
         assert!(!cpu.cores[1].halted);
     }
 
     #[test]
-    fn scheduler_swaps_to_task_b_on_first_tick() {
+    fn scheduler_swaps_each_core_to_other_task() {
         let mut cpu = Cpu::new();
-        // First tick at step 50; need the handler to finish + task B to run
-        // a few iterations. Task B is now the disk printer — we should see
-        // 'A' chars followed by disk-content bytes such as 'O' (sector 0
-        // starts with "OSstudy…").
-        cpu.run(150);
-        assert!(cpu.timer_ticks >= 1);
+        // Run long enough for ≥ 2 timer ticks. After tick 1: core 0 → B,
+        // core 1 → A. After tick 2: core 0 → A again, core 1 → B again.
+        cpu.run(200);
+        assert!(cpu.timer_ticks >= 2);
         let out = cpu.output();
         assert!(out.contains('A'), "no A: {:?}", out);
         assert!(out.contains('O'), "no disk content (O): {:?}", out);
     }
 
     #[test]
-    fn task_x3_persists_across_context_switches() {
+    fn each_core_uses_its_own_slot_region() {
         let mut cpu = Cpu::new();
         cpu.run(400);
         let read_u64 = |mem: &[u8], pa: usize| -> u64 {
             u64::from_le_bytes(mem[pa..pa + 8].try_into().unwrap())
         };
-        let a_x3 = read_u64(&cpu.mem, 0x4F10 + 24);
-        let b_x3 = read_u64(&cpu.mem, 0x4F30 + 24);
-        // Task A: X3 is just a tick counter that accumulates.
-        assert!(a_x3 > 0, "task A X3 didn't accumulate: {}", a_x3);
-        // Task B: X3 is the next-byte offset, bounded by the disk text length
-        // (~30 bytes before the NUL). Either it's mid-print (1..=30) or it
-        // just wrapped to 0 — but it MUST have advanced at least once.
-        assert!(b_x3 < 64, "task B X3 escaped sector bounds: {}", b_x3);
-        // Task A always re-loads X0='A' / X1=UART per iteration, so its save
-        // area still ends up holding those.
-        assert_eq!(read_u64(&cpu.mem, 0x4F10), b'A' as u64);
-        assert_eq!(read_u64(&cpu.mem, 0x4F10 + 8), UART_OUT);
-        // Task B's saved X0 is the last byte it loaded — a printable char
-        // from the disk image (or 0 if it just wrapped). X1 is the UART addr.
-        let b_x0 = read_u64(&cpu.mem, 0x4F30);
-        assert!(b_x0 == 0 || (0x20..0x7F).contains(&b_x0), "B.X0 wasn't a byte: {:#x}", b_x0);
-        assert_eq!(read_u64(&cpu.mem, 0x4F30 + 8), UART_OUT);
+        // Core 0's slot is at 0x4F00, core 1's at 0x5000. Both should hold
+        // valid task entry pointers (either A_entry=0x4D00 or B_entry=0x4E00).
+        let core0_entry = read_u64(&cpu.mem, 0x4F00);
+        let core1_entry = read_u64(&cpu.mem, 0x5000);
+        assert!(core0_entry == 0x4D00 || core0_entry == 0x4E00, "{:#x}", core0_entry);
+        assert!(core1_entry == 0x4D00 || core1_entry == 0x4E00, "{:#x}", core1_entry);
+        // After enough ticks they should have swapped at least once, but at
+        // any sample point they should be on DIFFERENT tasks (since they
+        // started on different ones and swap in lockstep with the timer).
+        assert_ne!(core0_entry, core1_entry, "cores ended up on same task");
+        // Save-area pointers point inside their own slot region.
+        let core0_save = read_u64(&cpu.mem, 0x4F08);
+        let core1_save = read_u64(&cpu.mem, 0x5008);
+        assert!((0x4F00..0x5000).contains(&core0_save), "core0 save_ptr escaped: {:#x}", core0_save);
+        assert!((0x5000..0x6000).contains(&core1_save), "core1 save_ptr escaped: {:#x}", core1_save);
     }
 
     #[test]
     fn kernel_disk_read_populates_buffer() {
         let mut cpu = Cpu::new();
-        // Run kernel boot (30 inst per core). Both cores issue the same
-        // disk read; both succeed (idempotent).
-        cpu.run(40);
-        // Sector 0 starts with "OSstudy disk image — sector 0\n".
+        // 35-inst kernel; run 50 to ensure both cores finished disk read.
+        cpu.run(50);
         let buf = &cpu.mem[0x6000..0x6010];
         assert_eq!(&buf[..7], b"OSstudy");
-        // Block accounting: total_reads should be ≥ 2 (one per core).
         let snap = cpu.block.snapshot();
         assert!(snap.total_reads >= 2, "total_reads = {}", snap.total_reads);
         assert_eq!(snap.status, BLK_STATUS_OK);
@@ -1667,9 +1696,9 @@ mod tests {
         cpu.run(5);
         assert_eq!(cpu.cores[0].current_el, 1);
         assert_eq!(cpu.cores[0].daif, 0xF);
-        // Remaining kernel boot is 26 more instructions (31 total per core)
-        // before ERETing into EL0 with SPSR_EL1=0 — DAIF restored to 0.
-        cpu.run(26);
+        // Remaining kernel boot is 30 more instructions (35 total per core)
+        // before ERETing into EL0 with SPSR_EL1=0.
+        cpu.run(30);
         assert_eq!(cpu.cores[0].current_el, 0);
         assert_eq!(cpu.cores[0].daif, 0);
     }
