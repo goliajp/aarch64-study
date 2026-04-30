@@ -78,7 +78,8 @@ pub struct CoreState {
     pub kind: String,
     pub mpidr: u64,
     pub x: [u64; 31],
-    pub sp: u64,
+    pub sp_el0: u64,
+    pub sp_el1: u64,
     pub pc: u64,
     pub nzcv: u8,
     pub halted: bool,
@@ -354,7 +355,12 @@ struct Core {
     id: u8,
     mpidr: u64,
     x: [u64; 31],
-    sp: u64,
+    /// EL0 stack pointer — used by user-mode tasks. Save/restored across
+    /// the EL0 ↔ EL1 boundary by software (we don't model SPSel; assume
+    /// SPSel=1 at EL1+ and SPSel=0 at EL0).
+    sp_el0: u64,
+    /// EL1 stack pointer — used by every kernel handler.
+    sp_el1: u64,
     pc: u64,
     nzcv: u8,
     halted: bool,
@@ -398,7 +404,8 @@ impl Core {
             id,
             mpidr,
             x: [0; 31],
-            sp: 0,
+            sp_el0: 0,
+            sp_el1: 0,
             pc: ENTRY_PC,
             nzcv: 0,
             halted: false,
@@ -435,7 +442,8 @@ impl Core {
             kind: CORE_KIND[self.id as usize].to_string(),
             mpidr: self.mpidr,
             x: self.x,
-            sp: self.sp,
+            sp_el0: self.sp_el0,
+            sp_el1: self.sp_el1,
             pc: self.pc,
             nzcv: self.nzcv,
             halted: self.halted,
@@ -464,6 +472,35 @@ impl Core {
 
     fn write_x(&mut self, idx: usize, val: u64) {
         if idx < 31 {
+            self.x[idx] = val;
+        }
+    }
+
+    /// Active SP — `SP_EL1` at EL1+, `SP_EL0` at EL0. We don't model SPSel
+    /// because the demo never flips it (kernel runs SPSel=1, user SPSel=0).
+    fn current_sp(&self) -> u64 {
+        if self.current_el >= 1 { self.sp_el1 } else { self.sp_el0 }
+    }
+
+    fn set_current_sp(&mut self, val: u64) {
+        if self.current_el >= 1 {
+            self.sp_el1 = val;
+        } else {
+            self.sp_el0 = val;
+        }
+    }
+
+    /// Read register or SP — encoding `31` means SP for ADD/SUB-imm and
+    /// LDP/STP/LDR/STR-base-register forms, but XZR for "free" forms like
+    /// MOVZ. Callers pick which helper to use.
+    fn read_x_or_sp(&self, idx: usize) -> u64 {
+        if idx == 31 { self.current_sp() } else { self.x[idx] }
+    }
+
+    fn write_x_or_sp(&mut self, idx: usize, val: u64) {
+        if idx == 31 {
+            self.set_current_sp(val);
+        } else {
             self.x[idx] = val;
         }
     }
@@ -515,6 +552,9 @@ impl Core {
             (3, 4, 4, 0, 0) => self.spsr_el2,
             (3, 4, 4, 0, 1) => self.elr_el2,
             (3, 4, 5, 2, 0) => self.esr_el2,
+            // SP_EL0 / SP_EL1 — explicit per-EL stack pointer access.
+            (3, 0, 4, 1, 0) => self.sp_el0,
+            (3, 4, 4, 1, 0) => self.sp_el1,
             // CurrentEL[3:2] = current_el.
             (3, 0, 4, 2, 2) => (self.current_el as u64) << 2,
             // MPIDR_EL1 — read-only, identifies this core.
@@ -536,6 +576,8 @@ impl Core {
             (3, 4, 4, 0, 0) => self.spsr_el2 = val,
             (3, 4, 4, 0, 1) => self.elr_el2 = val,
             (3, 4, 5, 2, 0) => self.esr_el2 = val,
+            (3, 0, 4, 1, 0) => self.sp_el0 = val,
+            (3, 4, 4, 1, 0) => self.sp_el1 = val,
             (3, 0, 4, 2, 2) => return Err("MSR to CurrentEL (read-only)".into()),
             (3, 0, 0, 0, 5) => return Err("MSR to MPIDR_EL1 (read-only)".into()),
             _ => return Err(unsupported_sysreg("MSR", sr, self.pc)),
@@ -841,28 +883,29 @@ impl Core {
             return Ok(StepResult::Continue);
         }
 
-        // ADD Xd, Xn, #imm12{, LSL #12} :: 1 00 10001 sh imm12 Rn Rd
+        // ADD Xd|SP, Xn|SP, #imm12{, LSL #12} :: 1 00 10001 sh imm12 Rn Rd
+        // (Rd/Rn=31 reads/writes the active SP, not XZR.)
         if insn & 0xFF80_0000 == 0x9100_0000 {
             let rd = (insn & 0x1F) as usize;
             let rn = ((insn >> 5) & 0x1F) as usize;
             let imm12 = ((insn >> 10) & 0xFFF) as u64;
             let sh = ((insn >> 22) & 0x1) as u32;
             let imm = if sh == 1 { imm12 << 12 } else { imm12 };
-            let val = self.read_x(rn).wrapping_add(imm);
-            self.write_x(rd, val);
+            let val = self.read_x_or_sp(rn).wrapping_add(imm);
+            self.write_x_or_sp(rd, val);
             self.pc = self.pc.wrapping_add(4);
             return Ok(StepResult::Continue);
         }
 
-        // SUB Xd, Xn, #imm12{, LSL #12} :: 1 10 10001 sh imm12 Rn Rd
+        // SUB Xd|SP, Xn|SP, #imm12{, LSL #12} :: 1 10 10001 sh imm12 Rn Rd
         if insn & 0xFF80_0000 == 0xD100_0000 {
             let rd = (insn & 0x1F) as usize;
             let rn = ((insn >> 5) & 0x1F) as usize;
             let imm12 = ((insn >> 10) & 0xFFF) as u64;
             let sh = ((insn >> 22) & 0x1) as u32;
             let imm = if sh == 1 { imm12 << 12 } else { imm12 };
-            let val = self.read_x(rn).wrapping_sub(imm);
-            self.write_x(rd, val);
+            let val = self.read_x_or_sp(rn).wrapping_sub(imm);
+            self.write_x_or_sp(rd, val);
             self.pc = self.pc.wrapping_add(4);
             return Ok(StepResult::Continue);
         }
@@ -889,24 +932,24 @@ impl Core {
             return Ok(StepResult::Continue);
         }
 
-        // STR Xt, [Xn, #imm12]
+        // STR Xt, [Xn|SP, #imm12]
         if insn & 0xFFC0_0000 == 0xF900_0000 {
             let rt = (insn & 0x1F) as usize;
             let rn = ((insn >> 5) & 0x1F) as usize;
             let imm12 = ((insn >> 10) & 0xFFF) as u64;
-            let addr = self.read_x(rn).wrapping_add(imm12 * 8);
+            let addr = self.read_x_or_sp(rn).wrapping_add(imm12 * 8);
             let val = self.read_x(rt);
             self.store64(mem, out, aic, block, addr, val)?;
             self.pc = self.pc.wrapping_add(4);
             return Ok(StepResult::Continue);
         }
 
-        // LDR Xt, [Xn, #imm12]
+        // LDR Xt, [Xn|SP, #imm12]
         if insn & 0xFFC0_0000 == 0xF940_0000 {
             let rt = (insn & 0x1F) as usize;
             let rn = ((insn >> 5) & 0x1F) as usize;
             let imm12 = ((insn >> 10) & 0xFFF) as u64;
-            let addr = self.read_x(rn).wrapping_add(imm12 * 8);
+            let addr = self.read_x_or_sp(rn).wrapping_add(imm12 * 8);
             let val = self.load64(mem, aic, block, addr)?;
             self.write_x(rt, val);
             self.pc = self.pc.wrapping_add(4);
@@ -958,30 +1001,49 @@ impl Core {
             return Ok(StepResult::Continue);
         }
 
-        // LDP/STP (signed offset, 64-bit)
-        // 1 0 1 0 1 0 0 1 0 L imm7 Rt2 Rn Rt1
-        //   STP: 0xA9000000  |  LDP: 0xA9400000
-        if (insn & 0xFFC0_0000 == 0xA900_0000) || (insn & 0xFFC0_0000 == 0xA940_0000) {
+        // LDP/STP, 64-bit. Three addressing modes share most of the encoding;
+        // bits 24..23 = mode (01 post / 10 signed-offset / 11 pre-indexed),
+        // bit 22 = L (load), then imm7/Rt2/Rn/Rt1.
+        //   STP signed:    0xA9000000     LDP signed:    0xA9400000
+        //   STP pre-idx:   0xA9800000     LDP pre-idx:   0xA9C00000
+        //   STP post-idx:  0xA8800000     LDP post-idx:  0xA8C00000
+        if (insn & 0xFF80_0000) == 0xA880_0000  // post-indexed (mode=01)
+            || (insn & 0xFF80_0000) == 0xA900_0000  // signed offset (mode=10)
+            || (insn & 0xFF80_0000) == 0xA980_0000  // pre-indexed (mode=11)
+        {
+            let mode = (insn >> 23) & 0x3; // 01 post, 10 signed, 11 pre
             let l = (insn >> 22) & 1;
-            // imm7 is signed, scaled by 8.
             let imm7_raw = ((insn >> 15) & 0x7F) as u32;
             let imm7 = ((imm7_raw as i32) << 25) >> 25; // sign-extend 7-bit
             let offset_bytes = (imm7 as i64) * 8;
             let rt2 = ((insn >> 10) & 0x1F) as usize;
             let rn = ((insn >> 5) & 0x1F) as usize;
             let rt1 = (insn & 0x1F) as usize;
-            let base = self.read_x(rn);
-            let addr = (base as i64).wrapping_add(offset_bytes) as u64;
+            let base = self.read_x_or_sp(rn);
+            // Address used for the actual load/store.
+            let access_addr = if mode == 0b01 {
+                // post-indexed: write to [base], then base += offset
+                base
+            } else {
+                // signed-offset (mode=10) and pre-indexed (mode=11) both
+                // access [base + offset] first.
+                (base as i64).wrapping_add(offset_bytes) as u64
+            };
             if l == 0 {
                 let v1 = self.read_x(rt1);
                 let v2 = self.read_x(rt2);
-                self.store64(mem, out, aic, block, addr, v1)?;
-                self.store64(mem, out, aic, block, addr.wrapping_add(8), v2)?;
+                self.store64(mem, out, aic, block, access_addr, v1)?;
+                self.store64(mem, out, aic, block, access_addr.wrapping_add(8), v2)?;
             } else {
-                let v1 = self.load64(mem, aic, block, addr)?;
-                let v2 = self.load64(mem, aic, block, addr.wrapping_add(8))?;
+                let v1 = self.load64(mem, aic, block, access_addr)?;
+                let v2 = self.load64(mem, aic, block, access_addr.wrapping_add(8))?;
                 self.write_x(rt1, v1);
                 self.write_x(rt2, v2);
+            }
+            // Writeback for pre-/post-indexed.
+            if mode == 0b01 || mode == 0b11 {
+                let new_base = (base as i64).wrapping_add(offset_bytes) as u64;
+                self.write_x_or_sp(rn, new_base);
             }
             self.pc = self.pc.wrapping_add(4);
             return Ok(StepResult::Continue);
@@ -1139,6 +1201,25 @@ impl Core {
                 return Ok(StepResult::Halt);
             }
             self.pc = target;
+            return Ok(StepResult::Continue);
+        }
+
+        // BL imm26 — branch with link. X30 (LR) := PC+4.
+        if insn & 0xFC00_0000 == 0x9400_0000 {
+            let imm26_raw = (insn & 0x03FF_FFFF) as i32;
+            let imm26 = (imm26_raw << 6) >> 6;
+            let offset = (imm26 as i64) * 4;
+            let target = (self.pc as i64).wrapping_add(offset) as u64;
+            self.write_x(30, self.pc.wrapping_add(4));
+            self.pc = target;
+            return Ok(StepResult::Continue);
+        }
+
+        // RET Xn — branch to register (default Xn = X30 / LR).
+        // Encoding: 1101_0110_0101_1111_0000_00 Rn 00000 ; bits [4:0] = 0.
+        if insn & 0xFFFF_FC1F == 0xD65F_0000 {
+            let rn = ((insn >> 5) & 0x1F) as usize;
+            self.pc = self.read_x(rn);
             return Ok(StepResult::Continue);
         }
 
@@ -1473,24 +1554,24 @@ pub fn disassemble(insn: u32, pc: u64) -> String {
             format!("movz x{rd}, #{imm:#x}, lsl #{}", hw * 16)
         };
     }
-    // ADD Xd, Xn, #imm12 {, LSL #12}
+    // ADD Xd|SP, Xn|SP, #imm12 {, LSL #12}
     if insn & 0xFF80_0000 == 0x9100_0000 {
         let rd = insn & 0x1F;
         let rn = (insn >> 5) & 0x1F;
         let imm = (insn >> 10) & 0xFFF;
         let sh = (insn >> 22) & 1;
         return if sh == 1 {
-            format!("add x{rd}, x{rn}, #{imm:#x}, lsl #12")
+            format!("add {}, {}, #{imm:#x}, lsl #12", reg_or_sp(rd), reg_or_sp(rn))
         } else {
-            format!("add x{rd}, x{rn}, #{imm:#x}")
+            format!("add {}, {}, #{imm:#x}", reg_or_sp(rd), reg_or_sp(rn))
         };
     }
-    // SUB Xd, Xn, #imm12
+    // SUB Xd|SP, Xn|SP, #imm12
     if insn & 0xFF80_0000 == 0xD100_0000 {
         let rd = insn & 0x1F;
         let rn = (insn >> 5) & 0x1F;
         let imm = (insn >> 10) & 0xFFF;
-        return format!("sub x{rd}, x{rn}, #{imm:#x}");
+        return format!("sub {}, {}, #{imm:#x}", reg_or_sp(rd), reg_or_sp(rn));
     }
     // ADD Xd, Xn, Xm
     if insn & 0xFF20_FC00 == 0x8B00_0000 {
@@ -1506,28 +1587,28 @@ pub fn disassemble(insn: u32, pc: u64) -> String {
         let rm = (insn >> 16) & 0x1F;
         return format!("sub x{rd}, x{rn}, x{rm}");
     }
-    // STR Xt, [Xn, #imm12*8]
+    // STR Xt, [Xn|SP, #imm12*8]
     if insn & 0xFFC0_0000 == 0xF900_0000 {
         let rt = insn & 0x1F;
         let rn = (insn >> 5) & 0x1F;
         let imm = (insn >> 10) & 0xFFF;
         let off = imm * 8;
         return if off == 0 {
-            format!("str x{rt}, [x{rn}]")
+            format!("str x{rt}, [{}]", reg_or_sp(rn))
         } else {
-            format!("str x{rt}, [x{rn}, #{off}]")
+            format!("str x{rt}, [{}, #{off}]", reg_or_sp(rn))
         };
     }
-    // LDR Xt, [Xn, #imm12*8]
+    // LDR Xt, [Xn|SP, #imm12*8]
     if insn & 0xFFC0_0000 == 0xF940_0000 {
         let rt = insn & 0x1F;
         let rn = (insn >> 5) & 0x1F;
         let imm = (insn >> 10) & 0xFFF;
         let off = imm * 8;
         return if off == 0 {
-            format!("ldr x{rt}, [x{rn}]")
+            format!("ldr x{rt}, [{}]", reg_or_sp(rn))
         } else {
-            format!("ldr x{rt}, [x{rn}, #{off}]")
+            format!("ldr x{rt}, [{}, #{off}]", reg_or_sp(rn))
         };
     }
     // LDRB Wt, [Xn, #imm12]
@@ -1541,8 +1622,12 @@ pub fn disassemble(insn: u32, pc: u64) -> String {
             format!("ldrb w{rt}, [x{rn}, #{imm}]")
         };
     }
-    // LDP/STP signed offset
-    if insn & 0xFFC0_0000 == 0xA900_0000 || insn & 0xFFC0_0000 == 0xA940_0000 {
+    // LDP/STP — signed-offset, pre-indexed (`!`), or post-indexed.
+    if (insn & 0xFF80_0000) == 0xA900_0000      // signed offset (mode=10)
+        || (insn & 0xFF80_0000) == 0xA980_0000  // pre-indexed (mode=11)
+        || (insn & 0xFF80_0000) == 0xA880_0000  // post-indexed (mode=01)
+    {
+        let mode = (insn >> 23) & 0x3; // 01 post / 10 signed / 11 pre
         let l = (insn >> 22) & 1;
         let imm7_raw = (insn >> 15) & 0x7F;
         let imm7 = ((imm7_raw as i32) << 25) >> 25;
@@ -1551,10 +1636,17 @@ pub fn disassemble(insn: u32, pc: u64) -> String {
         let rn = (insn >> 5) & 0x1F;
         let rt1 = insn & 0x1F;
         let mnem = if l == 0 { "stp" } else { "ldp" };
-        return if off == 0 {
-            format!("{mnem} x{rt1}, x{rt2}, [x{rn}]")
-        } else {
-            format!("{mnem} x{rt1}, x{rt2}, [x{rn}, #{off}]")
+        let base = reg_or_sp(rn);
+        return match mode {
+            0b10 => {
+                if off == 0 {
+                    format!("{mnem} x{rt1}, x{rt2}, [{base}]")
+                } else {
+                    format!("{mnem} x{rt1}, x{rt2}, [{base}, #{off}]")
+                }
+            }
+            0b11 => format!("{mnem} x{rt1}, x{rt2}, [{base}, #{off}]!"),
+            _ => format!("{mnem} x{rt1}, x{rt2}, [{base}], #{off}"),
         };
     }
     // LDXR Xt, [Xn]
@@ -1658,8 +1750,32 @@ pub fn disassemble(insn: u32, pc: u64) -> String {
         let target = (pc as i64).wrapping_add((imm26 as i64) * 4) as u64;
         return format!("b {target:#x}");
     }
+    // BL imm26
+    if insn & 0xFC00_0000 == 0x9400_0000 {
+        let imm26_raw = (insn & 0x03FF_FFFF) as i32;
+        let imm26 = (imm26_raw << 6) >> 6;
+        let target = (pc as i64).wrapping_add((imm26 as i64) * 4) as u64;
+        return format!("bl {target:#x}");
+    }
+    // RET Xn
+    if insn & 0xFFFF_FC1F == 0xD65F_0000 {
+        let rn = (insn >> 5) & 0x1F;
+        return if rn == 30 {
+            "ret".into()
+        } else {
+            format!("ret x{rn}")
+        };
+    }
     // Unknown
     format!(".word {insn:#010x}")
+}
+
+fn reg_or_sp(idx: u32) -> String {
+    if idx == 31 {
+        "sp".into()
+    } else {
+        format!("x{idx}")
+    }
 }
 
 fn sysreg_name(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> String {
@@ -1677,6 +1793,8 @@ fn sysreg_name(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> String {
         (3, 4, 4, 0, 1) => "elr_el2".into(),
         (3, 4, 5, 2, 0) => "esr_el2".into(),
         (3, 4, 12, 0, 0) => "vbar_el2".into(),
+        (3, 0, 4, 1, 0) => "sp_el0".into(),
+        (3, 4, 4, 1, 0) => "sp_el1".into(),
         _ => format!("s{op0}_{op1}_c{crn}_c{crm}_{op2}"),
     }
 }
@@ -1727,9 +1845,12 @@ fn load_demo(mem: &mut [u8]) {
     // 0x10 = imm12 #2 in an 8-byte-scaled STR).
     const IPI_TARGET: u32 = 1;
     const IPI_OFFSET_WORDS: u32 = (AIC_REG_IPI_SET / 8) as u32;
+    // Per-core EL0 stack tops in the user-mapped 0x7000 page. Stacks grow
+    // downwards. Core 0 gets 0x7800; core 1 gets 0x7900 (mpidr_offset = 0x100).
+    const USER_STACK_BASE: u32 = 0x7800;
     const EL1_ENTRY: u32 = ENTRY_PC as u32 + 5 * 4;
 
-    let kernel: [u32; 35] = [
+    let kernel: [u32; 38] = [
         // --- EL2 prologue → ERET to EL1 ---
         movz(9, EL1_ENTRY, 0),
         msr_elr_el2(9),
@@ -1771,6 +1892,10 @@ fn load_demo(mem: &mut [u8]) {
         // Initialise my slot: [slot_base+0]=entry, [slot_base+8]=save_ptr
         str_imm(11, 14, 0),
         str_imm(12, 14, 1),
+        // --- EL1: install per-core EL0 stack — core 0 → 0x7800, core 1 → 0x7900 ---
+        movz(10, USER_STACK_BASE, 0),
+        add_reg(13, 10, 9),
+        msr_sp_el0(13),
         // --- EL1: ERET into my initial task at EL0t with DAIF=0 ---
         msr_elr_el1(11),
         movz(10, 0, 0),
@@ -1796,21 +1921,38 @@ fn load_demo(mem: &mut [u8]) {
         ldr_imm(10, 9, 0),           // 1: X10 = irq id (read clears pending)
         eret(),                      // 2: return to preempted task
     ];
-    // Task A — atomic counter + IPI generator. Each scheduling round it
-    // (1) atomically bumps the u64 at PA 0x6FF8 via an LDXR/STXR pair,
-    // (2) issues SVC #0 to ask the kernel to ping core 1 via the AIC, and
-    // (3) WFIs until the next IRQ. The MOVZ that loads the counter
-    // address runs once at first entry; subsequent resumes loop back to
-    // the LDXR. Does not touch UART, so task B's output stays clean.
-    let task_a: [u32; 8] = [
-        movz(4, ATOMIC_COUNTER_PA, 0), // 0: X4 = &counter (PA 0x6FF8)
-        ldxr(5, 4),                    // 1: X5 = *X4, set local monitor
-        add_imm(5, 5, 1),              // 2: X5 += 1
-        stxr(6, 5, 4),                 // 3: try CAS, W6 = 0/1 (ok/retry)
-        cbnz(6, -2),                   // 4: if W6 != 0 → branch back to LDXR
-        svc_imm(0),                    // 5: kernel: please ping core 1
-        wfi(),                         // 6: sleep until next IRQ
-        b_offset(-6),                  // 7: on resume → back to LDXR
+    // Task A — atomic-counter loop now split into a real `bump_counter`
+    // function with the canonical AArch64 prologue/epilogue. The loop body
+    // becomes `bl bump_counter; svc #0; wfi; b loop_top`; bump_counter
+    // pushes a frame, runs the LDXR/STXR retry loop, pops, then RETs.
+    let task_a: [u32; 13] = [
+        // 0  movz x4, ATOMIC_COUNTER_PA, 0  (runs once at first entry)
+        movz(4, ATOMIC_COUNTER_PA, 0),
+        // 1  bl bump_counter (+4 words → start of bump_counter)
+        bl_offset(4),
+        // 2  svc #0  ; ask kernel to ping core 1
+        svc_imm(0),
+        // 3  wfi
+        wfi(),
+        // 4  b loop_top  (-3 words → back to bl)
+        b_offset(-3),
+        // bump_counter:
+        // 5  stp x29, x30, [sp, #-16]!   prologue: push frame
+        stp_pre(29, 30, 31, -2),
+        // 6  mov x29, sp ↔ add x29, sp, #0
+        add_imm(29, 31, 0),
+        // 7  ldxr x5, [x4]
+        ldxr(5, 4),
+        // 8  add x5, x5, #1
+        add_imm(5, 5, 1),
+        // 9  stxr w6, x5, [x4]
+        stxr(6, 5, 4),
+        // 10 cbnz w6, retry  (-3 words → back to LDXR at insn 7)
+        cbnz(6, -3),
+        // 11 ldp x29, x30, [sp], #16    epilogue: pop frame
+        ldp_post(29, 30, 31, 2),
+        // 12 ret
+        ret(30),
     ];
     // Task B — "disk printer". Walks the 64-byte disk buffer at PA 0x6000
     // once, emitting each byte to the UART. On hitting the null terminator
@@ -1849,6 +1991,7 @@ fn setup_demo_pgtable(mem: &mut [u8]) {
     write_u64(mem, L3_TABLE_PA + 8, 0x1000 | user); // UART
     write_u64(mem, L3_TABLE_PA + 4 * 8, 0x4000 | user); // program/code
     write_u64(mem, L3_TABLE_PA + 6 * 8, 0x6000 | user); // disk buffer (task B)
+    write_u64(mem, L3_TABLE_PA + 7 * 8, 0x7000 | user); // user-mode stacks
     // Kernel-only pages — only EL1 (kernel handlers) can touch these.
     write_u64(mem, L3_TABLE_PA + 2 * 8, 0x2000 | kern); // AIC MMIO
     write_u64(mem, L3_TABLE_PA + 3 * 8, 0x3000 | kern); // Block MMIO
@@ -1917,6 +2060,29 @@ const fn ldp_imm(rt1: u32, rt2: u32, rn: u32, imm7: i32) -> u32 {
     0xA940_0000 | (imm << 15) | ((rt2 & 0x1F) << 10) | ((rn & 0x1F) << 5) | (rt1 & 0x1F)
 }
 
+/// STP Xt1, Xt2, [Xn, #imm7*8]! — pre-indexed with writeback.
+const fn stp_pre(rt1: u32, rt2: u32, rn: u32, imm7: i32) -> u32 {
+    let imm = (imm7 as u32) & 0x7F;
+    0xA980_0000 | (imm << 15) | ((rt2 & 0x1F) << 10) | ((rn & 0x1F) << 5) | (rt1 & 0x1F)
+}
+
+/// LDP Xt1, Xt2, [Xn], #imm7*8 — post-indexed with writeback.
+const fn ldp_post(rt1: u32, rt2: u32, rn: u32, imm7: i32) -> u32 {
+    let imm = (imm7 as u32) & 0x7F;
+    0xA8C0_0000 | (imm << 15) | ((rt2 & 0x1F) << 10) | ((rn & 0x1F) << 5) | (rt1 & 0x1F)
+}
+
+/// BL imm26 — branch with link. `words` is the signed instruction-word offset.
+const fn bl_offset(words: i32) -> u32 {
+    let imm26 = (words as u32) & 0x03FF_FFFF;
+    0x9400_0000 | imm26
+}
+
+/// RET Xn — defaults to X30 (LR).
+const fn ret(rn: u32) -> u32 {
+    0xD65F_0000 | ((rn & 0x1F) << 5)
+}
+
 const fn b_self() -> u32 {
     0x1400_0000
 }
@@ -1960,6 +2126,9 @@ const fn msr_elr_el1(rt: u32) -> u32 {
 }
 const fn msr_spsr_el1(rt: u32) -> u32 {
     msr_sysreg(rt, 3, 0, 4, 0, 0)
+}
+const fn msr_sp_el0(rt: u32) -> u32 {
+    msr_sysreg(rt, 3, 0, 4, 1, 0)
 }
 
 /// MRS Xt, sysreg :: MSR with L=1 (bit 21 set).
@@ -2033,6 +2202,22 @@ mod tests {
         assert_eq!(disassemble(ldxr(5, 4), 0x4000), "ldxr x5, [x4]");
         assert_eq!(disassemble(stxr(6, 5, 4), 0x4000), "stxr w6, x5, [x4]");
         assert_eq!(disassemble(clrex(), 0x4000), "clrex");
+        // BL renders the absolute target.
+        assert_eq!(disassemble(bl_offset(4), 0x4000), "bl 0x4010");
+        assert_eq!(disassemble(ret(30), 0x4000), "ret");
+        assert_eq!(disassemble(ret(15), 0x4000), "ret x15");
+        // Pre/post-indexed LDP/STP and SP encodings.
+        assert_eq!(
+            disassemble(stp_pre(29, 30, 31, -2), 0x4000),
+            "stp x29, x30, [sp, #-16]!"
+        );
+        assert_eq!(
+            disassemble(ldp_post(29, 30, 31, 2), 0x4000),
+            "ldp x29, x30, [sp], #16"
+        );
+        // ADD with Rd=Rn=31 renders as SP.
+        assert_eq!(disassemble(add_imm(31, 31, 0x10), 0x4000), "add sp, sp, #0x10");
+        assert_eq!(disassemble(add_imm(29, 31, 0), 0x4000), "add x29, sp, #0x0");
         assert_eq!(disassemble(msr_ttbr0(9), 0x4000), "msr ttbr0_el1, x9");
         assert_eq!(disassemble(mrs_mpidr(14), 0x4000), "mrs x14, mpidr_el1");
         assert_eq!(disassemble(0xD503_42FFu32, 0x4000), "msr DAIFClr, #0x2");
@@ -2139,9 +2324,10 @@ mod tests {
         cpu.run(5);
         assert_eq!(cpu.cores[0].current_el, 1);
         assert_eq!(cpu.cores[0].daif, 0xF);
-        // Remaining kernel boot is 30 more instructions (35 total per core)
-        // before ERETing into EL0 with SPSR_EL1=0.
-        cpu.run(30);
+        // Remaining kernel boot is 33 more instructions (38 total per core
+        // since v0.20's per-core SP_EL0 setup) before ERETing into EL0 with
+        // SPSR_EL1=0.
+        cpu.run(33);
         assert_eq!(cpu.cores[0].current_el, 0);
         assert_eq!(cpu.cores[0].daif, 0);
     }
@@ -2448,12 +2634,96 @@ mod tests {
     }
 
     #[test]
+    fn bl_writes_lr_and_ret_returns() {
+        let mut cpu = Cpu::new();
+        // Tiny program: bl callee; halt; callee: movz x1, #7; ret.
+        let prog = [
+            bl_offset(2),       // 0x4000  bl 0x4008
+            b_self(),           // 0x4004  halt
+            movz(1, 7, 0),      // 0x4008  callee
+            ret(30),            // 0x400C
+        ];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+        cpu.cores[0].sctlr_el1 = 0; // identity-mapped
+        cpu.cores[1].halted = true;
+        cpu.run(20);
+        assert_eq!(cpu.cores[0].x[1], 7, "callee should have run");
+        assert_eq!(cpu.cores[0].pc, 0x4004, "RET should land on the b .");
+        // X30 holds PC+4 of the BL.
+        assert_eq!(cpu.cores[0].x[30], 0x4004);
+    }
+
+    #[test]
+    fn stp_pre_indexed_writes_back_sp() {
+        let mut cpu = Cpu::new();
+        let prog = [
+            movz(0, 0xAA, 0),
+            movz(1, 0xBB, 0),
+            // sp = 0x100 (a free area in mem)
+            movz(9, 0x100, 0),
+            add_imm(31, 9, 0), // mov sp, x9
+            stp_pre(0, 1, 31, -2), // stp x0, x1, [sp, #-16]!
+            b_self(),
+        ];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+        cpu.cores[0].sctlr_el1 = 0;
+        cpu.cores[1].halted = true;
+        cpu.run(20);
+        // SP should now be 0x100 - 16 = 0xF0; we run at EL2 so set_current_sp wrote to sp_el1.
+        assert_eq!(cpu.cores[0].sp_el1, 0xF0);
+        let v0 = u64::from_le_bytes(cpu.mem[0xF0..0xF8].try_into().unwrap());
+        let v1 = u64::from_le_bytes(cpu.mem[0xF8..0x100].try_into().unwrap());
+        assert_eq!(v0, 0xAA);
+        assert_eq!(v1, 0xBB);
+    }
+
+    #[test]
+    fn ldp_post_indexed_pops() {
+        let mut cpu = Cpu::new();
+        // Pre-fill stack memory at 0x200 with two qwords.
+        cpu.mem[0x200..0x208].copy_from_slice(&0x1234u64.to_le_bytes());
+        cpu.mem[0x208..0x210].copy_from_slice(&0x5678u64.to_le_bytes());
+        let prog = [
+            movz(9, 0x200, 0),
+            add_imm(31, 9, 0),       // mov sp, x9
+            ldp_post(0, 1, 31, 2),   // ldp x0, x1, [sp], #16
+            b_self(),
+        ];
+        write_words(&mut cpu.mem, ENTRY_PC, &prog);
+        cpu.cores[0].sctlr_el1 = 0;
+        cpu.cores[1].halted = true;
+        cpu.run(20);
+        assert_eq!(cpu.cores[0].x[0], 0x1234);
+        assert_eq!(cpu.cores[0].x[1], 0x5678);
+        assert_eq!(cpu.cores[0].sp_el1, 0x210);
+    }
+
+    #[test]
+    fn sp_el0_and_sp_el1_are_isolated() {
+        // Boot the demo, then check the kernel set sp_el0 per-core. The
+        // kernel itself never wrote to sp_el1, so it stays at 0.
+        let mut cpu = Cpu::new();
+        cpu.run(80); // past kernel boot for both cores
+        assert_eq!(cpu.cores[0].sp_el0, 0x7800, "core 0 sp_el0");
+        assert_eq!(cpu.cores[1].sp_el0, 0x7900, "core 1 sp_el0");
+        assert_eq!(cpu.cores[0].sp_el1, 0, "kernel never set sp_el1");
+        // Each task A iteration moves SP_EL0 by 16 bytes during the prologue
+        // and back during the epilogue, so post-iteration SP_EL0 returns to
+        // its initial top.
+        cpu.run(2000);
+        assert_eq!(cpu.cores[0].sp_el0, 0x7800, "stack frame must be balanced");
+    }
+
+    #[test]
     fn ipi_wakes_a_wfi_d_core() {
         // Park core 1 in WFI with IRQs unmasked (DAIF=0). Have core 0 send
         // an IPI directly via the AIC. Core 1 must take the IRQ.
         let mut cpu = Cpu::new();
-        // Boot far enough that core 1 is parked in task B's WFI.
-        cpu.run(500);
+        // Boot far enough that core 1 is parked in task B's WFI. With v0.20
+        // each tick of task A also runs through the SVC handler (which sends
+        // an IPI to core 1), so core 1 spends extra cycles in its IRQ vector;
+        // 1500 steps is comfortably past the disk-print phase.
+        cpu.run(1500);
         assert!(cpu.cores[1].wfi_halted, "core 1 should be parked in WFI");
         let pc_before = cpu.cores[1].pc;
         cpu.aic.mmio_write(0, AIC_REG_IPI_SET, 1);

@@ -87,7 +87,7 @@ export function SystemDiagram({ aic, block, cores, events, output, slots }: Prop
         { addr: 0x4f00, label: 'core 0 ctx' },
         { addr: 0x5000, label: 'core 1 ctx' },
         { addr: 0x6000, label: 'disk buf' },
-        { addr: 0x7000, label: 'free' },
+        { addr: 0x7000, label: 'stack (EL0)' },
         { addr: 0x8000, label: 'page tbls' },
       ] as const,
     []
@@ -406,7 +406,10 @@ function RegsList({
     { label: 'x3', v: core.x[3] ?? 0n },
     { label: 'x9', v: core.x[9] ?? 0n },
     { label: 'x10', v: core.x[10] ?? 0n },
-    { label: 'sp', v: core.sp ?? 0n },
+    {
+      label: 'sp',
+      v: core.current_el === 0 ? (core.sp_el0 ?? 0n) : (core.sp_el1 ?? 0n),
+    },
     { label: 'x30', v: core.x[30] ?? 0n },
   ]
   return (

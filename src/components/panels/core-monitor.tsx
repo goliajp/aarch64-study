@@ -63,7 +63,8 @@ function RegistersSection({ core }: { core: CoreState }) {
         {REG_LABELS.map((label, i) => (
           <RegRow key={label} label={label} value={core.x[i]} />
         ))}
-        <RegRow label="SP" value={core.sp} />
+        <RegRow label="SP_EL0" value={core.sp_el0} />
+        <RegRow label="SP_EL1" value={core.sp_el1} />
         <RegRow highlight label="PC" value={core.pc} />
       </div>
       <div className="text-fg-muted type-small mt-3">

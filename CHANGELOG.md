@@ -2,6 +2,46 @@
 
 Each entry is one architectural concept added on top of the previous one.
 
+## v0.20
+
+Per-EL stacks + real function calls.
+
+- `Core` gains `sp_el0` / `sp_el1` (replacing the unused `sp` field). New
+  helpers `current_sp` / `read_x_or_sp` / `write_x_or_sp` route accesses
+  through the active SP based on `current_el`.
+- New decoders: `BL imm26` (`0x9400_0000 | …`), `RET Xn`
+  (`0xD65F_0000 | (Rn << 5)`), pre-indexed `STP …, [SP, #imm]!`
+  (`0xA980_0000 | …`), and post-indexed `LDP …, [SP], #imm`
+  (`0xA8C0_0000 | …`). Existing ADD/SUB-imm and LDR/STR/LDP/STP-base now
+  treat `Rn=31` as the active SP rather than XZR.
+- Sysreg dispatch handles `SP_EL0` (`S3_0_C4_C1_0`) and `SP_EL1`
+  (`S3_4_C4_C1_0`); kernel boot writes `MSR SP_EL0, X13` per-core
+  (`0x7800` / `0x7900`) before ERETing into EL0.
+- Page-table layout: PA `0x7000` is now mapped user (AP=01) — the EL0
+  stack page. Both cores share this 4 KiB page with their stacks at
+  `0x7800` / `0x7900`.
+- Task A becomes a real loop calling `bump_counter`:
+  ```
+  loop_top:
+      bl   bump_counter
+      svc  #0
+      wfi
+      b    loop_top
+  bump_counter:
+      stp  x29, x30, [sp, #-16]!
+      mov  x29, sp
+      …LDXR/STXR retry…
+      ldp  x29, x30, [sp], #16
+      ret
+  ```
+- UI: `CoreState` exposes `sp_el0` + `sp_el1` (replacing `sp`); the
+  CoreMonitor shows both. The SoC schematic's RAM grid relabels the
+  `0x7000` cell as `stack (EL0)`.
+- Four new tests: BL writes LR, RET resumes from LR; STP pre-indexed
+  writes back SP; LDP post-indexed pops; SP_EL0 and SP_EL1 stay
+  isolated, and task A's stack frame is balanced across many iterations.
+  Total cargo tests: 28.
+
 ## v0.19
 
 The simulator becomes a publishable, three-deployment-target crate.

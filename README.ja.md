@@ -33,7 +33,7 @@ bun run dev            # vite dev server（http://127.0.0.1:32030）
 
 | スクリプト             | 内容                                            |
 | --------------------- | ----------------------------------------------- |
-| `bun run test:sim`    | `cargo test`（24 件）                           |
+| `bun run test:sim`    | `cargo test`（28 件）                           |
 | `bun run test`        | React 側の vitest                               |
 | `bun run check`       | tsc + eslint + prettier                         |
 | `bun run build`       | `./dist` への本番ビルド                         |
@@ -62,6 +62,10 @@ bun run dev            # vite dev server（http://127.0.0.1:32030）
 | v0.17      | LDXR / STXR / CLREX + コア横断の排他モニタ（本物の同期プリミティブ）               |
 | v0.18      | コア間 IPI — SVC で要求し、AIC のソフトウェア IRQ で配送                            |
 | v0.19      | crate を公開可能に：純 Rust API + `cli` / `wasm` フィーチャ                        |
+| v0.20      | EL ごとのスタック（`SP_EL0` / `SP_EL1`）+ `BL` / `RET` + push/pop                |
+| v0.21      | TLB + ASID + `TLBI` 失効                                                         |
+| v0.22      | I-cache + `IC IVAU` / `DC CIVAC` + 自己改変コードのデモ                          |
+| v0.23      | PCB + ラウンドロビンスケジューラ（v0.16 のタスク固定を置き換え）                  |
 | v1.0       | m1n1 経由で実機 Apple Silicon 上にベアメタル化                                     |
 
 ## ディレクトリ構成

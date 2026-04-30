@@ -5,7 +5,8 @@ export interface CoreState {
   kind: string
   mpidr: bigint
   x: bigint[]
-  sp: bigint
+  sp_el0: bigint
+  sp_el1: bigint
   pc: bigint
   nzcv: number
   halted: boolean

@@ -36,7 +36,7 @@ bun run dev            # vite dev server on http://127.0.0.1:32030
 
 | Script               | What it runs                                    |
 | -------------------- | ----------------------------------------------- |
-| `bun run test:sim`   | `cargo test` the Rust simulator (24 tests)      |
+| `bun run test:sim`   | `cargo test` the Rust simulator (28 tests)      |
 | `cargo run --features cli --bin aarch64-sim -- run` | run the simulator from the command line |
 | `bun run test`       | Vitest the React side                           |
 | `bun run check`      | tsc + eslint + prettier                         |
@@ -66,6 +66,10 @@ bun run dev            # vite dev server on http://127.0.0.1:32030
 | v0.17   | LDXR / STXR / CLREX + cross-core exclusive monitor (real concurrency)      |
 | v0.18   | IPI between cores via AIC software-IRQ — SVC-mediated dispatch             |
 | v0.19   | Crate becomes publishable: pure-Rust API + `cli` and `wasm` features       |
+| v0.20   | Per-EL stacks (`SP_EL0` / `SP_EL1`), `BL` / `RET`, push/pop stack frames   |
+| v0.21   | TLB + ASID + `TLBI` invalidation                                           |
+| v0.22   | I-cache + `IC IVAU` / `DC CIVAC` + self-modifying code demo                |
+| v0.23   | PCB + round-robin scheduler (replaces v0.16 task-pinning)                  |
 | v1.0    | Bare-metal port via m1n1 — same Rust crate runs on real Apple Silicon      |
 
 ## Layout

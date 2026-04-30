@@ -31,7 +31,7 @@ bun run dev            # vite dev server，端口 32030
 
 | 脚本                  | 作用                                             |
 | --------------------- | ------------------------------------------------ |
-| `bun run test:sim`    | `cargo test` 跑模拟器测试（24 个）               |
+| `bun run test:sim`    | `cargo test` 跑模拟器测试（28 个）               |
 | `bun run test`        | React 侧 vitest                                  |
 | `bun run check`       | tsc + eslint + prettier                          |
 | `bun run build`       | 产线打包到 `./dist`                              |
@@ -60,6 +60,10 @@ bun run dev            # vite dev server，端口 32030
 | v0.17 | LDXR / STXR / CLREX + 跨核排他监视器（真正的并发原语）                       |
 | v0.18 | 跨核 IPI——SVC 触发，AIC 软件 IRQ 派发                                        |
 | v0.19 | crate 准备好可发布：纯 Rust API + `cli` 和 `wasm` 两个 feature              |
+| v0.20 | 分级栈（`SP_EL0` / `SP_EL1`）+ `BL` / `RET` + 入栈/出栈                       |
+| v0.21 | TLB + ASID + `TLBI` 失效                                                     |
+| v0.22 | I-cache + `IC IVAU` / `DC CIVAC` + 自修改代码演示                            |
+| v0.23 | PCB + round-robin 调度器（取代 v0.16 任务固定）                              |
 | v1.0  | 通过 m1n1 跑到真机——同一份 Rust crate 在 Apple Silicon 上裸跑                 |
 
 ## 项目结构
