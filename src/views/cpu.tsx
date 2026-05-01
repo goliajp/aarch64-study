@@ -283,13 +283,13 @@ export function CpuView() {
           <SavePanel slots={coreSlots} />
           <AicPanel aic={aic} />
           <ICachePanel cores={cores} />
-          <SchedulerPanel processes={processes} />
         </div>
 
         <div className="space-y-4">
           {cores.map((c) => (
             <CoreMonitor core={c} key={c.id} onStep={() => onStepCore(c.id)} />
           ))}
+          <SchedulerPanel processes={processes} />
         </div>
 
         <div className="space-y-4">

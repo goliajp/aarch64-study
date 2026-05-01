@@ -32,8 +32,8 @@ function ProcessCard({ proc }: { proc: Process }) {
         <span>
           {name} · PCB at 0x{proc.pcb_pa.toString(16)}
         </span>
-        <span className={proc.host_core !== null ? 'text-success' : 'text-fg-muted'}>
-          {proc.host_core !== null ? `running on core ${proc.host_core}` : 'idle'}
+        <span className={proc.host_core != null ? 'text-success' : 'text-fg-muted'}>
+          {proc.host_core != null ? `running on core ${proc.host_core}` : 'idle'}
         </span>
       </div>
       <div className="mono-data grid grid-cols-2 gap-x-4 gap-y-0.5 text-[11px]">
