@@ -282,7 +282,6 @@ export function CpuView() {
           </div>
           <SavePanel slots={coreSlots} />
           <AicPanel aic={aic} />
-          <TlbPanel cores={cores} />
           <ICachePanel cores={cores} />
           <SchedulerPanel processes={processes} />
         </div>
@@ -293,7 +292,10 @@ export function CpuView() {
           ))}
         </div>
 
-        <BlockPanel block={block} />
+        <div className="space-y-4">
+          <BlockPanel block={block} />
+          <TlbPanel cores={cores} />
+        </div>
       </div>
     </div>
   )
