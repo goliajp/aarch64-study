@@ -10,7 +10,7 @@ export function BlockPanel({ block }: { block: BlockState }) {
   return (
     <Card padding="none">
       <div className="space-y-3 p-4">
-        <div className="text-fg-muted flex items-center justify-between">
+        <div className="text-fg-muted flex flex-wrap items-center justify-between gap-x-3">
           <span className="type-small font-semibold tracking-wider uppercase">
             Block device · disk image ({numSectors} × 64-byte sectors @ MMIO 0x3000)
           </span>
@@ -18,7 +18,7 @@ export function BlockPanel({ block }: { block: BlockState }) {
             reads {block.total_reads.toString()} · writes {block.total_writes.toString()}
           </span>
         </div>
-        <div className="type-small grid gap-x-6 gap-y-1 sm:grid-cols-4">
+        <div className="type-small grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-4">
           <RegRow label="SECTOR" value={block.sector} />
           <RegRow label="BUF_ADDR" value={block.buf_addr} />
           <RegRow label="CMD" value={block.last_command} />
@@ -64,7 +64,7 @@ function DiskHexRows({ bytes, sector }: { bytes: Uint8Array; sector: number }) {
   }
   const baseAddr = sector * SECTOR_SIZE
   return (
-    <div className="mono-data type-small overflow-x-auto">
+    <div className="mono-data type-small overflow-x-auto whitespace-nowrap">
       {rows.map((row, ri) => {
         let ascii = ''
         for (let i = 0; i < row.length; i++) {

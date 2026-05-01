@@ -96,7 +96,7 @@ export function SystemDiagram({ aic, block, cores, events, output, slots }: Prop
   return (
     <Card padding="none">
       <div className="relative p-3">
-        <div className="text-fg-muted mb-2 flex items-center justify-between">
+        <div className="text-fg-muted mb-2 flex flex-wrap items-center justify-between gap-x-3">
           <span className="type-small font-semibold tracking-wider uppercase">
             AArch64 SoC · pin-out
           </span>
@@ -104,46 +104,48 @@ export function SystemDiagram({ aic, block, cores, events, output, slots }: Prop
             {events.length > 0 ? `${events.length} active` : 'idle'}
           </span>
         </div>
-        <svg
-          className="block w-full"
-          viewBox={`0 0 ${SVG_W} ${SVG_H}`}
-          xmlns="http://www.w3.org/2000/svg"
-        >
-          <rect
-            fill={BG_SECONDARY}
-            height={SVG_H - 4}
-            rx="6"
-            stroke={BORDER}
-            strokeWidth="0.5"
-            width={SVG_W - 4}
-            x={2}
-            y={2}
-          />
+        <div className="overflow-x-auto">
+          <svg
+            className="block w-full min-w-[420px]"
+            viewBox={`0 0 ${SVG_W} ${SVG_H}`}
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <rect
+              fill={BG_SECONDARY}
+              height={SVG_H - 4}
+              rx="6"
+              stroke={BORDER}
+              strokeWidth="0.5"
+              width={SVG_W - 4}
+              x={2}
+              y={2}
+            />
 
-          <BusLanes />
-          <CorePinStubs coreX={CORE0_X} />
-          <CorePinStubs coreX={CORE1_X} />
-          <PeripheralStubs />
+            <BusLanes />
+            <CorePinStubs coreX={CORE0_X} />
+            <CorePinStubs coreX={CORE1_X} />
+            <PeripheralStubs />
 
-          <line
-            stroke="rgb(168 85 247 / 0.35)"
-            strokeDasharray="2 2"
-            strokeWidth="0.8"
-            x1={ramMidX}
-            x2={ramMidX}
-            y1={LANE_CTRL_Y}
-            y2={RAM_Y}
-          />
+            <line
+              stroke="rgb(168 85 247 / 0.35)"
+              strokeDasharray="2 2"
+              strokeWidth="0.8"
+              x1={ramMidX}
+              x2={ramMidX}
+              y1={LANE_CTRL_Y}
+              y2={RAM_Y}
+            />
 
-          <CoreSvg core={cores[0]} coreX={CORE0_X} slot={slots[0]} />
-          <CoreSvg core={cores[1]} coreX={CORE1_X} slot={slots[1]} />
+            <CoreSvg core={cores[0]} coreX={CORE0_X} slot={slots[0]} />
+            <CoreSvg core={cores[1]} coreX={CORE1_X} slot={slots[1]} />
 
-          <AicSvg aic={aic} />
-          <UartSvg output={output} />
-          <BlockSvg block={block} />
+            <AicSvg aic={aic} />
+            <UartSvg output={output} />
+            <BlockSvg block={block} />
 
-          <RamGrid regions={ramRegions} />
-        </svg>
+            <RamGrid regions={ramRegions} />
+          </svg>
+        </div>
       </div>
     </Card>
   )

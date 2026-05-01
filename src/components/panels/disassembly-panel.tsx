@@ -32,7 +32,7 @@ export function DisassemblyPanel({ cpu, cores }: Props) {
   return (
     <Card padding="none">
       <div className="space-y-2 p-4">
-        <div className="text-fg-muted flex items-center justify-between">
+        <div className="text-fg-muted flex flex-wrap items-center justify-between gap-x-3">
           <span className="type-small font-semibold tracking-wider uppercase">
             Disassembly · around core 0 PC
           </span>
@@ -40,7 +40,7 @@ export function DisassemblyPanel({ cpu, cores }: Props) {
             range {fmtHex32(start)}–{fmtHex32(end - 1)}
           </span>
         </div>
-        <div className="mono-data type-small overflow-x-auto">
+        <div className="mono-data type-small overflow-x-auto whitespace-nowrap">
           {rows.map((r) => (
             <DisassemblyRow key={r.pa} pa0={pc0} pa1={pc1} row={r} />
           ))}

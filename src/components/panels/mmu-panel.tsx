@@ -29,14 +29,14 @@ export function MmuPanel({
   return (
     <Card padding="none">
       <div className="space-y-4 p-4">
-        <div className="text-fg-muted flex items-center justify-between">
+        <div className="text-fg-muted flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
           <span className="type-small font-semibold tracking-wider uppercase">
             MMU · Stage-1 Translation
           </span>
           <Badge variant={mmuOn ? 'success' : undefined}>SCTLR_EL1.M={mmuOn ? '1' : '0'}</Badge>
         </div>
 
-        <div className="type-small flex items-center gap-2">
+        <div className="type-small flex flex-wrap items-center gap-2">
           <span className="text-fg-muted">walk using</span>
           {cores.map((c) => (
             <button
@@ -54,7 +54,7 @@ export function MmuPanel({
           ))}
         </div>
 
-        <div className="type-small grid gap-x-6 gap-y-1 sm:grid-cols-3">
+        <div className="type-small grid grid-cols-1 gap-x-6 gap-y-1 sm:grid-cols-3">
           <RegRow label="TTBR0_EL1" value={sel.ttbr0_el1} />
           <RegRow label="TCR_EL1" value={sel.tcr_el1} />
           <RegRow label="SCTLR_EL1" value={sel.sctlr_el1} />
@@ -74,12 +74,12 @@ export function MmuPanel({
             : 'Translation is a query only — fetches and LDR/STR bypass the MMU until SCTLR_EL1.M=1.'}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <label className="text-fg-muted type-small" htmlFor="va-input">
             translate VA
           </label>
           <input
-            className="mono-data border-border bg-bg-secondary text-fg focus:border-accent type-small w-40 rounded border px-2 py-1 outline-none"
+            className="mono-data border-border bg-bg-secondary text-fg focus:border-accent type-small w-32 rounded border px-2 py-1 outline-none sm:w-40"
             id="va-input"
             onChange={(e) => onVaChange(e.target.value)}
             placeholder="0x4000"

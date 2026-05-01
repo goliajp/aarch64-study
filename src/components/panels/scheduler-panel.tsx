@@ -8,7 +8,7 @@ export function SchedulerPanel({ processes }: { processes: Process[] }) {
   return (
     <Card padding="none">
       <div className="space-y-3 p-4">
-        <div className="text-fg-muted flex items-center justify-between">
+        <div className="text-fg-muted flex flex-wrap items-center justify-between gap-x-3">
           <span className="type-small font-semibold tracking-wider uppercase">
             Scheduler · PCBs in shared memory
           </span>
@@ -28,7 +28,7 @@ function ProcessCard({ proc }: { proc: Process }) {
   const name = TASK_NAME[proc.pid] ?? `pid ${proc.pid}`
   return (
     <div className="border-border bg-bg-secondary rounded border px-3 py-2">
-      <div className="text-fg-muted type-small mb-2 flex items-center justify-between tracking-wider uppercase">
+      <div className="text-fg-muted type-small mb-2 flex flex-wrap items-center justify-between gap-x-3 tracking-wider uppercase">
         <span>
           {name} · PCB at 0x{proc.pcb_pa.toString(16)}
         </span>

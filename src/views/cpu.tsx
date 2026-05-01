@@ -207,9 +207,9 @@ export function CpuView() {
   return (
     <div className="space-y-4">
       <header className="space-y-2">
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <h1
-            className="text-fg text-2xl font-bold"
+            className="text-fg text-xl font-bold sm:text-2xl"
             style={{ textShadow: '0 0 20px var(--gds-accent, #3b82f6)' }}
           >
             AArch64 CPU
@@ -250,7 +250,7 @@ export function CpuView() {
         </div>
       )}
 
-      <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-3">
+      <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
         <SystemDiagram
           aic={aic}
           block={block}

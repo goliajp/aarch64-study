@@ -59,7 +59,7 @@ function RegistersSection({ core }: { core: CoreState }) {
       <div className="text-fg-muted type-base mb-2 font-semibold tracking-wider uppercase">
         Registers
       </div>
-      <div className="type-base grid grid-cols-2 gap-x-4 gap-y-1">
+      <div className="type-base grid grid-cols-1 gap-x-4 gap-y-1 min-[480px]:grid-cols-2">
         {REG_LABELS.map((label, i) => (
           <RegRow key={label} label={label} value={core.x[i]} />
         ))}

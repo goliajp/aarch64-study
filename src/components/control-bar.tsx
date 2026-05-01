@@ -36,7 +36,7 @@ export function ControlBar({
 }: Props) {
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Button onClick={onStep} size="sm" variant="primary">
           Step both
         </Button>
@@ -120,7 +120,7 @@ function Stats({ aic, block, cores, info, totalCoreSteps, uartBytes }: StatsProp
     { label: 'i$ hit %', value: icHitPct(cores) },
   ]
   return (
-    <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
       {stats.map((s) => (
         <Stat emphasize={s.emphasize} key={s.label} label={s.label} value={s.value} />
       ))}

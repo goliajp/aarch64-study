@@ -7,14 +7,14 @@ export function AicPanel({ aic }: { aic: AicState }) {
   return (
     <Card padding="none">
       <div className="space-y-2 p-4">
-        <div className="text-fg-muted flex items-center justify-between">
+        <div className="text-fg-muted flex flex-wrap items-center justify-between gap-x-3">
           <span className="type-small font-semibold tracking-wider uppercase">
             AIC · Apple-style interrupt controller
           </span>
           <span className="type-small">
             base 0x2000 · ACK reads cleared {aic.total_acks.toString()} · IPIs sent{' '}
             {aic.total_ipis.toString()}
-            {aic.last_ipi_target !== null ? ` → core ${aic.last_ipi_target}` : ''}
+            {aic.last_ipi_target != null ? ` → core ${aic.last_ipi_target}` : ''}
           </span>
         </div>
         <div className="grid gap-3 sm:grid-cols-2">

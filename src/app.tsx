@@ -28,21 +28,22 @@ export function AppLayout() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="border-border bg-bg/80 flex h-12 shrink-0 items-center justify-between border-b px-6 backdrop-blur-xl">
-        <div className="flex items-center gap-6">
-          <Link className="text-fg flex items-center gap-2 text-sm font-semibold" to="/">
+      <header className="border-border bg-bg/80 flex h-12 shrink-0 items-center justify-between gap-2 border-b px-3 backdrop-blur-xl sm:px-6">
+        <div className="flex min-w-0 items-center gap-3 sm:gap-6">
+          <Link className="text-fg flex shrink-0 items-center gap-2 text-sm font-semibold" to="/">
             <img
               alt="GOLIA"
               className="h-5 w-5 rounded-sm"
               src="https://cdn.golia.jp/logo-icon.png"
               style={{ filter: 'drop-shadow(0 0 6px var(--gds-accent, #3b82f6))' }}
             />
-            AArch64 Study
+            <span className="hidden sm:inline">AArch64 Study</span>
+            <span className="sm:hidden">aarch64</span>
           </Link>
           <nav className="flex items-center gap-1">
             {NAV.map((item) => (
               <Link
-                className={`rounded-md px-3 py-1.5 text-sm transition-colors ${
+                className={`rounded-md px-2 py-1.5 text-sm transition-colors sm:px-3 ${
                   isActive(item.path)
                     ? 'bg-accent/10 text-accent'
                     : 'text-fg-muted hover:bg-bg-tertiary hover:text-fg'
@@ -59,7 +60,7 @@ export function AppLayout() {
       </header>
 
       <main className="flex-1 overflow-y-auto">
-        <div className="px-6 py-6 2xl:px-10">
+        <div className="px-3 py-4 sm:px-6 sm:py-6 2xl:px-10">
           <Outlet />
         </div>
       </main>

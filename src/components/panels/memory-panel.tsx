@@ -16,7 +16,7 @@ export function MemoryPanel({ base, bytes, pcs }: Props) {
   return (
     <Card className="h-full" padding="none">
       <div className="flex h-full flex-col p-4">
-        <div className="text-fg-muted mb-3 flex items-center justify-between">
+        <div className="text-fg-muted mb-3 flex flex-wrap items-center justify-between gap-x-3">
           <span className="type-small font-semibold tracking-wider uppercase">
             Memory (around core 0 PC) — shared
           </span>
@@ -24,7 +24,7 @@ export function MemoryPanel({ base, bytes, pcs }: Props) {
             base {fmtHex32(base)} · pc {pcs.map((pc, i) => `c${i}=${fmtHex32(pc)}`).join(' · ')}
           </span>
         </div>
-        <div className="mono-data type-small min-h-0 flex-1 overflow-auto">
+        <div className="mono-data type-small min-h-0 flex-1 overflow-auto whitespace-nowrap">
           {rows.map((r) => (
             <MemoryRow addr={r.addr} bytes={r.bytes} key={r.addr} pcs={pcs} />
           ))}
